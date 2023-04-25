@@ -111,6 +111,7 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
+	"log"
 	"os"
 	"sync"
 
@@ -151,6 +152,8 @@ type builder struct {
 	created  *creator // functions created during building
 	finished int      // Invariant: create[i].built holds for i in [0,finished)
 	rtypes   int      // Invariant: all of the runtime types for create[i] have been added for i in [0,rtypes)
+
+	ispmd bool
 }
 
 // cond emits to fn code to evaluate boolean condition e and jump
@@ -793,6 +796,10 @@ func (b *builder) expr0(fn *Function, e ast.Expr, tv types.TypeAndValue) Value {
 			return &Builtin{name: obj.Name(), sig: fn.instanceType(e).(*types.Signature)}
 		case *types.Nil:
 			return zeroConst(fn.instanceType(e))
+		}
+		if obj == nil {
+			// Unresolved identifier.
+			log.Println("unresolved identifier:", e)
 		}
 		// Package-level func or var?
 		if v := fn.Prog.packageLevelMember(obj); v != nil {
@@ -2127,6 +2134,51 @@ func (b *builder) rangeStmt(fn *Function, s *ast.RangeStmt, label *lblock) {
 	fn.currentBlock = done
 }
 
+func (b *builder) eachStmt(fn *Function, s *ast.EachStmt, label *lblock) {
+	// FIXME: we want individual simd value here, not the same value for all lanes
+	log.Println("index", s.Index)
+
+	if s.Tok == token.DEFINE {
+		fn.addLocalForIdent(s.Index.(*ast.Ident))
+	}
+
+	b.assignStmt(fn, []ast.Expr{s.Index}, []ast.Expr{s.From}, s.Tok == token.DEFINE)
+
+	body := fn.newBasicBlock("for.body")
+	done := fn.newBasicBlock("for.done") // target of 'break'
+	loop := fn.newBasicBlock("for.loop") // target of back-edge
+	cont := fn.newBasicBlock("for.post") // target of 'continue'
+
+	if label != nil {
+		label._break = done
+		label._continue = cont
+	}
+
+	emitJump(fn, loop)
+
+	fn.currentBlock = loop
+	b.cond(fn, s.Cond, body, done)
+
+	fn.currentBlock = body
+	// targets should include the lanemask
+	fn.targets = &targets{
+		tail:      fn.targets,
+		_break:    done,
+		_continue: cont,
+	}
+	b.stmt(fn, s.Body)
+	fn.targets = fn.targets.tail
+	emitJump(fn, cont)
+
+	fn.currentBlock = cont
+	// FIXME: This should increment the index by the number of lanes
+	loc := b.addr(fn, s.Index, false)
+	b.assignOp(fn, loc, NewConst(constant.MakeInt64(1), types.Typ[types.Int]), token.ADD, s.Pos())
+	emitJump(fn, loop) // back-edge
+
+	fn.currentBlock = done
+}
+
 // stmt lowers statement s to SSA form, emitting code to fn.
 func (b *builder) stmt(fn *Function, _s ast.Stmt) {
 	// The label of the current statement.  If non-nil, its _goto
@@ -2276,6 +2328,12 @@ start:
 	case *ast.BlockStmt:
 		b.stmtList(fn, s.List)
 
+	case *ast.IspmdStmt:
+		b.ispmd = true
+		defer func() { b.ispmd = false }()
+
+		b.stmt(fn, s.Body)
+
 	case *ast.IfStmt:
 		if s.Init != nil {
 			b.stmt(fn, s.Init)
@@ -2313,6 +2371,9 @@ start:
 
 	case *ast.RangeStmt:
 		b.rangeStmt(fn, s, label)
+
+	case *ast.EachStmt:
+		b.eachStmt(fn, s, label)
 
 	default:
 		panic(fmt.Sprintf("unexpected statement kind: %T", s))
