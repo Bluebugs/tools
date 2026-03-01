@@ -314,6 +314,9 @@ func (h hasher) hash(t types.Type) uint32 {
 
 	case *types.Tuple:
 		return h.hashTuple(t)
+
+	case *types.SPMDType:
+		return 9181 + 2*uint32(t.Qualifier()) + 3*h.hash(t.Elem())
 	}
 
 	panic(fmt.Sprintf("%T: %v", t, t))
@@ -454,6 +457,9 @@ func (h hasher) shallowHash(t types.Type) uint32 {
 
 	case *types.TypeParam:
 		return h.hashTypeParam(t)
+
+	case *types.SPMDType:
+		return 9181 + 2*uint32(t.Qualifier())
 	}
 	panic(fmt.Sprintf("shallowHash: %T: %v", t, t))
 }

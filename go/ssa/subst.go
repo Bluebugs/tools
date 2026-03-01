@@ -153,6 +153,12 @@ func (subst *subster) typ(t types.Type) (res types.Type) {
 	case *opaqueType:
 		return t // opaque types are never substituted
 
+	case *types.SPMDType:
+		if r := subst.typ(t.Elem()); r != t.Elem() {
+			return types.NewVarying(r)
+		}
+		return t
+
 	default:
 		panic("unreachable")
 	}
