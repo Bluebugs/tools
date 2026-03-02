@@ -7,6 +7,7 @@ package ssa
 import (
 	"go/types"
 
+	"golang.org/x/tools/go/types/spmd"
 	"golang.org/x/tools/go/types/typeutil"
 	"golang.org/x/tools/internal/aliases"
 )
@@ -152,6 +153,9 @@ func (subst *subster) typ(t types.Type) (res types.Type) {
 
 	case *opaqueType:
 		return t // opaque types are never substituted
+
+	case *spmd.MaskType:
+		return t // mask types are never substituted
 
 	case *types.SPMDType:
 		if r := subst.typ(t.Elem()); r != t.Elem() {
