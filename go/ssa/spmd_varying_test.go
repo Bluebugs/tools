@@ -3,6 +3,7 @@ package ssa_test
 import (
 	"bytes"
 	"go/token"
+	"go/types"
 	"strings"
 	"testing"
 
@@ -23,20 +24,30 @@ func main() {
 	pkg := buildSSAWithSPMD(t, src)
 	mainFn := pkg.Func("main")
 
-	found := false
+	// predicateSPMD linearizes varying Ifs into Jump + mask computations.
+	// For an if-without-else with no Phi at the merge (only a discard `_ = i`),
+	// no SPMDSelect is generated (there is no value to select). However, the
+	// varying If must be gone (replaced by Jump) and mask instructions present.
+	foundVaryingIf := false
+	foundMaskConvert := false
 	for _, block := range mainFn.Blocks {
-		if len(block.Instrs) == 0 {
-			continue
-		}
-		if ifInstr, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok {
-			if ifInstr.IsVarying {
-				found = true
-				break
+		for _, instr := range block.Instrs {
+			if ifInstr, ok := instr.(*ssa.If); ok && ifInstr.IsVarying {
+				foundVaryingIf = true
+			}
+			// Mask computations: Convert(cond → Varying[mask]) is inserted by predicateSPMD.
+			if conv, ok := instr.(*ssa.Convert); ok {
+				if _, isMask := conv.Type().(*types.SPMDType); isMask {
+					foundMaskConvert = true
+				}
 			}
 		}
 	}
-	if !found {
-		t.Error("expected at least one If with IsVarying=true")
+	if foundVaryingIf {
+		t.Error("unexpected IsVarying If: predicateSPMD should have linearized it to a Jump")
+	}
+	if !foundMaskConvert {
+		t.Error("expected a Convert-to-Varying[mask] instruction inserted by predicateSPMD")
 	}
 }
 
@@ -224,8 +235,16 @@ func main() {
 	var buf bytes.Buffer
 	mainFn.WriteTo(&buf)
 	output := buf.String()
-	if !strings.Contains(output, "if varying") {
-		t.Error("expected 'if varying' in SSA output for varying condition")
+
+	// predicateSPMD linearizes "if varying" into a Jump + mask computations.
+	// The "if varying" annotation should be gone after transformation.
+	// For an if-without-else with no live Phi at the merge, no spmd_select is
+	// generated; instead, a Varying[mask] Convert instruction is emitted.
+	if strings.Contains(output, "if varying") {
+		t.Error("unexpected 'if varying' in SSA output: predicateSPMD should have linearized it")
+	}
+	if !strings.Contains(output, "lanes.Varying[mask]") {
+		t.Error("expected 'lanes.Varying[mask]' mask computation in SSA output after predicateSPMD")
 	}
 }
 

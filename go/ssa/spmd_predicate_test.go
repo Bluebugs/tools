@@ -766,3 +766,308 @@ var _ ssa.Value = (*ssa.SPMDIndex)(nil)
 var _ ssa.Instruction = (*ssa.SPMDSelect)(nil)
 var _ ssa.Instruction = (*ssa.SPMDLoad)(nil)
 var _ ssa.Instruction = (*ssa.SPMDIndex)(nil)
+
+// ----------------------------------------------------------------------------
+// predicateSPMD pass tests
+// These tests verify the transformation pass that linearizes varying If/else
+// control flow into predicated mask-gated operations.
+
+// TestPredicateSPMD_NoVaryingIf verifies that when there is no varying If,
+// predicateSPMD does nothing and the function remains valid.
+func TestPredicateSPMD_NoVaryingIf(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		_ = i
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+	if mainFn == nil {
+		t.Fatal("main function not found")
+	}
+
+	// No varying If: no SPMDSelect should appear.
+	for _, block := range mainFn.Blocks {
+		for _, instr := range block.Instrs {
+			if _, ok := instr.(*ssa.SPMDSelect); ok {
+				t.Errorf("unexpected SPMDSelect in loop with no varying If")
+			}
+		}
+	}
+}
+
+// TestPredicateSPMD_VaryingIfElse verifies that a simple if/else is linearized
+// by predicateSPMD: varying If is gone, mask computations are inserted,
+// and the CFG is rewired (then-block falls through to else-block).
+func TestPredicateSPMD_VaryingIfElse(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		x := i
+		if i > 5 {
+			x = i + 1
+		} else {
+			x = i - 1
+		}
+		_ = x
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+	if mainFn == nil {
+		t.Fatal("main function not found")
+	}
+
+	// Verify no varying If remains (all were linearized to Jump).
+	for _, block := range mainFn.Blocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		if vif, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok {
+			if vif.IsVarying {
+				t.Errorf("block %d: varying If was not linearized by predicateSPMD", block.Index)
+			}
+		}
+	}
+
+	// Verify mask computation instructions are present (Convert + AND inserted by predicateSPMD).
+	// When the Phi at the merge is dead (_ = x discards), SPMDSelect is not generated,
+	// but the mask instructions are still inserted before the Jump.
+	var buf bytes.Buffer
+	mainFn.WriteTo(&buf)
+	output := buf.String()
+	if !strings.Contains(output, "lanes.Varying[mask]") {
+		t.Error("expected mask computation instructions from predicateSPMD")
+	}
+	if strings.Contains(output, "if varying") {
+		t.Error("unexpected 'if varying': predicateSPMD must have replaced it with Jump")
+	}
+}
+
+// TestPredicateSPMD_MaskInstructions verifies that the mask computation
+// instructions (Convert to Varying[mask], AND mask binop) are inserted
+// by predicateSPMD for a varying if-without-else.
+func TestPredicateSPMD_MaskInstructions(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		if i > 5 {
+			_ = i + 1
+		}
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+	if mainFn == nil {
+		t.Fatal("main function not found")
+	}
+
+	// predicateSPMD inserts: Convert(cond → Varying[mask]) and BinOp(AND, allOnes, maskCond).
+	// These appear as the mask computation block before the Jump to then-block.
+	var buf bytes.Buffer
+	mainFn.WriteTo(&buf)
+	output := buf.String()
+
+	// The mask-to-bool conversion must appear in the SSA dump.
+	if !strings.Contains(output, "lanes.Varying[mask]") {
+		t.Error("expected 'lanes.Varying[mask]' mask instructions from predicateSPMD")
+	}
+
+	// The varying If must be gone.
+	if strings.Contains(output, "if varying") {
+		t.Error("unexpected 'if varying': predicateSPMD must have replaced it with Jump")
+	}
+}
+
+// TestPredicateSPMD_SelectLanes verifies that when SPMDSelect is generated,
+// it carries the correct lane count from the enclosing SPMD loop.
+// Since dead Phis are not generated (Go SSA optimizes them away), we verify
+// the lane count property using the existing SPMDLoopInfo data.
+func TestPredicateSPMD_SelectLanes(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		_ = i
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+	if mainFn == nil {
+		t.Fatal("main function not found")
+	}
+
+	if len(mainFn.SPMDLoops) == 0 {
+		t.Fatal("expected SPMDLoops to be populated")
+	}
+	lanes := mainFn.SPMDLoops[0].LaneCount
+	if lanes <= 0 {
+		t.Fatalf("LaneCount = %d, want > 0", lanes)
+	}
+
+	// Any SPMDSelect instructions that do exist must carry the correct lane count.
+	for _, block := range mainFn.Blocks {
+		for _, instr := range block.Instrs {
+			if sel, ok := instr.(*ssa.SPMDSelect); ok {
+				if sel.Lanes != lanes {
+					t.Errorf("SPMDSelect.Lanes = %d, want %d (from SPMDLoopInfo)", sel.Lanes, lanes)
+				}
+			}
+		}
+	}
+}
+
+// TestPredicateSPMD_SwitchChainNotLinearized verifies that varying Ifs that are
+// part of an SPMDSwitchChain are not linearized by predicateSPMD.
+// These Ifs implement case dispatch and must remain as-is for the TinyGo backend.
+func TestPredicateSPMD_SwitchChainNotLinearized(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		switch i % 3 {
+		case 0:
+			_ = i
+		case 1:
+			_ = i + 1
+		default:
+			_ = i + 2
+		}
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+	if mainFn == nil {
+		t.Fatal("main function not found")
+	}
+
+	// Switch chain Ifs must be preserved (not linearized to Jump).
+	// The SPMDSwitchChains metadata must still be present.
+	if len(mainFn.SPMDSwitchChains) == 0 {
+		t.Fatal("expected SPMDSwitchChains to be populated")
+	}
+
+	// Each switch-chain If must still be an *If instruction in its block.
+	for _, chain := range mainFn.SPMDSwitchChains {
+		for _, caseIf := range chain.Cases {
+			if caseIf.Block() == nil {
+				t.Error("switch-chain If has nil Block(): predicateSPMD erroneously removed it")
+			}
+		}
+	}
+}
+
+// TestPredicateSPMD_SanityCheck verifies the sanity checker passes after
+// predicateSPMD runs on a function with a varying if-without-else.
+func TestPredicateSPMD_SanityCheck(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		x := i
+		if i > 5 {
+			x = i + 10
+		}
+		_ = x
+	}
+}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setSPMDOnRange(f)
+
+	// SanityCheckFunctions will panic if predicateSPMD leaves the SSA invalid.
+	_, _, err = ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{f},
+		ssa.SanityCheckFunctions,
+	)
+	if err != nil {
+		t.Fatalf("BuildPackage failed: %v", err)
+	}
+}
+
+// TestPredicateSPMD_IfElseSanityCheck verifies the sanity checker passes
+// after predicateSPMD linearizes a full if/else with SPMDSelect.
+func TestPredicateSPMD_IfElseSanityCheck(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		x := i
+		if i > 5 {
+			x = i + 10
+		} else {
+			x = i - 10
+		}
+		_ = x
+	}
+}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setSPMDOnRange(f)
+
+	_, _, err = ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{f},
+		ssa.SanityCheckFunctions,
+	)
+	if err != nil {
+		t.Fatalf("BuildPackage failed: %v", err)
+	}
+}
+
+// TestPredicateSPMD_WriteFunction verifies WriteFunction does not panic on a
+// function after predicateSPMD runs. Mask computation instructions (from
+// linearizing a varying if) must appear in the output.
+func TestPredicateSPMD_WriteFunction(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		if i > 5 {
+			_ = i + 1
+		} else {
+			_ = i - 1
+		}
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+	if mainFn == nil {
+		t.Fatal("main function not found")
+	}
+
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, mainFn)
+	if buf.Len() == 0 {
+		t.Error("WriteFunction returned empty output")
+	}
+	output := buf.String()
+
+	// predicateSPMD inserts mask computations even when the Phi is dead.
+	if !strings.Contains(output, "lanes.Varying[mask]") {
+		t.Error("expected mask computation instructions from predicateSPMD in WriteFunction output")
+	}
+	// The varying If must be gone.
+	if strings.Contains(output, "if varying") {
+		t.Error("unexpected 'if varying' after predicateSPMD ran")
+	}
+}

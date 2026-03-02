@@ -395,6 +395,10 @@ func (f *Function) finishBody() {
 	// Resolve SPMD loop phis after lift has promoted allocs to phis.
 	if len(f.SPMDLoops) > 0 {
 		resolveSPMDLoops(f)
+		// Transform varying control flow into predicated form with explicit
+		// mask-gated operations. Runs after loop resolution so LaneCount is
+		// available, and before numberRegisters so new instructions get numbered.
+		predicateSPMD(f)
 	}
 
 	// clear remaining builder state
