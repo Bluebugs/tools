@@ -361,6 +361,7 @@ type Function struct {
 	Blocks    []*BasicBlock // basic blocks of the function; nil => external
 	Recover   *BasicBlock   // optional; control transfers here after recovered panic
 	AnonFuncs []*Function   // anonymous functions (from FuncLit,RangeStmt) directly beneath this one
+	SPMDLoops []*SPMDLoopInfo // SPMD go-for loop metadata; nil if no SPMD loops
 	referrers []Instruction // referring instructions (iff Parent() != nil)
 	anonIdx   int32         // position of a nested function in parent's AnonFuncs. fn.Parent()!=nil => fn.Parent().AnonFunc[fn.anonIdx] == fn.
 
@@ -383,6 +384,41 @@ type Function struct {
 	source       *Function                // nearest enclosing source function
 	exits        []*exit                  // exits of the function that need to be resolved
 	uniq         int64                    // source of unique ints within the source tree while building
+}
+
+// SPMDLoopInfo holds structured information about an SPMD go-for loop,
+// populated during SSA construction when the source RangeStmt has IsSpmd=true.
+// Block pointers and BoundValue are set during construction.
+// IterPhi, IncrBinOp, and Accumulators are resolved after the lift pass.
+type SPMDLoopInfo struct {
+	EntryBlock     *BasicBlock // block containing loop setup (bound computation, initial branch)
+	BodyBlock      *BasicBlock // first block of loop body
+	LoopBlock      *BasicBlock // loop-test/increment block (may equal BodyBlock after block fusion)
+	DoneBlock      *BasicBlock // merge point after loop exits
+	MergedBodyLoop bool        // true if body and loop-test are in same block after optimization
+
+	// Iterator (resolved after lift)
+	IterPhi   *Phi   // the loop iteration variable phi
+	IncrBinOp *BinOp // the ADD instruction for iteration increment
+
+	// Bounds
+	BoundValue   Value // the upper bound of the range
+	LaneCount    int   // from AST RangeStmt.LaneCount
+	IsRangeIndex bool  // true for range-over-slice, false for range-over-int
+
+	// Accumulators: loop-carried values other than the iterator (resolved after lift)
+	Accumulators []SPMDAccumulator
+
+	// iterAlloc is the Alloc for the loop iterator, saved during construction
+	// for post-lift phi resolution. Cleared after resolution.
+	iterAlloc *Alloc
+}
+
+// SPMDAccumulator describes a loop-carried value other than the iterator.
+type SPMDAccumulator struct {
+	Phi       *Phi  // the loop-carried phi
+	InitValue Value // value on entry edge (initial accumulator state)
+	BackValue Value // value on back-edge (updated accumulator state)
 }
 
 // BasicBlock represents an SSA basic block.
