@@ -45,3 +45,36 @@ func exprHasSPMDType(fn *Function, e ast.Expr) bool {
 	}
 	return false
 }
+
+// resolveSPMDSwitchChains updates SPMDSwitchChain block pointers after
+// optimizeBlocks has potentially fused or eliminated blocks. Called from
+// finishBody right after optimizeBlocks and removeNilBlocks.
+func resolveSPMDSwitchChains(fn *Function) {
+	for _, chain := range fn.SPMDSwitchChains {
+		chain.DoneBlock = resolveBlock(fn, chain.DoneBlock)
+		if chain.DefaultBlock != nil {
+			chain.DefaultBlock = resolveBlock(fn, chain.DefaultBlock)
+		}
+	}
+}
+
+// resolveBlock returns the surviving block after optimizeBlocks may have
+// eliminated the original block via fuseBlocks or jumpThreading.
+// For fused blocks, the instructions' Block() returns the absorbing block.
+// For jump-threaded blocks, the successor is the redirect target.
+func resolveBlock(fn *Function, block *BasicBlock) *BasicBlock {
+	if blockInFunction(fn, block) {
+		return block
+	}
+	// fuseBlocks: instructions moved to absorbing block via setBlock.
+	if len(block.Instrs) > 0 {
+		if surviving := block.Instrs[0].Block(); surviving != block && blockInFunction(fn, surviving) {
+			return surviving
+		}
+	}
+	// jumpThreading: successor is the redirect target.
+	if len(block.Succs) > 0 {
+		return resolveBlock(fn, block.Succs[0])
+	}
+	return block
+}

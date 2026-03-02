@@ -228,6 +228,72 @@ func main() {
 	}
 }
 
+func TestVaryingSwitch_DefaultBlockResolution(t *testing.T) {
+	// The default case body block may be fused into the last switch.next
+	// block by optimizeBlocks (fuseBlocks). Verify that SPMDSwitchChain
+	// block pointers are resolved to surviving blocks after optimization.
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		switch i % 4 {
+		case 0:
+			_ = i
+		case 1:
+			_ = i + 1
+		case 2:
+			_ = i + 2
+		default:
+			_ = i + 3
+		}
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+
+	if len(mainFn.SPMDSwitchChains) != 1 {
+		t.Fatalf("expected 1 SPMDSwitchChain, got %d", len(mainFn.SPMDSwitchChains))
+	}
+
+	chain := mainFn.SPMDSwitchChains[0]
+
+	// DefaultBlock must point to a valid block in the function.
+	if chain.DefaultBlock == nil {
+		t.Fatal("DefaultBlock is nil, expected non-nil for switch with default case")
+	}
+	found := false
+	for _, blk := range mainFn.Blocks {
+		if blk == chain.DefaultBlock {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("DefaultBlock (index %d, comment %q) not found in function blocks",
+			chain.DefaultBlock.Index, chain.DefaultBlock.Comment)
+	}
+
+	// DoneBlock must also be valid.
+	found = false
+	for _, blk := range mainFn.Blocks {
+		if blk == chain.DoneBlock {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("DoneBlock (index %d, comment %q) not found in function blocks",
+			chain.DoneBlock.Index, chain.DoneBlock.Comment)
+	}
+
+	// DefaultBlock.Index must be within range.
+	if chain.DefaultBlock.Index >= len(mainFn.Blocks) {
+		t.Errorf("DefaultBlock.Index=%d out of range for %d blocks",
+			chain.DefaultBlock.Index, len(mainFn.Blocks))
+	}
+}
+
 func TestVaryingSwitchChain_String(t *testing.T) {
 	src := `package main
 

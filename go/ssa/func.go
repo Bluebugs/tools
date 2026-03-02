@@ -371,6 +371,13 @@ func (f *Function) finishBody() {
 
 	optimizeBlocks(f)
 
+	// Resolve SPMD switch chain block pointers after optimizeBlocks
+	// may have fused or eliminated blocks (e.g., fuseBlocks merges
+	// a single-Jump switch.next into the default body block).
+	if len(f.SPMDSwitchChains) > 0 {
+		resolveSPMDSwitchChains(f)
+	}
+
 	buildReferrers(f)
 
 	buildDomTree(f)
