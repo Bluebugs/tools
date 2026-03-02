@@ -361,9 +361,10 @@ type Function struct {
 	Blocks    []*BasicBlock // basic blocks of the function; nil => external
 	Recover   *BasicBlock   // optional; control transfers here after recovered panic
 	AnonFuncs []*Function   // anonymous functions (from FuncLit,RangeStmt) directly beneath this one
-	SPMDLoops        []*SPMDLoopInfo    // SPMD go-for loop metadata; nil if no SPMD loops
-	SPMDSwitchChains []*SPMDSwitchChain // varying switch chain metadata; nil if none
-	referrers        []Instruction      // referring instructions (iff Parent() != nil)
+	SPMDLoops          []*SPMDLoopInfo      // SPMD go-for loop metadata; nil if no SPMD loops
+	SPMDSwitchChains   []*SPMDSwitchChain   // varying switch chain metadata; nil if none
+	SPMDBooleanChains  []*SPMDBooleanChain  // compound boolean chain metadata; nil if none
+	referrers          []Instruction        // referring instructions (iff Parent() != nil)
 	anonIdx   int32         // position of a nested function in parent's AnonFuncs. fn.Parent()!=nil => fn.Parent().AnonFunc[fn.anonIdx] == fn.
 
 	typeparams     *types.TypeParamList // type parameters of this function. typeparams.Len() > 0 => generic or instance of generic function
@@ -383,8 +384,9 @@ type Function struct {
 	jump         *types.Var               // synthetic variable for the yield state (non-nil => range-over-func)
 	deferstack   *types.Var               // synthetic variable holding enclosing ssa:deferstack()
 	source       *Function                // nearest enclosing source function
-	exits        []*exit                  // exits of the function that need to be resolved
-	uniq         int64                    // source of unique ints within the source tree while building
+	exits             []*exit                  // exits of the function that need to be resolved
+	uniq              int64                    // source of unique ints within the source tree while building
+	pendingBoolChains []*booleanChainCtx       // stack for boolean chain accumulation during cond()
 }
 
 // SPMDLoopInfo holds structured information about an SPMD go-for loop,
@@ -429,6 +431,27 @@ type SPMDSwitchChain struct {
 	Cases        []*If        // ordered If instructions (one per case clause)
 	DefaultBlock *BasicBlock  // the default case block; nil if no default
 	DoneBlock    *BasicBlock  // merge point after switch (switch.done)
+}
+
+// SPMDBooleanChain represents a short-circuit boolean expression (&&/||)
+// that was lowered into a chain of If blocks by cond().
+// Populated during SSA construction when a compound boolean condition
+// has 2+ terms. Block pointers are resolved after optimizeBlocks.
+type SPMDBooleanChain struct {
+	Op        token.Token   // token.LAND (&&) or token.LOR (||)
+	Blocks    []*BasicBlock // ordered chain: [first, ..., last] condition blocks
+	ThenBlock *BasicBlock   // true-exit target (last block's Succs[0] for LAND)
+	ElseBlock *BasicBlock   // false-exit target (last block's Succs[1] for LOR)
+	IsVarying bool          // true when any condition in chain involves *types.SPMDType
+}
+
+// booleanChainCtx is a temporary accumulator used during cond() recursion
+// to collect blocks forming a boolean chain. Not exported.
+type booleanChainCtx struct {
+	op           token.Token // LAND or LOR
+	sharedTarget *BasicBlock // f for LAND, t for LOR
+	blocks       []*BasicBlock // leaf If blocks, appended in execution order
+	expr         ast.Expr    // top-level expression (for IsVarying via exprHasSPMDType)
 }
 
 // BasicBlock represents an SSA basic block.
