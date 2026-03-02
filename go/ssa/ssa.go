@@ -1382,6 +1382,73 @@ type Store struct {
 	pos  token.Pos
 }
 
+// SPMDSelect yields X where Mask is active, Y where inactive, per SIMD lane.
+// It replaces Phi at varying merge points after a predicateSPMD transformation pass.
+// Mask must be of type Varying[mask] (spmd.NewVaryingMask()).
+// X and Y must have identical types.
+// Lanes is the lane count from the enclosing SPMD loop.
+//
+// Example printed form:
+//
+//	t5 = spmd_select<4> t2 t3 t4
+type SPMDSelect struct {
+	register
+	Mask  Value // Varying[mask] — platform-native execution mask
+	X     Value // value for active lanes
+	Y     Value // value for inactive lanes
+	Lanes int   // lane count from enclosing SPMD loop
+}
+
+// SPMDLoad loads from Addr only for lanes where Mask is active.
+// Inactive lanes receive a zero value. It replaces UnOp{MUL} in varying paths.
+// Mask must be of type Varying[mask] (spmd.NewVaryingMask()).
+// Addr must be a pointer type; the loaded type is Addr.Type().(*types.Pointer).Elem().
+// Lanes is the lane count from the enclosing SPMD loop.
+//
+// Example printed form:
+//
+//	t3 = spmd_load<16> t1 mask t2
+type SPMDLoad struct {
+	register
+	Addr  Value     // pointer to load from
+	Mask  Value     // Varying[mask] — which lanes execute the load
+	Lanes int       // lane count from enclosing SPMD loop
+	pos   token.Pos // optional source position
+}
+
+// SPMDStore stores Val to Addr only for lanes where Mask is active.
+// It is an effect-only instruction (no SSA value produced). It replaces Store in varying paths.
+// Mask must be of type Varying[mask] (spmd.NewVaryingMask()).
+// Addr must be a pointer type.
+// Lanes is the lane count from the enclosing SPMD loop.
+//
+// Example printed form:
+//
+//	spmd_store<16> t1 t2 mask t3
+type SPMDStore struct {
+	anInstruction
+	Addr  Value     // pointer to store to
+	Val   Value     // value to store
+	Mask  Value     // Varying[mask] — which lanes execute the store
+	Lanes int       // lane count from enclosing SPMD loop
+	pos   token.Pos // optional source position
+}
+
+// SPMDIndex produces consecutive lane indices [0, 1, ..., Lanes-1]
+// in the loop's natural element type. It replaces lanes.Index() calls inside SPMD loops.
+// ElemType is the loop's natural element type (byte, int16, int32, etc.).
+// Lanes is the lane count from the enclosing SPMD loop.
+// The result type is Varying[ElemType].
+//
+// Example printed form:
+//
+//	t1 = spmd_index<16, byte>
+type SPMDIndex struct {
+	register
+	Lanes    int        // lane count from enclosing SPMD loop
+	ElemType types.Type // loop's natural element type (byte, int16, int32, etc.)
+}
+
 // The MapUpdate instruction updates the association of Map[Key] to
 // Value.
 //
@@ -1941,3 +2008,36 @@ func (v *Const) Operands(rands []*Value) []*Value     { return rands }
 func (v *Function) Operands(rands []*Value) []*Value  { return rands }
 func (v *Global) Operands(rands []*Value) []*Value    { return rands }
 func (v *Parameter) Operands(rands []*Value) []*Value { return rands }
+
+// SPMD predicated instruction operands.
+
+func (v *SPMDSelect) Operands(rands []*Value) []*Value {
+	return append(rands, &v.Mask, &v.X, &v.Y)
+}
+
+func (v *SPMDLoad) Operands(rands []*Value) []*Value {
+	return append(rands, &v.Addr, &v.Mask)
+}
+
+func (s *SPMDStore) Operands(rands []*Value) []*Value {
+	return append(rands, &s.Addr, &s.Val, &s.Mask)
+}
+
+func (v *SPMDIndex) Operands(rands []*Value) []*Value {
+	return rands // no value operands; Lanes and ElemType are not Values
+}
+
+// Pos methods for SPMD predicated instructions.
+// SPMDSelect and SPMDIndex return NoPos because they are synthetic nodes
+// with no single source location (analogous to Phi).
+
+func (v *SPMDSelect) Pos() token.Pos { return token.NoPos }
+func (v *SPMDLoad) Pos() token.Pos   { return v.pos }
+func (s *SPMDStore) Pos() token.Pos  { return s.pos }
+func (v *SPMDIndex) Pos() token.Pos  { return token.NoPos }
+
+// Type returns Varying[ElemType]. Computed dynamically so SPMDIndex works
+// correctly whether constructed via emitSPMDIndex or directly.
+func (v *SPMDIndex) Type() types.Type {
+	return types.NewVarying(v.ElemType)
+}

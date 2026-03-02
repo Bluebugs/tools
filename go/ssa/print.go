@@ -384,6 +384,43 @@ func (s *Store) String() string {
 	return fmt.Sprintf("*%s = %s", relName(s.Addr, s), relName(s.Val, s))
 }
 
+// spmdRelName is like relName but safe to call on instructions with no parent block.
+// When the instruction has no block set, the package context is omitted (nil).
+func spmdRelName(v Value, i Instruction) string {
+	if i == nil || i.Block() == nil {
+		return relName(v, nil)
+	}
+	return relName(v, i)
+}
+
+// spmdRelPkg returns the package for type printing, or nil if block is not set.
+func spmdRelPkg(i Instruction) *types.Package {
+	if i == nil || i.Block() == nil {
+		return nil
+	}
+	return i.Parent().relPkg()
+}
+
+func (v *SPMDSelect) String() string {
+	return fmt.Sprintf("spmd_select<%d> %s %s %s",
+		v.Lanes, spmdRelName(v.Mask, v), spmdRelName(v.X, v), spmdRelName(v.Y, v))
+}
+
+func (v *SPMDLoad) String() string {
+	return fmt.Sprintf("spmd_load<%d> %s mask %s",
+		v.Lanes, spmdRelName(v.Addr, v), spmdRelName(v.Mask, v))
+}
+
+func (s *SPMDStore) String() string {
+	return fmt.Sprintf("spmd_store<%d> %s %s mask %s",
+		s.Lanes, spmdRelName(s.Addr, s), spmdRelName(s.Val, s), spmdRelName(s.Mask, s))
+}
+
+func (v *SPMDIndex) String() string {
+	from := spmdRelPkg(v)
+	return fmt.Sprintf("spmd_index<%d, %s>", v.Lanes, relType(v.ElemType, from))
+}
+
 func (s *MapUpdate) String() string {
 	return fmt.Sprintf("%s[%s] = %s", relName(s.Map, s), relName(s.Key, s), relName(s.Value, s))
 }

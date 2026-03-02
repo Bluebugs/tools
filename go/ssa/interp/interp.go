@@ -427,6 +427,9 @@ func visitInstr(fr *frame, instr ssa.Instruction) continuation {
 		}
 		fr.env[instr] = r
 
+	case *ssa.SPMDSelect, *ssa.SPMDLoad, *ssa.SPMDStore, *ssa.SPMDIndex:
+		panic(fmt.Sprintf("SPMD instruction %T not supported by the scalar interpreter", instr))
+
 	default:
 		panic(fmt.Sprintf("unexpected instruction: %T", instr))
 	}

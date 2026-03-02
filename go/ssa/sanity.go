@@ -17,6 +17,8 @@ import (
 	"os"
 	"slices"
 	"strings"
+
+	"golang.org/x/tools/go/types/spmd"
 )
 
 type sanity struct {
@@ -129,6 +131,17 @@ func (s *sanity) checkInstr(idx int, instr Instruction) {
 		}
 
 	case *BinOp:
+		// Allow AND/OR/XOR/AND_NOT on Varying[mask] operands in addition to
+		// the normal numeric operations. This supports mask algebra in SPMD code.
+		if isMaskBinOp(instr.Op) {
+			xIsMask := spmd.IsVaryingMask(instr.X.Type())
+			yIsMask := spmd.IsVaryingMask(instr.Y.Type())
+			if xIsMask != yIsMask {
+				s.errorf("BinOp %s: Varying[mask] operand mismatch: X=%s Y=%s",
+					instr.Op, instr.X.Type(), instr.Y.Type())
+			}
+			// If both are Varying[mask], the BinOp is valid regardless of other checks.
+		}
 	case *Call:
 		if common := instr.Call; common.IsInvoke() {
 			if !types.IsInterface(common.Value.Type()) {
@@ -139,8 +152,12 @@ func (s *sanity) checkInstr(idx int, instr Instruction) {
 	case *ChangeType:
 	case *SliceToArrayPointer:
 	case *Convert:
-		if from := instr.X.Type(); !isBasicConvTypes(from) {
-			if to := instr.Type(); !isBasicConvTypes(to) {
+		// Allow Varying[bool] <-> Varying[mask] conversions in SPMD code.
+		from, to := instr.X.Type(), instr.Type()
+		if isVaryingBoolToMask(from, to) || isVaryingBoolToMask(to, from) {
+			// Valid SPMD conversion: Varying[bool] <-> Varying[mask].
+		} else if !isBasicConvTypes(from) {
+			if !isBasicConvTypes(to) {
 				s.errorf("convert %s -> %s: at least one type must be basic (or all basic, []byte, or []rune)", from, to)
 			}
 		}
@@ -181,6 +198,57 @@ func (s *sanity) checkInstr(idx int, instr Instruction) {
 	case *UnOp:
 	case *DebugRef:
 		// TODO(adonovan): implement checks.
+
+	case *SPMDSelect:
+		if instr.Lanes <= 0 {
+			s.errorf("SPMDSelect: Lanes must be > 0, got %d", instr.Lanes)
+		}
+		if !spmd.IsVaryingMask(instr.Mask.Type()) {
+			s.errorf("SPMDSelect: Mask must be Varying[mask], got %s", instr.Mask.Type())
+		}
+		if !types.Identical(instr.X.Type(), instr.Y.Type()) {
+			s.errorf("SPMDSelect: X and Y must have identical types, got %s and %s",
+				instr.X.Type(), instr.Y.Type())
+		}
+
+	case *SPMDLoad:
+		if instr.Lanes <= 0 {
+			s.errorf("SPMDLoad: Lanes must be > 0, got %d", instr.Lanes)
+		}
+		if !spmd.IsVaryingMask(instr.Mask.Type()) {
+			s.errorf("SPMDLoad: Mask must be Varying[mask], got %s", instr.Mask.Type())
+		}
+		if ptrType, ok := instr.Addr.Type().Underlying().(*types.Pointer); !ok {
+			s.errorf("SPMDLoad: Addr must be a pointer type, got %s", instr.Addr.Type())
+		} else if !types.Identical(instr.Type(), ptrType.Elem()) {
+			s.errorf("SPMDLoad: result type %s does not match Addr element type %s",
+				instr.Type(), ptrType.Elem())
+		}
+
+	case *SPMDStore:
+		if instr.Lanes <= 0 {
+			s.errorf("SPMDStore: Lanes must be > 0, got %d", instr.Lanes)
+		}
+		if !spmd.IsVaryingMask(instr.Mask.Type()) {
+			s.errorf("SPMDStore: Mask must be Varying[mask], got %s", instr.Mask.Type())
+		}
+		if ptrType, ok := instr.Addr.Type().Underlying().(*types.Pointer); !ok {
+			s.errorf("SPMDStore: Addr must be a pointer type, got %s", instr.Addr.Type())
+		} else if !types.Identical(instr.Val.Type(), ptrType.Elem()) {
+			s.errorf("SPMDStore: Val type %s does not match Addr element type %s",
+				instr.Val.Type(), ptrType.Elem())
+		}
+
+	case *SPMDIndex:
+		if instr.Lanes <= 0 {
+			s.errorf("SPMDIndex: Lanes must be > 0, got %d", instr.Lanes)
+		}
+		if instr.ElemType == nil {
+			s.errorf("SPMDIndex: ElemType must not be nil")
+		} else if _, ok := instr.ElemType.Underlying().(*types.Basic); !ok {
+			s.errorf("SPMDIndex: ElemType must be a basic type, got %s", instr.ElemType)
+		}
+
 	default:
 		panic(fmt.Sprintf("Unknown instruction type: %T", instr))
 	}
@@ -652,6 +720,35 @@ func (s *sanity) checkFunction(fn *Function) bool {
 	}
 	s.fn = nil
 	return !s.insane
+}
+
+// isMaskBinOp reports whether op is a bitwise operation that can be
+// applied to Varying[mask] operands (AND, OR, XOR, AND_NOT).
+func isMaskBinOp(op token.Token) bool {
+	switch op {
+	case token.AND, token.OR, token.XOR, token.AND_NOT:
+		return true
+	}
+	return false
+}
+
+// isVaryingBoolToMask reports whether from is Varying[bool] and to is Varying[mask]
+// (or vice versa when called with swapped arguments).
+func isVaryingBoolToMask(from, to types.Type) bool {
+	fromST, fromOK := from.(*types.SPMDType)
+	toST, toOK := to.(*types.SPMDType)
+	if !fromOK || !toOK {
+		return false
+	}
+	if !fromST.IsVarying() || !toST.IsVarying() {
+		return false
+	}
+	// Check: from is Varying[bool], to is Varying[mask].
+	fromBasic, fromIsBasic := fromST.Elem().(*types.Basic)
+	if !fromIsBasic || fromBasic.Kind() != types.Bool {
+		return false
+	}
+	return spmd.IsMask(toST.Elem())
 }
 
 // sanityCheckPackage checks invariants of packages upon creation.

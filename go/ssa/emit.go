@@ -627,3 +627,63 @@ func createRecoverBlock(f *Function) {
 
 	f.currentBlock = saved
 }
+
+// Used by the predicateSPMD transformation pass.
+
+// emitSPMDSelect emits an SPMDSelect instruction into the current block of f.
+// mask must be of type Varying[mask], x and y must have identical types, and
+// lanes must be > 0. The result type equals x.Type().
+func emitSPMDSelect(f *Function, mask, x, y Value, lanes int) *SPMDSelect {
+	v := &SPMDSelect{
+		Mask:  mask,
+		X:     x,
+		Y:     y,
+		Lanes: lanes,
+	}
+	v.setType(x.Type())
+	f.emit(v)
+	return v
+}
+
+// emitSPMDLoad emits an SPMDLoad instruction into the current block of f.
+// addr must be a pointer type; the loaded type is addr.Type().(*types.Pointer).Elem().
+// mask must be of type Varying[mask] and lanes must be > 0.
+func emitSPMDLoad(f *Function, addr, mask Value, lanes int, pos token.Pos) *SPMDLoad {
+	elemType := typeparams.MustDeref(addr.Type())
+	v := &SPMDLoad{
+		Addr:  addr,
+		Mask:  mask,
+		Lanes: lanes,
+		pos:   pos,
+	}
+	v.setType(elemType)
+	f.emit(v)
+	return v
+}
+
+// emitSPMDStore emits an SPMDStore instruction into the current block of f.
+// addr must be a pointer type, mask must be of type Varying[mask], and lanes must be > 0.
+func emitSPMDStore(f *Function, addr, val, mask Value, lanes int, pos token.Pos) *SPMDStore {
+	s := &SPMDStore{
+		Addr:  addr,
+		Val:   val,
+		Mask:  mask,
+		Lanes: lanes,
+		pos:   pos,
+	}
+	f.emit(s)
+	return s
+}
+
+// emitSPMDIndex emits an SPMDIndex instruction into the current block of f.
+// lanes must be > 0 and elemType must be a basic type.
+// The result type is Varying[elemType].
+func emitSPMDIndex(f *Function, lanes int, elemType types.Type) *SPMDIndex {
+	v := &SPMDIndex{
+		Lanes:    lanes,
+		ElemType: elemType,
+	}
+	// Type() is computed dynamically from ElemType, so no setType call needed.
+	f.emit(v)
+	return v
+}
