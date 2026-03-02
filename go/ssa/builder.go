@@ -213,7 +213,18 @@ func (b *builder) cond(fn *Function, e ast.Expr, t, f *BasicBlock) {
 	// The value of a constant condition may be platform-specific,
 	// and may cause blocks that are reachable in some configuration
 	// to be hidden from subsequent analyses such as bug-finding tools.
-	emitIf(fn, b.expr(fn, e), t, f)
+	val := b.expr(fn, e)
+	// Save currentBlock before emitIf clears fn.currentBlock.
+	block := fn.currentBlock
+	emitIf(fn, val, t, f)
+	// Tag the If instruction as varying when the condition expression
+	// involves an SPMD (Varying[T]) type, so downstream consumers
+	// (e.g. the TinyGo SPMD backend) know to apply mask-based control flow.
+	if exprHasSPMDType(fn, e) {
+		if ifInstr, ok := block.Instrs[len(block.Instrs)-1].(*If); ok {
+			ifInstr.IsVarying = true
+		}
+	}
 }
 
 // logicalBinop emits code to fn to evaluate e, a &&- or
@@ -1434,6 +1445,17 @@ func (b *builder) switchStmt(fn *Function, s *ast.SwitchStmt, label *lblock) {
 	if label != nil {
 		label._break = done
 	}
+
+	// Detect varying switch: tag expression involves a *types.SPMDType.
+	isVaryingSwitch := s.Tag != nil && exprHasSPMDType(fn, s.Tag)
+	var switchChain *SPMDSwitchChain
+	if isVaryingSwitch {
+		switchChain = &SPMDSwitchChain{
+			TagValue:  tag,
+			DoneBlock: done,
+		}
+	}
+
 	// We pull the default case (if present) down to the end.
 	// But each fallthrough label must point to the next
 	// body block in source order, so we preallocate a
@@ -1472,8 +1494,17 @@ func (b *builder) switchStmt(fn *Function, s *ast.SwitchStmt, label *lblock) {
 			// instead of BinOp(EQL, tag, b.expr(cond))
 			// followed by If.  Don't forget conversions
 			// though.
-			cond := emitCompare(fn, token.EQL, tag, b.expr(fn, cond), cond.Pos())
-			emitIf(fn, cond, body, nextCond)
+			condVal := emitCompare(fn, token.EQL, tag, b.expr(fn, cond), cond.Pos())
+			// Save current block before emitIf clears it (emitIf sets fn.currentBlock = nil).
+			condBlock := fn.currentBlock
+			emitIf(fn, condVal, body, nextCond)
+			// Tag the emitted If instruction as varying when the switch tag is varying.
+			if isVaryingSwitch {
+				if ifInstr, ok := condBlock.Instrs[len(condBlock.Instrs)-1].(*If); ok {
+					ifInstr.IsVarying = true
+					switchChain.Cases = append(switchChain.Cases, ifInstr)
+				}
+			}
 			fn.currentBlock = nextCond
 		}
 		fn.currentBlock = body
@@ -1497,6 +1528,11 @@ func (b *builder) switchStmt(fn *Function, s *ast.SwitchStmt, label *lblock) {
 		}
 		b.stmtList(fn, *dfltBody)
 		fn.targets = fn.targets.tail
+	}
+	// Register the switch chain now that we know the default block.
+	if switchChain != nil {
+		switchChain.DefaultBlock = dfltBlock
+		fn.SPMDSwitchChains = append(fn.SPMDSwitchChains, switchChain)
 	}
 	emitJump(fn, done)
 	fn.currentBlock = done

@@ -313,6 +313,9 @@ func (s *If) String() string {
 		tblock = s.block.Succs[0].Index
 		fblock = s.block.Succs[1].Index
 	}
+	if s.IsVarying {
+		return fmt.Sprintf("if varying %s goto %d else %d", relName(s.Cond, s), tblock, fblock)
+	}
 	return fmt.Sprintf("if %s goto %d else %d", relName(s.Cond, s), tblock, fblock)
 }
 

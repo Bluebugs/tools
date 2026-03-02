@@ -592,6 +592,28 @@ func (s *sanity) checkFunction(fn *Function) bool {
 		}
 	}
 
+	// Validate SPMD switch chain info.
+	for i, chain := range fn.SPMDSwitchChains {
+		if chain.TagValue == nil {
+			s.errorf("SPMDSwitchChain %d: TagValue is nil", i)
+		}
+		for j, ifInstr := range chain.Cases {
+			if ifInstr == nil {
+				s.errorf("SPMDSwitchChain %d: Cases[%d] is nil", i, j)
+			} else if !ifInstr.IsVarying {
+				s.errorf("SPMDSwitchChain %d: Cases[%d] not marked IsVarying", i, j)
+			}
+		}
+		if chain.DefaultBlock != nil && chain.DefaultBlock.parent != fn {
+			s.errorf("SPMDSwitchChain %d: DefaultBlock belongs to different function", i)
+		}
+		if chain.DoneBlock == nil {
+			s.errorf("SPMDSwitchChain %d: DoneBlock is nil", i)
+		} else if chain.DoneBlock.parent != fn {
+			s.errorf("SPMDSwitchChain %d: DoneBlock belongs to different function", i)
+		}
+	}
+
 	for i, anon := range fn.AnonFuncs {
 		if anon.Parent() != fn {
 			s.errorf("AnonFuncs[%d]=%s but %s.Parent()=%s", i, anon, anon, anon.Parent())

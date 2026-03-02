@@ -361,8 +361,9 @@ type Function struct {
 	Blocks    []*BasicBlock // basic blocks of the function; nil => external
 	Recover   *BasicBlock   // optional; control transfers here after recovered panic
 	AnonFuncs []*Function   // anonymous functions (from FuncLit,RangeStmt) directly beneath this one
-	SPMDLoops []*SPMDLoopInfo // SPMD go-for loop metadata; nil if no SPMD loops
-	referrers []Instruction // referring instructions (iff Parent() != nil)
+	SPMDLoops        []*SPMDLoopInfo    // SPMD go-for loop metadata; nil if no SPMD loops
+	SPMDSwitchChains []*SPMDSwitchChain // varying switch chain metadata; nil if none
+	referrers        []Instruction      // referring instructions (iff Parent() != nil)
 	anonIdx   int32         // position of a nested function in parent's AnonFuncs. fn.Parent()!=nil => fn.Parent().AnonFunc[fn.anonIdx] == fn.
 
 	typeparams     *types.TypeParamList // type parameters of this function. typeparams.Len() > 0 => generic or instance of generic function
@@ -419,6 +420,15 @@ type SPMDAccumulator struct {
 	Phi       *Phi  // the loop-carried phi
 	InitValue Value // value on entry edge (initial accumulator state)
 	BackValue Value // value on back-edge (updated accumulator state)
+}
+
+// SPMDSwitchChain groups the If instructions from a lowered varying switch statement.
+// Populated during SSA construction when the switch tag has *types.SPMDType.
+type SPMDSwitchChain struct {
+	TagValue     Value        // the original switch tag SSA value
+	Cases        []*If        // ordered If instructions (one per case clause)
+	DefaultBlock *BasicBlock  // the default case block; nil if no default
+	DoneBlock    *BasicBlock  // merge point after switch (switch.done)
 }
 
 // BasicBlock represents an SSA basic block.
@@ -1207,7 +1217,8 @@ type Jump struct {
 //	if t0 goto done else body
 type If struct {
 	anInstruction
-	Cond Value
+	Cond      Value
+	IsVarying bool // true when Cond derives from a *types.SPMDType value
 }
 
 // The Return instruction returns values and control back to the calling

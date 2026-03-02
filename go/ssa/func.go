@@ -754,6 +754,20 @@ func WriteFunction(buf *bytes.Buffer, f *Function) {
 		fmt.Fprintf(buf, " accumulators=%d", len(info.Accumulators))
 		fmt.Fprintln(buf)
 	}
+
+	// Print SPMD switch chain info.
+	for i, chain := range f.SPMDSwitchChains {
+		fmt.Fprintf(buf, "# SPMDSwitchChain %d:", i)
+		fmt.Fprintf(buf, " cases=%d", len(chain.Cases))
+		if chain.DefaultBlock != nil {
+			fmt.Fprintf(buf, " default=%d", chain.DefaultBlock.Index)
+		}
+		if chain.DoneBlock != nil {
+			fmt.Fprintf(buf, " done=%d", chain.DoneBlock.Index)
+		}
+		fmt.Fprintln(buf)
+	}
+
 	fmt.Fprintf(buf, "\n")
 }
 
