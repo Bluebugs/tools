@@ -362,3 +362,170 @@ func main() {
 		}
 	}
 }
+
+func TestBooleanChain_Or(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		if i < 2 || i > 10 {
+			_ = i
+		}
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+
+	if len(mainFn.SPMDBooleanChains) != 1 {
+		t.Fatalf("expected 1 SPMDBooleanChain, got %d", len(mainFn.SPMDBooleanChains))
+	}
+
+	chain := mainFn.SPMDBooleanChains[0]
+	if chain.Op != token.LOR {
+		t.Errorf("expected LOR, got %v", chain.Op)
+	}
+	if len(chain.Blocks) != 2 {
+		t.Errorf("expected 2 blocks in chain, got %d", len(chain.Blocks))
+	}
+	if !chain.IsVarying {
+		t.Error("expected IsVarying=true")
+	}
+	// All chain blocks should share the same true successor (ThenBlock).
+	for i, blk := range chain.Blocks {
+		if blk.Succs[0] != chain.ThenBlock {
+			t.Errorf("block %d: true successor is block %d, want %d",
+				i, blk.Succs[0].Index, chain.ThenBlock.Index)
+		}
+	}
+}
+
+func TestBooleanChain_TripleAnd(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		if i > 2 && i < 10 && i != 5 {
+			_ = i
+		}
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+
+	if len(mainFn.SPMDBooleanChains) != 1 {
+		t.Fatalf("expected 1 SPMDBooleanChain, got %d", len(mainFn.SPMDBooleanChains))
+	}
+
+	chain := mainFn.SPMDBooleanChains[0]
+	if chain.Op != token.LAND {
+		t.Errorf("expected LAND, got %v", chain.Op)
+	}
+	if len(chain.Blocks) != 3 {
+		t.Errorf("expected 3 blocks in chain, got %d", len(chain.Blocks))
+	}
+}
+
+func TestBooleanChain_TripleOr(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		if i < 2 || i > 10 || i == 5 {
+			_ = i
+		}
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+
+	if len(mainFn.SPMDBooleanChains) != 1 {
+		t.Fatalf("expected 1 SPMDBooleanChain, got %d", len(mainFn.SPMDBooleanChains))
+	}
+
+	chain := mainFn.SPMDBooleanChains[0]
+	if chain.Op != token.LOR {
+		t.Errorf("expected LOR, got %v", chain.Op)
+	}
+	if len(chain.Blocks) != 3 {
+		t.Errorf("expected 3 blocks in chain, got %d", len(chain.Blocks))
+	}
+}
+
+func TestBooleanChain_MixedAndOr(t *testing.T) {
+	// (a && b) || c produces inner LAND chain only.
+	// The outer LOR is not a flat chain (LHS is compound).
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		if (i > 2 && i < 10) || i == 0 {
+			_ = i
+		}
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+
+	// Should have exactly 1 chain: the inner LAND.
+	if len(mainFn.SPMDBooleanChains) != 1 {
+		t.Fatalf("expected 1 SPMDBooleanChain for (a&&b)||c, got %d", len(mainFn.SPMDBooleanChains))
+	}
+
+	chain := mainFn.SPMDBooleanChains[0]
+	if chain.Op != token.LAND {
+		t.Errorf("expected inner chain to be LAND, got %v", chain.Op)
+	}
+	if len(chain.Blocks) != 2 {
+		t.Errorf("expected 2 blocks in inner LAND chain, got %d", len(chain.Blocks))
+	}
+}
+
+func TestBooleanChain_UniformCondition(t *testing.T) {
+	// Uniform conditions should still create a chain but with IsVarying=false.
+	src := `package main
+
+func main() {
+	x := 3
+	y := 7
+	if x > 2 && y < 10 {
+		_ = x
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+
+	if len(mainFn.SPMDBooleanChains) != 1 {
+		t.Fatalf("expected 1 SPMDBooleanChain, got %d", len(mainFn.SPMDBooleanChains))
+	}
+
+	chain := mainFn.SPMDBooleanChains[0]
+	if chain.IsVarying {
+		t.Error("expected IsVarying=false for uniform conditions")
+	}
+}
+
+func TestBooleanChain_NotExclusion(t *testing.T) {
+	// !a && b should NOT form a chain (NOT inverts successor pattern).
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		if !(i > 5) && i < 10 {
+			_ = i
+		}
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+
+	// No chain because NOT breaks the shared-target invariant.
+	if len(mainFn.SPMDBooleanChains) != 0 {
+		t.Errorf("expected 0 SPMDBooleanChains for !a && b, got %d", len(mainFn.SPMDBooleanChains))
+	}
+}
