@@ -572,6 +572,26 @@ func (s *sanity) checkFunction(fn *Function) bool {
 	}
 
 	s.block = nil
+
+	// Validate SPMD loop info.
+	for i, info := range fn.SPMDLoops {
+		if info.EntryBlock != nil && info.EntryBlock.parent != fn {
+			s.errorf("SPMDLoop %d: EntryBlock belongs to different function", i)
+		}
+		if info.BodyBlock != nil && info.BodyBlock.parent != fn {
+			s.errorf("SPMDLoop %d: BodyBlock belongs to different function", i)
+		}
+		if info.LoopBlock != nil && info.LoopBlock.parent != fn {
+			s.errorf("SPMDLoop %d: LoopBlock belongs to different function", i)
+		}
+		if info.DoneBlock != nil && info.DoneBlock.parent != fn {
+			s.errorf("SPMDLoop %d: DoneBlock belongs to different function", i)
+		}
+		if info.MergedBodyLoop && info.BodyBlock != info.LoopBlock {
+			s.errorf("SPMDLoop %d: MergedBodyLoop=true but BodyBlock != LoopBlock", i)
+		}
+	}
+
 	for i, anon := range fn.AnonFuncs {
 		if anon.Parent() != fn {
 			s.errorf("AnonFuncs[%d]=%s but %s.Parent()=%s", i, anon, anon, anon.Parent())
