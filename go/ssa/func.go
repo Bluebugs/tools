@@ -382,6 +382,11 @@ func (f *Function) finishBody() {
 		lift(f)
 	}
 
+	// Resolve SPMD loop phis after lift has promoted allocs to phis.
+	if len(f.SPMDLoops) > 0 {
+		resolveSPMDLoops(f)
+	}
+
 	// clear remaining builder state
 	f.results = nil    // (used by lifting)
 	f.deferstack = nil // (used by lifting)

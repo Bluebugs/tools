@@ -90,6 +90,116 @@ func main() {
 	}
 }
 
+func TestSPMDLoopInfo_IterPhi_RangeInt(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		_ = i
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+	if len(mainFn.SPMDLoops) != 1 {
+		t.Fatalf("expected 1 SPMD loop, got %d", len(mainFn.SPMDLoops))
+	}
+
+	info := mainFn.SPMDLoops[0]
+
+	if info.IterPhi == nil {
+		t.Fatal("IterPhi is nil after lift")
+	}
+	if info.IterPhi.Comment != "rangeint.iter" {
+		t.Errorf("IterPhi.Comment = %q, want %q", info.IterPhi.Comment, "rangeint.iter")
+	}
+
+	if info.IncrBinOp == nil {
+		t.Fatal("IncrBinOp is nil after lift")
+	}
+
+	// MergedBodyLoop: for rangeInt, body and loop are typically fused.
+	if info.MergedBodyLoop {
+		if info.BodyBlock != info.LoopBlock {
+			t.Error("MergedBodyLoop=true but BodyBlock != LoopBlock")
+		}
+	}
+}
+
+func TestSPMDLoopInfo_Accumulators(t *testing.T) {
+	// Use a uniform accumulator (sum += 1) to satisfy the SPMD type checker:
+	// inside a go-for loop, the iteration variable i is varying, so assigning
+	// it to a uniform sum would be a type error. Accumulating a uniform
+	// constant is valid and still produces a loop-carried phi after lift.
+	src := `package main
+
+func main() {
+	sum := 0
+	for i := range 16 {
+		_ = i
+		sum += 1
+	}
+	_ = sum
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+	if len(mainFn.SPMDLoops) != 1 {
+		t.Fatalf("expected 1 SPMD loop, got %d", len(mainFn.SPMDLoops))
+	}
+
+	info := mainFn.SPMDLoops[0]
+
+	// sum is a loop-carried accumulator.
+	if len(info.Accumulators) < 1 {
+		t.Fatalf("expected at least 1 accumulator, got %d", len(info.Accumulators))
+	}
+
+	acc := info.Accumulators[0]
+	if acc.Phi == nil {
+		t.Error("Accumulator.Phi is nil")
+	}
+	if acc.InitValue == nil {
+		t.Error("Accumulator.InitValue is nil")
+	}
+	if acc.BackValue == nil {
+		t.Error("Accumulator.BackValue is nil")
+	}
+}
+
+func TestSPMDLoopInfo_IterPhi_RangeIndexed(t *testing.T) {
+	src := `package main
+
+func main() {
+	data := []int{1, 2, 3, 4}
+	for i := range data {
+		_ = i
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+	if len(mainFn.SPMDLoops) != 1 {
+		t.Fatalf("expected 1 SPMD loop, got %d", len(mainFn.SPMDLoops))
+	}
+
+	info := mainFn.SPMDLoops[0]
+
+	if info.IterPhi == nil {
+		t.Fatal("IterPhi is nil after lift for rangeIndexed")
+	}
+	if info.IterPhi.Comment != "rangeindex" {
+		t.Errorf("IterPhi.Comment = %q, want %q", info.IterPhi.Comment, "rangeindex")
+	}
+	if info.IsRangeIndex != true {
+		t.Error("IsRangeIndex should be true")
+	}
+	// rangeIndexed blocks should NOT be merged.
+	if info.MergedBodyLoop {
+		t.Error("MergedBodyLoop should be false for rangeIndexed")
+	}
+}
+
 func TestSPMDLoopInfo_RangeIndexed(t *testing.T) {
 	src := `package main
 
