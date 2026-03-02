@@ -2315,6 +2315,12 @@ func (b *builder) rangeStmt(fn *Function, s *ast.RangeStmt, label *lblock) {
 
 	x := b.expr(fn, s.X)
 
+	// Capture the entry block for SPMD loop info.
+	var spmdEntryBlock *BasicBlock
+	if s.IsSpmd {
+		spmdEntryBlock = fn.currentBlock
+	}
+
 	var k, v Value
 	var loop, done *BasicBlock
 	switch rt := typeparams.CoreType(x.Type()).(type) {
@@ -2349,6 +2355,35 @@ func (b *builder) rangeStmt(fn *Function, s *ast.RangeStmt, label *lblock) {
 
 	default:
 		panic("Cannot range over: " + rt.String())
+	}
+
+	// Record SPMD loop structure.
+	if s.IsSpmd && loop != nil && done != nil {
+		bodyBlock := fn.currentBlock // rangeInt/rangeIndexed leave currentBlock = body
+		info := &SPMDLoopInfo{
+			EntryBlock:   spmdEntryBlock,
+			BodyBlock:    bodyBlock,
+			LoopBlock:    loop,
+			DoneBlock:    done,
+			BoundValue:   x,
+			LaneCount:    int(s.LaneCount),
+			IsRangeIndex: false, // updated below for rangeIndexed
+		}
+		// Determine IsRangeIndex from the range type.
+		switch typeparams.CoreType(x.Type()).(type) {
+		case *types.Slice, *types.Array, *types.Pointer:
+			info.IsRangeIndex = true
+		}
+		// Save iter alloc for post-lift phi resolution.
+		// The iter alloc is the last matching Alloc in fn.Locals.
+		for i := len(fn.Locals) - 1; i >= 0; i-- {
+			a := fn.Locals[i]
+			if a.Comment == "rangeint.iter" || a.Comment == "rangeindex" {
+				info.iterAlloc = a
+				break
+			}
+		}
+		fn.SPMDLoops = append(fn.SPMDLoops, info)
 	}
 
 	if s.Tok == token.DEFINE && afterGo122 {
