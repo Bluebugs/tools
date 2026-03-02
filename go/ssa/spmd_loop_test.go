@@ -266,3 +266,116 @@ func main() {
 		t.Errorf("WriteTo output does not contain SPMDLoop info:\n%s", output)
 	}
 }
+
+func TestSPMDLoopInfo_NonSPMD(t *testing.T) {
+	src := `package main
+
+func main() {
+	sum := 0
+	for i := range 16 {
+		sum += i
+	}
+	_ = sum
+}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately NOT setting IsSpmd
+
+	mode := ssa.SanityCheckFunctions
+	pkg, _, err := ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{f}, mode,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mainFn := pkg.Func("main")
+	if len(mainFn.SPMDLoops) != 0 {
+		t.Errorf("expected 0 SPMD loops for non-SPMD range, got %d", len(mainFn.SPMDLoops))
+	}
+}
+
+func TestSPMDLoopInfo_MultipleLoops(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		_ = i
+	}
+	for j := range 32 {
+		_ = j
+	}
+}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Set IsSpmd on ALL RangeStmts
+	ast.Inspect(f, func(n ast.Node) bool {
+		if rs, ok := n.(*ast.RangeStmt); ok {
+			rs.IsSpmd = true
+			rs.LaneCount = 4
+		}
+		return true
+	})
+
+	mode := ssa.SanityCheckFunctions
+	pkg, _, err := ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{f}, mode,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mainFn := pkg.Func("main")
+	if len(mainFn.SPMDLoops) != 2 {
+		t.Fatalf("expected 2 SPMD loops, got %d", len(mainFn.SPMDLoops))
+	}
+
+	for i, info := range mainFn.SPMDLoops {
+		if info.IterPhi == nil {
+			t.Errorf("loop %d: IterPhi is nil", i)
+		}
+		if info.EntryBlock == nil {
+			t.Errorf("loop %d: EntryBlock is nil", i)
+		}
+		if info.DoneBlock == nil {
+			t.Errorf("loop %d: DoneBlock is nil", i)
+		}
+	}
+}
+
+func TestSPMDLoopInfo_MultipleAccumulators(t *testing.T) {
+	src := `package main
+
+func main() {
+	sum := 0
+	count := 0
+	for i := range 16 {
+		_ = i
+		sum += 1
+		count += 1
+	}
+	_ = sum
+	_ = count
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+	if len(mainFn.SPMDLoops) != 1 {
+		t.Fatalf("expected 1 SPMD loop, got %d", len(mainFn.SPMDLoops))
+	}
+
+	info := mainFn.SPMDLoops[0]
+	if len(info.Accumulators) < 2 {
+		t.Fatalf("expected at least 2 accumulators (sum, count), got %d", len(info.Accumulators))
+	}
+}
