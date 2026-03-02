@@ -720,6 +720,40 @@ func WriteFunction(buf *bytes.Buffer, f *Function) {
 			buf.WriteString("\n")
 		}
 	}
+
+	// Print SPMD loop info.
+	for i, info := range f.SPMDLoops {
+		fmt.Fprintf(buf, "# SPMDLoop %d:", i)
+		if info.IsRangeIndex {
+			fmt.Fprint(buf, " rangeindex")
+		} else {
+			fmt.Fprint(buf, " rangeint")
+		}
+		fmt.Fprintf(buf, " lanes=%d", info.LaneCount)
+		if info.MergedBodyLoop {
+			fmt.Fprint(buf, " merged")
+		}
+		if info.EntryBlock != nil {
+			fmt.Fprintf(buf, " entry=%d", info.EntryBlock.Index)
+		}
+		if info.BodyBlock != nil {
+			fmt.Fprintf(buf, " body=%d", info.BodyBlock.Index)
+		}
+		if info.LoopBlock != nil && !info.MergedBodyLoop {
+			fmt.Fprintf(buf, " loop=%d", info.LoopBlock.Index)
+		}
+		if info.DoneBlock != nil {
+			fmt.Fprintf(buf, " done=%d", info.DoneBlock.Index)
+		}
+		if info.IterPhi != nil {
+			fmt.Fprintf(buf, " iter=%s", info.IterPhi.Name())
+		}
+		if info.IncrBinOp != nil {
+			fmt.Fprintf(buf, " incr=%s", info.IncrBinOp.Name())
+		}
+		fmt.Fprintf(buf, " accumulators=%d", len(info.Accumulators))
+		fmt.Fprintln(buf)
+	}
 	fmt.Fprintf(buf, "\n")
 }
 

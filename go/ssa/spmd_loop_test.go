@@ -1,11 +1,13 @@
 package ssa_test
 
 import (
+	"bytes"
 	"go/ast"
 	"go/importer"
 	"go/parser"
 	"go/token"
 	"go/types"
+	"strings"
 	"testing"
 
 	"golang.org/x/tools/go/ssa"
@@ -241,5 +243,26 @@ func main() {
 	// just verify it is positive.
 	if info.LaneCount <= 0 {
 		t.Errorf("LaneCount = %d, want > 0", info.LaneCount)
+	}
+}
+
+func TestSPMDLoopInfo_String(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		_ = i
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+
+	var buf bytes.Buffer
+	mainFn.WriteTo(&buf)
+	output := buf.String()
+
+	if !strings.Contains(output, "SPMDLoop") {
+		t.Errorf("WriteTo output does not contain SPMDLoop info:\n%s", output)
 	}
 }
