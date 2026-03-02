@@ -2,6 +2,7 @@ package ssa_test
 
 import (
 	"bytes"
+	"go/token"
 	"strings"
 	"testing"
 
@@ -316,5 +317,48 @@ func main() {
 	output := buf.String()
 	if !strings.Contains(output, "SPMDSwitchChain") {
 		t.Error("expected 'SPMDSwitchChain' in SSA output for varying switch")
+	}
+}
+
+func TestBooleanChain_And(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		if i > 2 && i < 10 {
+			_ = i
+		}
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+
+	if len(mainFn.SPMDBooleanChains) != 1 {
+		t.Fatalf("expected 1 SPMDBooleanChain, got %d", len(mainFn.SPMDBooleanChains))
+	}
+
+	chain := mainFn.SPMDBooleanChains[0]
+	if chain.Op != token.LAND {
+		t.Errorf("expected LAND, got %v", chain.Op)
+	}
+	if len(chain.Blocks) != 2 {
+		t.Errorf("expected 2 blocks in chain, got %d", len(chain.Blocks))
+	}
+	if chain.ThenBlock == nil {
+		t.Error("ThenBlock is nil")
+	}
+	if chain.ElseBlock == nil {
+		t.Error("ElseBlock is nil")
+	}
+	if !chain.IsVarying {
+		t.Error("expected IsVarying=true")
+	}
+	// All chain blocks should share the same false successor (ElseBlock).
+	for i, blk := range chain.Blocks {
+		if blk.Succs[1] != chain.ElseBlock {
+			t.Errorf("block %d (index %d): false successor is block %d, want %d",
+				i, blk.Index, blk.Succs[1].Index, chain.ElseBlock.Index)
+		}
 	}
 }

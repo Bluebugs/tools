@@ -186,17 +186,75 @@ func (b *builder) cond(fn *Function, e ast.Expr, t, f *BasicBlock) {
 	case *ast.BinaryExpr:
 		switch e.Op {
 		case token.LAND:
+			// Check if continuing an existing LAND chain (flat a && b && c).
+			continuing := false
+			if n := len(fn.pendingBoolChains); n > 0 {
+				top := fn.pendingBoolChains[n-1]
+				if top.op == token.LAND && top.sharedTarget == f {
+					continuing = true
+				}
+			}
+			if !continuing {
+				fn.pendingBoolChains = append(fn.pendingBoolChains, &booleanChainCtx{
+					op: token.LAND, sharedTarget: f, expr: e,
+				})
+			}
+
 			ltrue := fn.newBasicBlock("cond.true")
 			b.cond(fn, e.X, ltrue, f)
 			fn.currentBlock = ltrue
 			b.cond(fn, e.Y, t, f)
+
+			if !continuing {
+				ctx := fn.pendingBoolChains[len(fn.pendingBoolChains)-1]
+				fn.pendingBoolChains = fn.pendingBoolChains[:len(fn.pendingBoolChains)-1]
+				if len(ctx.blocks) > 1 {
+					chain := &SPMDBooleanChain{
+						Op:        token.LAND,
+						Blocks:    ctx.blocks,
+						ElseBlock: ctx.sharedTarget,
+						ThenBlock: ctx.blocks[len(ctx.blocks)-1].Succs[0],
+						IsVarying: exprHasSPMDType(fn, ctx.expr),
+					}
+					fn.SPMDBooleanChains = append(fn.SPMDBooleanChains, chain)
+				}
+			}
 			return
 
 		case token.LOR:
+			// Check if continuing an existing LOR chain (flat a || b || c).
+			continuing := false
+			if n := len(fn.pendingBoolChains); n > 0 {
+				top := fn.pendingBoolChains[n-1]
+				if top.op == token.LOR && top.sharedTarget == t {
+					continuing = true
+				}
+			}
+			if !continuing {
+				fn.pendingBoolChains = append(fn.pendingBoolChains, &booleanChainCtx{
+					op: token.LOR, sharedTarget: t, expr: e,
+				})
+			}
+
 			lfalse := fn.newBasicBlock("cond.false")
 			b.cond(fn, e.X, t, lfalse)
 			fn.currentBlock = lfalse
 			b.cond(fn, e.Y, t, f)
+
+			if !continuing {
+				ctx := fn.pendingBoolChains[len(fn.pendingBoolChains)-1]
+				fn.pendingBoolChains = fn.pendingBoolChains[:len(fn.pendingBoolChains)-1]
+				if len(ctx.blocks) > 1 {
+					chain := &SPMDBooleanChain{
+						Op:        token.LOR,
+						Blocks:    ctx.blocks,
+						ThenBlock: ctx.sharedTarget,
+						ElseBlock: ctx.blocks[len(ctx.blocks)-1].Succs[1],
+						IsVarying: exprHasSPMDType(fn, ctx.expr),
+					}
+					fn.SPMDBooleanChains = append(fn.SPMDBooleanChains, chain)
+				}
+			}
 			return
 		}
 
@@ -207,12 +265,7 @@ func (b *builder) cond(fn *Function, e ast.Expr, t, f *BasicBlock) {
 		}
 	}
 
-	// A traditional compiler would simplify "if false" (etc) here
-	// but we do not, for better fidelity to the source code.
-	//
-	// The value of a constant condition may be platform-specific,
-	// and may cause blocks that are reachable in some configuration
-	// to be hidden from subsequent analyses such as bug-finding tools.
+	// Base case: emit comparison and If instruction.
 	val := b.expr(fn, e)
 	// Save currentBlock before emitIf clears fn.currentBlock.
 	block := fn.currentBlock
@@ -223,6 +276,15 @@ func (b *builder) cond(fn *Function, e ast.Expr, t, f *BasicBlock) {
 	if exprHasSPMDType(fn, e) {
 		if ifInstr, ok := block.Instrs[len(block.Instrs)-1].(*If); ok {
 			ifInstr.IsVarying = true
+		}
+	}
+	// Append to active boolean chain if shared target matches.
+	// NOT inversions swap t/f, breaking the match, so they're excluded.
+	if n := len(fn.pendingBoolChains); n > 0 {
+		top := fn.pendingBoolChains[n-1]
+		if (top.op == token.LAND && f == top.sharedTarget) ||
+			(top.op == token.LOR && t == top.sharedTarget) {
+			top.blocks = append(top.blocks, block)
 		}
 	}
 }
