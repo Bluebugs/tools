@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"golang.org/x/tools/go/packages"
+	spmdpkg "golang.org/x/tools/go/types/spmd"
 	"golang.org/x/tools/go/types/typeutil"
 	"golang.org/x/tools/internal/testenv"
 )
@@ -464,5 +465,25 @@ func BenchmarkMap(b *testing.B) {
 				tmap.Len(),
 				want)
 		}
+	}
+}
+
+func TestMaskTypeHash(t *testing.T) {
+	// MaskType should be usable as a map key
+	var m typeutil.Map
+	maskTy := spmdpkg.MaskInstance
+	varyingMask := spmdpkg.NewVaryingMask()
+
+	m.Set(maskTy, "bare-mask")
+	m.Set(varyingMask, "varying-mask")
+
+	if v := m.At(maskTy); v != "bare-mask" {
+		t.Errorf("At(MaskType) = %v, want 'bare-mask'", v)
+	}
+	if v := m.At(varyingMask); v != "varying-mask" {
+		t.Errorf("At(VaryingMask) = %v, want 'varying-mask'", v)
+	}
+	if m.Len() != 2 {
+		t.Errorf("Len() = %d, want 2", m.Len())
 	}
 }

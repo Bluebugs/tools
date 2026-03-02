@@ -12,6 +12,7 @@ import (
 	"go/types"
 	"hash/maphash"
 
+	"golang.org/x/tools/go/types/spmd"
 	"golang.org/x/tools/internal/typeparams"
 )
 
@@ -317,6 +318,9 @@ func (h hasher) hash(t types.Type) uint32 {
 
 	case *types.SPMDType:
 		return 9181 + 2*uint32(t.Qualifier()) + 3*h.hash(t.Elem())
+
+	case *spmd.MaskType:
+		return 9182
 	}
 
 	panic(fmt.Sprintf("%T: %v", t, t))
@@ -460,6 +464,9 @@ func (h hasher) shallowHash(t types.Type) uint32 {
 
 	case *types.SPMDType:
 		return 9181 + 2*uint32(t.Qualifier())
+
+	case *spmd.MaskType:
+		return 9182
 	}
 	panic(fmt.Sprintf("shallowHash: %T: %v", t, t))
 }
