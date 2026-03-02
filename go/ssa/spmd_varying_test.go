@@ -529,3 +529,75 @@ func main() {
 		t.Errorf("expected 0 SPMDBooleanChains for !a && b, got %d", len(mainFn.SPMDBooleanChains))
 	}
 }
+
+func TestBooleanChain_String(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		if i > 2 && i < 10 {
+			_ = i
+		}
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+
+	var buf bytes.Buffer
+	mainFn.WriteTo(&buf)
+	output := buf.String()
+	if !strings.Contains(output, "SPMDBooleanChain") {
+		t.Error("expected 'SPMDBooleanChain' in SSA output for && chain")
+	}
+}
+
+func TestBooleanChain_BlockResolution(t *testing.T) {
+	// Verify that chain block pointers survive optimizeBlocks.
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		if i > 2 && i < 10 && i != 5 {
+			_ = i
+		}
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+
+	if len(mainFn.SPMDBooleanChains) != 1 {
+		t.Fatalf("expected 1 chain, got %d", len(mainFn.SPMDBooleanChains))
+	}
+	chain := mainFn.SPMDBooleanChains[0]
+
+	// ThenBlock and ElseBlock must be valid blocks in the function.
+	for _, target := range []*ssa.BasicBlock{chain.ThenBlock, chain.ElseBlock} {
+		found := false
+		for _, blk := range mainFn.Blocks {
+			if blk == target {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("block %d (comment %q) not found in function blocks",
+				target.Index, target.Comment)
+		}
+	}
+
+	// All chain blocks must also be in the function.
+	for i, blk := range chain.Blocks {
+		found := false
+		for _, fblk := range mainFn.Blocks {
+			if fblk == blk {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("chain block %d (index %d) not found in function blocks", i, blk.Index)
+		}
+	}
+}

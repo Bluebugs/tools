@@ -377,6 +377,9 @@ func (f *Function) finishBody() {
 	if len(f.SPMDSwitchChains) > 0 {
 		resolveSPMDSwitchChains(f)
 	}
+	if len(f.SPMDBooleanChains) > 0 {
+		resolveSPMDBooleanChains(f)
+	}
 
 	buildReferrers(f)
 
@@ -771,6 +774,25 @@ func WriteFunction(buf *bytes.Buffer, f *Function) {
 		}
 		if chain.DoneBlock != nil {
 			fmt.Fprintf(buf, " done=%d", chain.DoneBlock.Index)
+		}
+		fmt.Fprintln(buf)
+	}
+
+	// Print SPMD boolean chain info.
+	for i, chain := range f.SPMDBooleanChains {
+		fmt.Fprintf(buf, "# SPMDBooleanChain %d:", i)
+		fmt.Fprintf(buf, " op=%s", chain.Op)
+		fmt.Fprintf(buf, " blocks=[")
+		for j, blk := range chain.Blocks {
+			if j > 0 {
+				fmt.Fprint(buf, ",")
+			}
+			fmt.Fprintf(buf, "%d", blk.Index)
+		}
+		fmt.Fprint(buf, "]")
+		fmt.Fprintf(buf, " then=%d else=%d", chain.ThenBlock.Index, chain.ElseBlock.Index)
+		if chain.IsVarying {
+			fmt.Fprint(buf, " varying")
 		}
 		fmt.Fprintln(buf)
 	}

@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"fmt"
 	"go/ast"
+	"go/token"
 	"go/types"
 	"io"
 	"os"
@@ -611,6 +612,33 @@ func (s *sanity) checkFunction(fn *Function) bool {
 			s.errorf("SPMDSwitchChain %d: DoneBlock is nil", i)
 		} else if chain.DoneBlock.parent != fn {
 			s.errorf("SPMDSwitchChain %d: DoneBlock belongs to different function", i)
+		}
+	}
+
+	// Validate SPMD boolean chain info.
+	for i, chain := range fn.SPMDBooleanChains {
+		if chain.Op != token.LAND && chain.Op != token.LOR {
+			s.errorf("SPMDBooleanChain %d: invalid Op %v", i, chain.Op)
+		}
+		if len(chain.Blocks) < 2 {
+			s.errorf("SPMDBooleanChain %d: expected at least 2 blocks, got %d", i, len(chain.Blocks))
+		}
+		for j, blk := range chain.Blocks {
+			if blk == nil {
+				s.errorf("SPMDBooleanChain %d: Blocks[%d] is nil", i, j)
+			} else if blk.parent != fn {
+				s.errorf("SPMDBooleanChain %d: Blocks[%d] belongs to different function", i, j)
+			}
+		}
+		if chain.ThenBlock == nil {
+			s.errorf("SPMDBooleanChain %d: ThenBlock is nil", i)
+		} else if chain.ThenBlock.parent != fn {
+			s.errorf("SPMDBooleanChain %d: ThenBlock belongs to different function", i)
+		}
+		if chain.ElseBlock == nil {
+			s.errorf("SPMDBooleanChain %d: ElseBlock is nil", i)
+		} else if chain.ElseBlock.parent != fn {
+			s.errorf("SPMDBooleanChain %d: ElseBlock belongs to different function", i)
 		}
 	}
 

@@ -58,6 +58,15 @@ func resolveSPMDSwitchChains(fn *Function) {
 	}
 }
 
+// resolveSPMDBooleanChains updates SPMDBooleanChain block pointers after
+// optimizeBlocks has potentially fused or eliminated blocks.
+func resolveSPMDBooleanChains(fn *Function) {
+	for _, chain := range fn.SPMDBooleanChains {
+		chain.ThenBlock = resolveBlock(fn, chain.ThenBlock)
+		chain.ElseBlock = resolveBlock(fn, chain.ElseBlock)
+	}
+}
+
 // resolveBlock returns the surviving block after optimizeBlocks may have
 // eliminated the original block via fuseBlocks or jumpThreading.
 // For fused blocks, the instructions' Block() returns the absorbing block.
