@@ -43,10 +43,11 @@ func predicateSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	// dominated by the body block (i.e., it is between the loop entry and exit).
 	scopeBlocks := spmdLoopScopeBlocks(loop)
 
-	// Build a set of If instructions to exclude from predication.
-	// Switch chains and boolean chains use IsVarying Ifs for their own
-	// structural patterns (case dispatch, short-circuit evaluation) and must
-	// not be linearized by this pass.
+	// Build a set of If instructions to exclude from the generic If predication
+	// pass. Both boolean-chain and switch-chain Ifs are excluded so the generic
+	// loop below does not linearize them independently. Switch-chain Ifs are
+	// handled by predicateVaryingSwitch below, which processes the whole chain
+	// as a unit. Boolean chains will be handled by a future phase.
 	excludedIfs := spmdBuildExcludedIfs(fn)
 
 	// Find all varying If instructions in scope and linearize them.
@@ -62,20 +63,44 @@ func predicateSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 			continue
 		}
 		if excludedIfs[vif] {
-			continue // skip switch-chain and boolean-chain Ifs
+			continue // skip boolean-chain and switch-chain Ifs
 		}
 		// linearize this varying If.
 		predicateVaryingIf(fn, loop, block, vif)
 	}
+
+	// Linearize each varying switch chain whose DoneBlock is in scope.
+	for _, chain := range fn.SPMDSwitchChains {
+		if chain.DoneBlock == nil {
+			continue
+		}
+		// Check that at least one case block is in scope.
+		if len(chain.Cases) == 0 {
+			continue
+		}
+		firstBlock := chain.Cases[0].Block()
+		if firstBlock == nil {
+			continue // already linearized by a prior pass
+		}
+		if !scopeBlocks[firstBlock] {
+			continue
+		}
+		predicateVaryingSwitch(fn, loop, chain)
+	}
 }
 
 // spmdBuildExcludedIfs builds a set of If instructions that should NOT be
-// processed by predicateSPMD. This includes:
-//   - Ifs that are part of SPMDSwitchChains (case dispatch)
+// processed by the generic varying-If predication pass. This includes:
 //   - Ifs that are part of SPMDBooleanChains (short-circuit &&/||)
+//   - Ifs that are part of SPMDSwitchChains (handled by predicateVaryingSwitch)
+//
+// Switch-chain Ifs are excluded here so the generic pass does not try to
+// linearize individual case Ifs independently. predicateVaryingSwitch handles
+// the entire chain as a unit.
 func spmdBuildExcludedIfs(fn *Function) map[*If]bool {
 	excluded := make(map[*If]bool)
 
+	// Exclude switch-chain Ifs so predicateVaryingSwitch can handle them.
 	for _, chain := range fn.SPMDSwitchChains {
 		for _, caseIf := range chain.Cases {
 			excluded[caseIf] = true
@@ -311,6 +336,7 @@ func spmdAddReferrer(val Value, instr Instruction) {
 // "if cond goto then else else_") with a Jump to thenBlock.
 // Rewires the CFG: removes b→elseBlock edge and keeps b→thenBlock.
 // The If's Cond still has b as a referrer — we must clean that up.
+// Sets oldIf.block = nil to mark it as removed.
 func spmdReplaceIfWithJump(b *BasicBlock, thenBlock, elseBlock *BasicBlock) {
 	// The old If instruction.
 	oldIf := b.Instrs[len(b.Instrs)-1].(*If)
@@ -319,6 +345,9 @@ func spmdReplaceIfWithJump(b *BasicBlock, thenBlock, elseBlock *BasicBlock) {
 	if refs := oldIf.Cond.Referrers(); refs != nil {
 		*refs = removeInstr(*refs, oldIf)
 	}
+
+	// Mark the If as removed from its block.
+	oldIf.block = nil
 
 	// Replace If with Jump.
 	jmp := &Jump{}
@@ -431,6 +460,295 @@ func spmdReplacePhisWithSelect(mergeBlock, thenPred, elsePred *BasicBlock, thenM
 	}
 }
 
+
+// spmdSwitchCaseInfo holds the per-case mask and body block for a linearized
+// switch case. Used internally by predicateVaryingSwitch.
+type spmdSwitchCaseInfo struct {
+	mask      Value       // per-case active mask (lanes matching this case)
+	bodyBlock *BasicBlock // case body block (then-branch of the original If)
+}
+
+// predicateVaryingSwitch linearizes a varying switch chain.
+//
+// For an N-case switch with optional default:
+//
+//	compBlock0: cond0 computed; If cond0 → body0, compBlock1
+//	compBlock1: cond1 computed; If cond1 → body1, default/done
+//	body0: ... Jump done
+//	body1: ... Jump done
+//	default: ... Jump done  (if present)
+//	done: Phi [body0: v0, body1: v1, default/last: vN]
+//
+// Transforms to:
+//
+//	compBlock0: maskCond0=convert(cond0); mask0=AND(rem,maskCond0); rem=AND_NOT(rem,maskCond0); Jump body0
+//	body0: ... [mem ops with mask0] Jump compBlock1
+//	compBlock1: maskCond1=convert(cond1); mask1=AND(rem,maskCond1); rem=AND_NOT(rem,maskCond1); Jump body1
+//	body1: ... [mem ops with mask1] Jump default/done
+//	default: ... [mem ops with defaultMask] Jump done  (if present)
+//	done: SPMDSelect(mask0, v0, SPMDSelect(mask1, v1, vDefault))
+func predicateVaryingSwitch(fn *Function, loop *SPMDLoopInfo, chain *SPMDSwitchChain) {
+	if len(chain.Cases) == 0 {
+		return
+	}
+	if chain.DoneBlock == nil {
+		return
+	}
+
+	lanes := loop.LaneCount
+	doneBlock := chain.DoneBlock
+
+	// Phase 0: Snapshot Phi edge values at DoneBlock BEFORE any CFG rewiring.
+	//
+	// spmdRewireBodyToNext calls doneBlock.removePred(bodyBlock), which
+	// removes both the predecessor entry and the corresponding Phi edge from
+	// doneBlock's Phi instructions. We must capture the per-case Phi values
+	// before that happens, otherwise the values for rewired cases are lost.
+	//
+	// phiEdges[bodyBlock] = map of phi → phi-edge-value-for-that-body.
+	//
+	// Skip snapshotting when doneBlock is a loop header: in that case all
+	// Phis are loop-carried (not switch-merge), and Phase 3 will be skipped.
+	type phiEdgeMap = map[*Phi]Value
+	doneIsLoopBlock := doneBlock == loop.LoopBlock || doneBlock == loop.BodyBlock
+	var phiEdges map[*BasicBlock]phiEdgeMap
+	if !doneIsLoopBlock {
+		phiEdges = make(map[*BasicBlock]phiEdgeMap, len(doneBlock.Preds))
+		for i, pred := range doneBlock.Preds {
+			m := make(phiEdgeMap)
+			for _, instr := range doneBlock.Instrs {
+				phi, ok := instr.(*Phi)
+				if !ok {
+					break
+				}
+				if i < len(phi.Edges) {
+					m[phi] = phi.Edges[i]
+				}
+			}
+			phiEdges[pred] = m
+		}
+	}
+
+	activeMask := spmdAllOnesMask()
+
+	// Phase 1: Compute per-case masks and linearize the comparison blocks.
+	//
+	// remaining tracks the mask of lanes not yet claimed by an earlier case.
+	// It starts as the all-ones active mask and is narrowed by AND_NOT after
+	// each case.
+	remaining := Value(activeMask)
+	cases := make([]spmdSwitchCaseInfo, len(chain.Cases))
+
+	for idx, caseIf := range chain.Cases {
+		compBlock := caseIf.Block()
+		bodyBlock := compBlock.Succs[0] // then-branch = case body
+		nextBlock := compBlock.Succs[1] // else-branch = next comparison or default
+
+		// Compute per-case mask: caseMask = remaining & convert(caseIf.Cond)
+		maskCond := spmdInsertConvertToMask(compBlock, caseIf.Cond)
+		caseMask := spmdInsertMaskAnd(compBlock, remaining, maskCond)
+
+		// Narrow remaining: remaining = remaining &^ maskCond
+		newRemaining := spmdInsertMaskAndNot(compBlock, remaining, maskCond)
+
+		cases[idx] = spmdSwitchCaseInfo{mask: caseMask, bodyBlock: bodyBlock}
+
+		// Replace the If with a Jump to the body block.
+		// This removes compBlock from nextBlock's predecessors.
+		spmdReplaceIfWithJump(compBlock, bodyBlock, nextBlock)
+
+		// Rewire: redirect the body's jump so control flows sequentially
+		// through all cases and the default before reaching done.
+		//
+		// NOTE: spmdRewireBodyToNext calls doneBlock.removePred(bodyBlock),
+		// which also compacts doneBlock's Phi.Edges. This is safe because we
+		// already snapshotted all Phi edge values in Phase 0.
+		isLastCase := idx == len(chain.Cases)-1
+		if !isLastCase {
+			// Non-last case: rewire body → nextBlock (the next comparison block).
+			spmdRewireBodyToNext(bodyBlock, doneBlock, nextBlock)
+		} else if chain.DefaultBlock != nil {
+			// Last case with a default: rewire body → defaultBlock.
+			// nextBlock is the default block for the last case's If.
+			spmdRewireBodyToNext(bodyBlock, doneBlock, chain.DefaultBlock)
+		}
+		// Last case without default: body already jumps to doneBlock — leave it.
+
+		remaining = newRemaining
+	}
+
+	// remaining is now the default mask: lanes not matched by any explicit case.
+	defaultMask := remaining
+
+	// Phase 2: Mask memory operations in each case body and the default body.
+	for _, ci := range cases {
+		spmdMaskMemOps(ci.bodyBlock, ci.mask, lanes)
+	}
+	if chain.DefaultBlock != nil {
+		spmdMaskMemOps(chain.DefaultBlock, defaultMask, lanes)
+	}
+
+	// Phase 3: Replace switch-merge Phis at DoneBlock with a chained SPMDSelect.
+	//
+	// When doneBlock is the loop's loop/body block (no explicit switch.done merge
+	// block; case bodies jump directly back to the loop header), the switch
+	// produces no live scalar values. All Phis in the loop header are loop-carried
+	// — do not replace them.
+	if !doneIsLoopBlock {
+		spmdReplaceSwitchPhisWithChainedSelect(chain, cases, phiEdges, lanes)
+	}
+}
+
+// spmdRewireBodyToNext redirects the body block's terminator from oldDest to newDest.
+// The body block ends with a Jump; we update its single successor.
+// oldDest loses body as a predecessor; newDest gains body as a predecessor.
+func spmdRewireBodyToNext(bodyBlock, oldDest, newDest *BasicBlock) {
+	bodyBlock.replaceSucc(oldDest, newDest)
+	oldDest.removePred(bodyBlock)
+	// Insert bodyBlock at the front of newDest.Preds so the ordering reflects
+	// CFG traversal order (the comparison block was already removed from
+	// newDest.Preds by spmdReplaceIfWithJump; bodyBlock now takes its place).
+	// Guard against duplicate predecessors if bodyBlock already reaches newDest.
+	if !slices.Contains(newDest.Preds, bodyBlock) {
+		newDest.Preds = append([]*BasicBlock{bodyBlock}, newDest.Preds...)
+	}
+}
+
+// spmdReplaceSwitchPhisWithChainedSelect replaces each Phi at chain.DoneBlock
+// with a chained SPMDSelect.
+//
+// phiEdges is a snapshotted map of predecessor block → (phi → edge value),
+// captured before CFG rewiring removed edges from the Phi slices.
+//
+// For a 2-case switch with default, the Phi [body0: v0, body1: v1, default: v2]
+// becomes:
+//
+//	sel1 = SPMDSelect(case1Mask, v1, v2)   // case 1 vs default
+//	sel0 = SPMDSelect(case0Mask, v0, sel1) // case 0 vs rest
+//
+// If there is no default, the last case's value is used as the base "else" value.
+func spmdReplaceSwitchPhisWithChainedSelect(
+	chain *SPMDSwitchChain,
+	cases []spmdSwitchCaseInfo,
+	phiEdges map[*BasicBlock]map[*Phi]Value,
+	lanes int,
+) {
+	doneBlock := chain.DoneBlock
+
+	// Snapshot the Phi instructions before we mutate the Instrs slice.
+	var phis []*Phi
+	for _, instr := range doneBlock.Instrs {
+		phi, ok := instr.(*Phi)
+		if !ok {
+			break // phis are always first in a block
+		}
+		phis = append(phis, phi)
+	}
+	if len(phis) == 0 {
+		// No phis at the done block — nothing to merge, nothing to do.
+		// Phase 1 already cleaned up stale predecessor edges via
+		// spmdRewireBodyToNext (which calls doneBlock.removePred for each
+		// rewired case body).
+		return
+	}
+
+	// The base "else" value comes from the default block (if present) or the
+	// last case body. Both still flow into doneBlock after linearization.
+	var baseBlock *BasicBlock
+	if chain.DefaultBlock != nil {
+		baseBlock = chain.DefaultBlock
+	} else {
+		baseBlock = cases[len(cases)-1].bodyBlock
+	}
+
+	for phiIdx, phi := range phis {
+		// Look up the base value from the snapshotted edge map.
+		baseEdges, ok := phiEdges[baseBlock]
+		if !ok {
+			// baseBlock not found in snapshot — defensive skip.
+			continue
+		}
+		baseVal, ok := baseEdges[phi]
+		if !ok {
+			continue
+		}
+
+		// Build chained selects from last case to first (bottom-up).
+		// Cases whose bodyBlock == baseBlock provide the starting value and
+		// skip select emission (no-default: last case IS the base).
+		sel := Value(baseVal)
+		for i := len(cases) - 1; i >= 0; i-- {
+			ci := cases[i]
+			if ci.bodyBlock == baseBlock {
+				// Last case in a no-default switch: already the base value.
+				continue
+			}
+			caseEdges, ok := phiEdges[ci.bodyBlock]
+			if !ok {
+				continue // body block not in snapshot (defensive)
+			}
+			caseVal, ok := caseEdges[phi]
+			if !ok {
+				continue
+			}
+
+			newSel := &SPMDSelect{
+				Mask:  ci.mask,
+				X:     caseVal,
+				Y:     sel,
+				Lanes: lanes,
+			}
+			newSel.setType(phi.Type())
+			newSel.setBlock(doneBlock)
+			spmdAddReferrer(ci.mask, newSel)
+			spmdAddReferrer(caseVal, newSel)
+			spmdAddReferrer(sel, newSel)
+			sel = newSel
+		}
+
+		// Replace the Phi slot with the outermost SPMDSelect in the Instrs slice.
+		if selInstr, ok := sel.(Instruction); ok {
+			doneBlock.Instrs[phiIdx] = selInstr
+		} else {
+			// Degenerate case: single-case no-default switch where no SPMDSelect
+			// was built (sel is a pre-existing Value, not an Instruction).
+			// Mark the slot for removal to avoid leaving a zombie Phi with
+			// block=nil in a live block's Instrs slice.
+			doneBlock.Instrs[phiIdx] = nil
+		}
+
+		// Redirect all uses of the old Phi to the new value.
+		replaceAll(phi, sel)
+
+		// Clean up the Phi's remaining edge referrers (post-CFG-rewiring,
+		// some edges may already have been removed by removePred above).
+		for _, edge := range phi.Edges {
+			if edge != nil {
+				if refs := edge.Referrers(); refs != nil {
+					*refs = removeInstr(*refs, phi)
+				}
+			}
+		}
+		phi.block = nil
+	}
+
+	// Compact nil slots from degenerate Phi replacements.
+	j := 0
+	for _, instr := range doneBlock.Instrs {
+		if instr != nil {
+			doneBlock.Instrs[j] = instr
+			j++
+		}
+	}
+	for k := j; k < len(doneBlock.Instrs); k++ {
+		doneBlock.Instrs[k] = nil // clear for GC
+	}
+	doneBlock.Instrs = doneBlock.Instrs[:j]
+
+	// Predecessor cleanup was already performed in Phase 1: spmdRewireBodyToNext
+	// called doneBlock.removePred(bodyBlock) for each non-last case body that was
+	// rewired away from doneBlock. No further cleanup is needed here.
+}
 
 // spmdMaskMemOps walks block b and replaces:
 //   - UnOp{Op: token.MUL} (pointer load) with SPMDLoad(addr, mask, lanes)

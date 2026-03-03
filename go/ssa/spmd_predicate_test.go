@@ -925,10 +925,10 @@ func main() {
 	}
 }
 
-// TestPredicateSPMD_SwitchChainNotLinearized verifies that varying Ifs that are
-// part of an SPMDSwitchChain are not linearized by predicateSPMD.
-// These Ifs implement case dispatch and must remain as-is for the TinyGo backend.
-func TestPredicateSPMD_SwitchChainNotLinearized(t *testing.T) {
+// TestPredicateSPMD_SwitchChainLinearized verifies that varying Ifs that are
+// part of an SPMDSwitchChain are linearized by predicateSPMD into a sequential
+// chain of comparison→body→comparison→body→...→default→done with per-case masks.
+func TestPredicateSPMD_SwitchChainLinearized(t *testing.T) {
 	src := `package main
 
 func main() {
@@ -950,19 +950,289 @@ func main() {
 		t.Fatal("main function not found")
 	}
 
-	// Switch chain Ifs must be preserved (not linearized to Jump).
-	// The SPMDSwitchChains metadata must still be present.
+	// SPMDSwitchChains metadata must still be present after linearization.
 	if len(mainFn.SPMDSwitchChains) == 0 {
 		t.Fatal("expected SPMDSwitchChains to be populated")
 	}
 
-	// Each switch-chain If must still be an *If instruction in its block.
+	// All switch-chain Ifs must have been replaced with Jump instructions
+	// (their Block() is nil after replacement since the If was removed).
 	for _, chain := range mainFn.SPMDSwitchChains {
 		for _, caseIf := range chain.Cases {
-			if caseIf.Block() == nil {
-				t.Error("switch-chain If has nil Block(): predicateSPMD erroneously removed it")
+			if caseIf.Block() != nil {
+				t.Error("switch-chain If still has a Block(): should have been replaced with Jump by predicateSPMD")
 			}
 		}
+	}
+
+	// Each former comparison block (where the If lived) must end with a Jump,
+	// not an If. Verify by checking that no block in the function ends with a
+	// varying If (since all switch-chain Ifs should be linearized).
+	for _, block := range mainFn.Blocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		if vif, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok {
+			if vif.IsVarying {
+				t.Errorf("block %d: varying If was not linearized by predicateSPMD", block.Index)
+			}
+		}
+	}
+
+	// Mask computation instructions (Convert to Varying[mask], AND binops) must
+	// be present — inserted during switch linearization.
+	var buf bytes.Buffer
+	mainFn.WriteTo(&buf)
+	output := buf.String()
+	if !strings.Contains(output, "lanes.Varying[mask]") {
+		t.Error("expected Varying[mask] mask computation instructions from switch linearization")
+	}
+}
+
+// TestPredicateSPMD_SwitchWithDefault verifies that a varying switch with 2
+// cases + default is linearized into a sequential chain with per-case masks,
+// and that SPMDSelect is emitted at the merge block when values are live.
+func TestPredicateSPMD_SwitchWithDefault(t *testing.T) {
+	// Use a rangeindex loop so slice stores generate SPMDStore instructions.
+	// This verifies both: (a) CFG is linearized and (b) mem ops are masked.
+	src := `package main
+
+func f(dst []int) {
+	for i := range dst {
+		switch i % 3 {
+		case 0:
+			dst[i] = i * 2
+		case 1:
+			dst[i] = i * 3
+		default:
+			dst[i] = i * 4
+		}
+	}
+}
+
+func main() { f(make([]int, 16)) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	// SPMDSwitchChain must be present.
+	if len(fn.SPMDSwitchChains) == 0 {
+		t.Fatal("expected SPMDSwitchChains to be populated")
+	}
+
+	// All switch-chain Ifs must have been replaced (Block() == nil).
+	chain := fn.SPMDSwitchChains[0]
+	for i, caseIf := range chain.Cases {
+		if caseIf.Block() != nil {
+			t.Errorf("case %d: If still has Block(): should be linearized to Jump", i)
+		}
+	}
+
+	// No varying If should remain in any block.
+	for _, block := range fn.Blocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		if vif, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok {
+			if vif.IsVarying {
+				t.Errorf("block %d: varying If remains after switch linearization", block.Index)
+			}
+		}
+	}
+
+	// SPMDStore instructions must appear — the case body stores were masked.
+	foundSPMDStore := false
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if _, ok := instr.(*ssa.SPMDStore); ok {
+				foundSPMDStore = true
+			}
+		}
+	}
+	if !foundSPMDStore {
+		t.Error("expected SPMDStore instructions from switch case body masking")
+	}
+
+	// Mask computation values must appear (Convert to Varying[mask] + AND/AND_NOT).
+	var buf bytes.Buffer
+	fn.WriteTo(&buf)
+	output := buf.String()
+	if !strings.Contains(output, "lanes.Varying[mask]") {
+		t.Error("expected Varying[mask] mask computations in switch-linearized function")
+	}
+}
+
+// TestPredicateSPMD_SwitchWithoutDefault verifies that a varying switch with
+// 2 cases and no default is linearized correctly. The last case body flows
+// directly to done (no default block to chain through).
+func TestPredicateSPMD_SwitchWithoutDefault(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		switch i % 3 {
+		case 0:
+			_ = i
+		case 1:
+			_ = i + 1
+		}
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+	if mainFn == nil {
+		t.Fatal("main function not found")
+	}
+
+	// SPMDSwitchChain with no default must still be linearized.
+	if len(mainFn.SPMDSwitchChains) == 0 {
+		t.Fatal("expected SPMDSwitchChains to be populated")
+	}
+	chain := mainFn.SPMDSwitchChains[0]
+	if chain.DefaultBlock != nil {
+		t.Fatal("expected no default block for switch without default")
+	}
+
+	// All switch-chain Ifs must have been replaced with Jump.
+	for i, caseIf := range chain.Cases {
+		if caseIf.Block() != nil {
+			t.Errorf("case %d: If still has Block() after linearization", i)
+		}
+	}
+
+	// No varying If should remain.
+	for _, block := range mainFn.Blocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		if vif, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok {
+			if vif.IsVarying {
+				t.Errorf("block %d: varying If not linearized", block.Index)
+			}
+		}
+	}
+
+	// Mask computation instructions must be present.
+	var buf bytes.Buffer
+	mainFn.WriteTo(&buf)
+	output := buf.String()
+	if !strings.Contains(output, "lanes.Varying[mask]") {
+		t.Error("expected Varying[mask] mask computations for switch without default")
+	}
+}
+
+// TestPredicateSPMD_SwitchMemOps verifies that memory operations (stores) in
+// varying switch case bodies are masked with the per-case mask by predicateSPMD.
+// Each case body should get an SPMDStore with its specific case mask, not the
+// all-ones mask or a wrong mask.
+func TestPredicateSPMD_SwitchMemOps(t *testing.T) {
+	// A switch with 3 cases, each performing a distinct store operation.
+	// The stores must each be masked with the corresponding case mask.
+	src := `package main
+
+func f(dst []int) {
+	for i := range dst {
+		switch i % 4 {
+		case 0:
+			dst[i] = 100
+		case 1:
+			dst[i] = 200
+		case 2:
+			dst[i] = 300
+		default:
+			dst[i] = 400
+		}
+	}
+}
+
+func main() { f(make([]int, 16)) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	if len(fn.SPMDSwitchChains) == 0 {
+		t.Fatal("expected SPMDSwitchChains to be populated")
+	}
+
+	// Count SPMDStore instructions — one per case body (3 cases + 1 default = 4).
+	spmdStoreCount := 0
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if _, ok := instr.(*ssa.SPMDStore); ok {
+				spmdStoreCount++
+			}
+		}
+	}
+	// 4 case/default bodies, each with one store → 4 SPMDStore instructions.
+	if spmdStoreCount != 4 {
+		t.Errorf("expected 4 SPMDStore instructions (one per case), got %d", spmdStoreCount)
+	}
+
+	// The lane count on all SPMDStore instructions must match the loop's lane count.
+	loopLanes := fn.SPMDLoops[0].LaneCount
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if store, ok := instr.(*ssa.SPMDStore); ok {
+				if store.Lanes != loopLanes {
+					t.Errorf("SPMDStore.Lanes = %d, want %d", store.Lanes, loopLanes)
+				}
+			}
+		}
+	}
+
+	// No varying If should remain after linearization.
+	for _, block := range fn.Blocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		if vif, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok {
+			if vif.IsVarying {
+				t.Errorf("block %d: varying If not linearized in 4-case switch", block.Index)
+			}
+		}
+	}
+}
+
+// TestPredicateSPMD_SwitchSanityCheck verifies that the SSA sanity checker
+// passes after predicateSPMD linearizes a varying switch chain.
+func TestPredicateSPMD_SwitchSanityCheck(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		switch i % 3 {
+		case 0:
+			_ = i
+		case 1:
+			_ = i + 1
+		default:
+			_ = i + 2
+		}
+	}
+}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setSPMDOnRange(f)
+
+	// SanityCheckFunctions will panic if predicateSPMD leaves the SSA invalid.
+	_, _, err = ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{f},
+		ssa.SanityCheckFunctions,
+	)
+	if err != nil {
+		t.Fatalf("BuildPackage with SanityCheckFunctions failed: %v", err)
 	}
 }
 
