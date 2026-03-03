@@ -569,6 +569,7 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	loop.TailCheckBlock = tailCheck
 	loop.TailBodyBlock = tailBody
 	loop.AlignedBound = alignedBound
+	loop.MainIterPhi = mainIterPhi
 	loop.TailIterPhi = tailIterPhi
 	// TrampolineBlock is set above when accumulators are present, nil otherwise.
 }

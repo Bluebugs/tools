@@ -419,6 +419,7 @@ type SPMDLoopInfo struct {
 	TailBodyBlock   *BasicBlock // tail loop body (masked, at most once)
 	TrampolineBlock *BasicBlock // accumulator merge block before DoneBlock (nil if no accumulators)
 	AlignedBound    Value       // bound & ~(laneCount-1)
+	MainIterPhi     *Phi        // iter phi in MainBodyBlock
 	TailIterPhi     *Phi        // iter phi in TailCheckBlock
 
 	// iterAlloc is the Alloc for the loop iterator, saved during construction

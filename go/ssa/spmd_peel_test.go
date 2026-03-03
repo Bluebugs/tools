@@ -321,6 +321,9 @@ func main() {
 	if loop.AlignedBound == nil {
 		t.Fatal("AlignedBound is nil")
 	}
+	if loop.MainIterPhi == nil {
+		t.Fatal("MainIterPhi is nil")
+	}
 	if loop.TailIterPhi == nil {
 		t.Fatal("TailIterPhi is nil")
 	}
@@ -382,6 +385,11 @@ func main() {
 	}
 	if len(tb.Instrs) == 0 {
 		t.Error("TailBody has no instructions")
+	}
+
+	// MainIterPhi must be in MainBodyBlock.
+	if loop.MainIterPhi.Block() != loop.MainBodyBlock {
+		t.Errorf("MainIterPhi.Block() = %s, want MainBodyBlock", loop.MainIterPhi.Block().Comment)
 	}
 
 	// TailIterPhi must be in TailCheckBlock.
