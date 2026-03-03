@@ -289,6 +289,13 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 		return
 	}
 
+	// Only peel loops whose body contains instruction types that spmdCloneBlock
+	// knows how to copy. If the body contains an unsupported instruction (e.g.,
+	// MakeInterface, Select, TypeAssert), skip peeling rather than panicking.
+	if !spmdBodyIsCloneable(body) {
+		return
+	}
+
 	// Use the IterPhi's type for all arithmetic. After the lift pass, the
 	// IterPhi is always a typed integer (e.g., "int"), never "untyped int".
 	// BoundValue may be untyped (e.g., a raw constant "8:untyped int"), so
@@ -331,6 +338,17 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	if !ok {
 		panic("peelSPMDLoop: entry block last instruction is not If")
 	}
+
+	// Extract the live bound from the guard condition before removing the If.
+	// The guard has the form: guardCond = 0 < bound, where bound is the
+	// post-lift live value. loop.BoundValue may be a stale load instruction
+	// that was promoted away by the lift pass (its alloca was replaced with
+	// the parameter or phi, but the SPMDLoopInfo field was not updated).
+	// Using the guard's Y operand guarantees we reference the live value.
+	if guardCond, ok2 := oldIf.Cond.(*BinOp); ok2 && guardCond.Op == token.LSS {
+		typedBound = spmdTypedBound(guardCond.Y, intType)
+	}
+
 	// Remove old If from its Cond's referrer list.
 	if refs := oldIf.Cond.Referrers(); refs != nil {
 		*refs = spmdRemoveOneReferrer(*refs, oldIf)
@@ -571,6 +589,10 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	loop.AlignedBound = alignedBound
 	loop.MainIterPhi = mainIterPhi
 	loop.TailIterPhi = tailIterPhi
+	// Update BoundValue to the live (post-lift) value derived from the guard
+	// condition. The original BoundValue may be a stale load instruction that
+	// the lift pass promoted away; typedBound holds the current live value.
+	loop.BoundValue = typedBound
 	// TrampolineBlock is set above when accumulators are present, nil otherwise.
 }
 
@@ -606,6 +628,24 @@ func spmdReplaceAccUses(oldPhi *Phi, newVal Value, excludeBlock *BasicBlock) {
 		}
 	}
 	*pxrefs = remaining
+}
+
+// spmdBodyIsCloneable reports whether all non-phi, non-terminator instructions
+// in block can be copied by spmdCloneBlock. If any instruction has a type not
+// listed in spmdCloneBlock's switch, peeling must be skipped.
+func spmdBodyIsCloneable(block *BasicBlock) bool {
+	for _, instr := range block.Instrs {
+		switch instr.(type) {
+		case *DebugRef, *Phi, *Jump, *If, *Return, *Panic:
+			// Skipped by spmdCloneBlock; always OK.
+		case *BinOp, *UnOp, *Store, *SPMDStore, *SPMDLoad, *SPMDSelect, *SPMDIndex,
+			*IndexAddr, *FieldAddr, *Convert, *ChangeType, *Call, *Alloc:
+			// Handled by spmdCloneBlock; OK.
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // spmdTypedBound returns a typed version of bound for use in integer arithmetic.
