@@ -161,20 +161,15 @@ func main() {
 		t.Fatal("main function not found")
 	}
 
-	// Find the body block: for rangeint the comment contains "rangeint.body".
-	var bodyBlock *BasicBlock
-	for _, blk := range fn.Blocks {
-		if strings.Contains(blk.Comment, "rangeint.body") {
-			bodyBlock = blk
-			break
-		}
+	// After peeling, the original rangeint.body block is unreachable and removed
+	// from fn.Blocks. Use the SPMDLoopInfo.BodyBlock pointer which still
+	// references the original block object (its Instrs remain intact).
+	if len(fn.SPMDLoops) == 0 {
+		t.Fatal("no SPMD loops found")
 	}
+	bodyBlock := fn.SPMDLoops[0].BodyBlock
 	if bodyBlock == nil {
-		var comments []string
-		for _, blk := range fn.Blocks {
-			comments = append(comments, blk.Comment)
-		}
-		t.Fatalf("rangeint.body block not found; available blocks: %v", comments)
+		t.Fatal("BodyBlock is nil")
 	}
 
 	// Count non-phi, non-terminator instructions in the source block.
@@ -284,6 +279,124 @@ func main() {
 	}
 }
 
+// TestPeelSPMDLoopSimple verifies that peelSPMDLoops creates the expected CFG
+// structure for a simple rangeint SPMD loop with no accumulators.
+func TestPeelSPMDLoopSimple(t *testing.T) {
+	src := `package main
+
+var result [8]int32
+
+func main() {
+	for i := range 8 {
+		result[i] = int32(i * 2)
+	}
+}
+`
+	pkg := buildSSAForPeelTest(t, src)
+	fn := pkg.Func("main")
+	if fn == nil {
+		t.Fatal("main function not found")
+	}
+	if len(fn.SPMDLoops) == 0 {
+		t.Fatal("no SPMD loops found")
+	}
+	loop := fn.SPMDLoops[0]
+
+	// Verify peeling happened.
+	if !loop.IsPeeled {
+		t.Fatal("loop was not peeled")
+	}
+	if loop.MainBodyBlock == nil {
+		t.Fatal("MainBodyBlock is nil")
+	}
+	if loop.TailCheckBlock == nil {
+		t.Fatal("TailCheckBlock is nil")
+	}
+	if loop.TailBodyBlock == nil {
+		t.Fatal("TailBodyBlock is nil")
+	}
+	if loop.TrampolineBlock != nil {
+		t.Error("TrampolineBlock should be nil for loop without accumulators")
+	}
+	if loop.AlignedBound == nil {
+		t.Fatal("AlignedBound is nil")
+	}
+	if loop.TailIterPhi == nil {
+		t.Fatal("TailIterPhi is nil")
+	}
+
+	// Verify CFG structure: entry should branch to MainBody or TailCheck.
+	entry := loop.EntryBlock
+	if len(entry.Succs) != 2 {
+		t.Fatalf("entry has %d succs, want 2", len(entry.Succs))
+	}
+	if entry.Succs[0] != loop.MainBodyBlock {
+		t.Errorf("entry.Succs[0] = %s, want MainBody", entry.Succs[0].Comment)
+	}
+	if entry.Succs[1] != loop.TailCheckBlock {
+		t.Errorf("entry.Succs[1] = %s, want TailCheck", entry.Succs[1].Comment)
+	}
+
+	// MainBody should self-loop and exit to TailCheck.
+	main := loop.MainBodyBlock
+	if len(main.Succs) != 2 {
+		t.Fatalf("MainBody has %d succs, want 2", len(main.Succs))
+	}
+	if main.Succs[0] != main {
+		t.Errorf("MainBody.Succs[0] should be self (loop back), got %s", main.Succs[0].Comment)
+	}
+	if main.Succs[1] != loop.TailCheckBlock {
+		t.Errorf("MainBody.Succs[1] = %s, want TailCheck", main.Succs[1].Comment)
+	}
+
+	// TailCheck should branch to TailBody or Done.
+	tc := loop.TailCheckBlock
+	if len(tc.Succs) != 2 {
+		t.Fatalf("TailCheck has %d succs, want 2", len(tc.Succs))
+	}
+	if tc.Succs[0] != loop.TailBodyBlock {
+		t.Errorf("TailCheck.Succs[0] = %s, want TailBody", tc.Succs[0].Comment)
+	}
+	if tc.Succs[1] != loop.DoneBlock {
+		t.Errorf("TailCheck.Succs[1] = %s, want Done", tc.Succs[1].Comment)
+	}
+
+	// TailBody should jump to Done.
+	tb := loop.TailBodyBlock
+	if len(tb.Succs) != 1 {
+		t.Fatalf("TailBody has %d succs, want 1", len(tb.Succs))
+	}
+	if tb.Succs[0] != loop.DoneBlock {
+		t.Errorf("TailBody.Succs[0] = %s, want Done", tb.Succs[0].Comment)
+	}
+
+	// Done should have exactly 2 predecessors: TailCheck and TailBody.
+	done := loop.DoneBlock
+	if len(done.Preds) != 2 {
+		t.Fatalf("Done has %d preds, want 2", len(done.Preds))
+	}
+
+	// MainBody and TailBody should contain cloned instructions.
+	if len(main.Instrs) == 0 {
+		t.Error("MainBody has no instructions")
+	}
+	if len(tb.Instrs) == 0 {
+		t.Error("TailBody has no instructions")
+	}
+
+	// TailIterPhi must be in TailCheckBlock.
+	if loop.TailIterPhi.Block() != loop.TailCheckBlock {
+		t.Errorf("TailIterPhi.Block() = %s, want TailCheckBlock", loop.TailIterPhi.Block().Comment)
+	}
+
+	// AlignedBound must be in EntryBlock.
+	if ab, ok := loop.AlignedBound.(Instruction); ok {
+		if ab.Block() != loop.EntryBlock {
+			t.Errorf("AlignedBound.Block() = %s, want EntryBlock", ab.Block().Comment)
+		}
+	}
+}
+
 // TestSPMDCloneBlock_OperandTranslation verifies that operands of cloned
 // instructions are translated through the valueMap: no cloned instruction
 // should reference an original value that was itself cloned.
@@ -304,16 +417,14 @@ func main() {
 		t.Fatal("main function not found")
 	}
 
-	// Find the body block.
-	var bodyBlock *BasicBlock
-	for _, blk := range fn.Blocks {
-		if strings.Contains(blk.Comment, "rangeint.body") {
-			bodyBlock = blk
-			break
-		}
+	// After peeling the original body block is detached from fn.Blocks;
+	// use SPMDLoopInfo.BodyBlock to access it directly.
+	if len(fn.SPMDLoops) == 0 {
+		t.Fatal("no SPMD loops found")
 	}
+	bodyBlock := fn.SPMDLoops[0].BodyBlock
 	if bodyBlock == nil {
-		t.Fatal("rangeint.body block not found")
+		t.Fatal("BodyBlock is nil")
 	}
 
 	cloneBlock := fn.newBasicBlock("clone-ops")
