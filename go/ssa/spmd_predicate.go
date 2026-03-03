@@ -19,7 +19,9 @@ package ssa
 import (
 	"go/constant"
 	"go/token"
+	"go/types"
 	"slices"
+	"strings"
 
 	spmdpkg "golang.org/x/tools/go/types/spmd"
 )
@@ -31,15 +33,41 @@ type spmdPhiSnapshot struct {
 	edgeVal map[*BasicBlock]Value // predecessor → edge value
 }
 
+// hasSPMDParams reports whether any parameter of fn has *types.SPMDType.
+// Such functions are "SPMD function bodies" that process per-lane varying values.
+func hasSPMDParams(fn *Function) bool {
+	sig := fn.Signature
+	if sig == nil {
+		return false
+	}
+	params := sig.Params()
+	for i := 0; i < params.Len(); i++ {
+		if _, ok := params.At(i).Type().(*types.SPMDType); ok {
+			return true
+		}
+	}
+	return false
+}
+
 // predicateSPMD transforms varying control flow in SPMD functions.
 // Called from finishBody after resolveSPMDLoops.
+// Handles two cases:
+//  1. Functions with SPMDLoops (go-for loops): linearizes varying Ifs in scope.
+//  2. Functions with SPMDType parameters (SPMD bodies): handles varying breaks
+//     inside regular for-range loops via break mask accumulation.
 func predicateSPMD(fn *Function) {
-	if len(fn.SPMDLoops) == 0 {
+	if len(fn.SPMDLoops) == 0 && !hasSPMDParams(fn) {
 		return
 	}
 
 	for _, loop := range fn.SPMDLoops {
 		predicateSPMDLoop(fn, loop)
+	}
+
+	// Handle SPMD function bodies: functions with varying params but no go-for loops.
+	// These may contain regular for-loops with varying breaks that need masking.
+	if hasSPMDParams(fn) {
+		predicateSPMDFuncBody(fn)
 	}
 }
 
@@ -119,6 +147,562 @@ func predicateSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 		}
 		predicateVaryingSwitch(fn, loop, chain)
 	}
+}
+
+// ----------------------------------------------------------------------------
+// SPMD function body predication (Phase 8)
+//
+// Functions with *types.SPMDType parameters ("SPMD bodies") may contain regular
+// for-range loops. Inside such loops, a varying if with a break is a "varying
+// break" — the break must accumulate into a break mask rather than immediately
+// jumping to the loop done block.
+
+// spmdRegularForLoop represents a regular for-range loop detected inside an
+// SPMD function body. Unlike SPMDLoopInfo (which covers go-for SPMD loops),
+// this represents plain Go for loops.
+type spmdRegularForLoop struct {
+	loopBlock *BasicBlock // rangeint.loop (or body when merged)
+	bodyBlock *BasicBlock // rangeint.body
+	doneBlock *BasicBlock // rangeint.done (loop exit)
+	iterPhi   *Phi        // rangeint.iter phi (for back-edge identification)
+}
+
+// spmdVaryingBreak represents a varying break inside a regular for-loop.
+// The varying If's then-branch jumps directly to the loop's done block.
+type spmdVaryingBreak struct {
+	ifBlock   *BasicBlock // block containing the varying If
+	thenBlock *BasicBlock // then-branch that jumps to done (the break block)
+	elseBlock *BasicBlock // else-branch (continuation; typically jumps back to loop)
+	vif       *If         // the varying If instruction
+}
+
+// predicateSPMDFuncBody handles varying breaks in SPMD function bodies.
+// It finds regular for-range loops in fn and, for each loop with at least one
+// varying break, transforms the break into break mask accumulation.
+func predicateSPMDFuncBody(fn *Function) {
+	lanes := spmdFuncBodyLaneCount(fn)
+	if lanes == 0 {
+		return
+	}
+
+	forLoops := spmdFindRegularForLoops(fn)
+	for _, fl := range forLoops {
+		vbreaks := spmdFindVaryingBreaks(fn, fl)
+		if len(vbreaks) == 0 {
+			continue
+		}
+		predicateVaryingBreaks(fn, fl, vbreaks, lanes)
+	}
+}
+
+// spmdFuncBodyLaneCount returns the lane count for an SPMD function body by
+// inspecting its first SPMDType parameter. Returns 0 if none is found.
+func spmdFuncBodyLaneCount(fn *Function) int {
+	if fn.Signature == nil {
+		return 0
+	}
+	params := fn.Signature.Params()
+	for i := 0; i < params.Len(); i++ {
+		stype, ok := params.At(i).Type().(*types.SPMDType)
+		if !ok {
+			continue
+		}
+		// Compute lane count from element type: 128 / element-size-in-bits.
+		// Use the same formula as the type checker (128-bit SIMD register).
+		elem := stype.Elem()
+		bits := spmdElemBits(elem)
+		if bits > 0 {
+			return 128 / bits
+		}
+	}
+	return 0
+}
+
+// spmdElemBits returns the bit width of a basic type suitable for SIMD lane count
+// computation. Returns 0 for unknown or non-basic types.
+func spmdElemBits(t types.Type) int {
+	basic, ok := t.(*types.Basic)
+	if !ok {
+		return 0
+	}
+	switch basic.Kind() {
+	case types.Bool, types.Int8, types.Uint8:
+		return 8
+	case types.Int16, types.Uint16:
+		return 16
+	case types.Int32, types.Uint32, types.Float32:
+		return 32
+	case types.Int64, types.Uint64, types.Float64:
+		return 64
+	case types.Int, types.Uint, types.Uintptr:
+		// Platform-dependent; default to 64-bit for lane count computation.
+		return 64
+	}
+	return 0
+}
+
+// spmdFindRegularForLoops finds regular for-range loops in fn that match the
+// rangeint SSA pattern: a block with comment "rangeint.body" containing an
+// iter phi with comment "rangeint.iter", paired with a "rangeint.done" block.
+//
+// These are plain Go for loops (not SPMD go-for loops) that appear inside
+// SPMD function bodies.
+func spmdFindRegularForLoops(fn *Function) []*spmdRegularForLoop {
+	var loops []*spmdRegularForLoop
+
+	// Index blocks already covered by SPMDLoopInfo to avoid double-processing.
+	spmdBodyBlocks := make(map[*BasicBlock]bool)
+	for _, info := range fn.SPMDLoops {
+		spmdBodyBlocks[info.BodyBlock] = true
+		spmdBodyBlocks[info.LoopBlock] = true
+	}
+
+	// Build a map from block comment prefix to block for done-block lookup.
+	// We match by comment prefix to handle suffixes like ":3" after optimization.
+	doneByPrefix := make(map[string]*BasicBlock)
+	for _, block := range fn.Blocks {
+		if strings.Contains(block.Comment, "rangeint.done") {
+			doneByPrefix[block.Comment] = block
+		}
+	}
+
+	for _, block := range fn.Blocks {
+		if spmdBodyBlocks[block] {
+			continue // skip SPMD loop blocks
+		}
+		// Look for rangeint.body blocks (comment contains "rangeint.body").
+		if !strings.Contains(block.Comment, "rangeint.body") {
+			continue
+		}
+		// Find the iter phi in this block.
+		var iterPhi *Phi
+		for _, instr := range block.Instrs {
+			phi, ok := instr.(*Phi)
+			if !ok {
+				break
+			}
+			if strings.Contains(phi.Comment, "rangeint.iter") {
+				iterPhi = phi
+				break
+			}
+		}
+		if iterPhi == nil {
+			continue
+		}
+
+		// Identify loop block (predecessor with "rangeint.loop" comment or same block).
+		// For merged body+loop (most rangeint cases), the body block IS the loop block.
+		loopBlock := block
+		for _, pred := range block.Preds {
+			if strings.Contains(pred.Comment, "rangeint.loop") {
+				loopBlock = pred
+				break
+			}
+		}
+
+		// Find the done block: look for the block with "rangeint.done" comment
+		// that is reachable from this loop (shares the same function scope).
+		// For functions with a single loop, there is exactly one such block.
+		// For multiple loops, we match by BFS from the loop body.
+		doneBlock := spmdFindLoopDoneBlock(fn, block, loopBlock, doneByPrefix)
+		if doneBlock == nil {
+			continue
+		}
+
+		loops = append(loops, &spmdRegularForLoop{
+			loopBlock: loopBlock,
+			bodyBlock: block,
+			doneBlock: doneBlock,
+			iterPhi:   iterPhi,
+		})
+	}
+	return loops
+}
+
+// spmdFindLoopDoneBlock finds the done block for a regular for-loop.
+// It first tries to find a "rangeint.done" block reachable from bodyBlock
+// without re-entering the loop (stops at loopBlock to avoid infinite loops).
+// Falls back to searching the doneByPrefix map if BFS finds only one candidate.
+func spmdFindLoopDoneBlock(fn *Function, bodyBlock, loopBlock *BasicBlock, doneByPrefix map[string]*BasicBlock) *BasicBlock {
+	// BFS from bodyBlock, stopping at loopBlock (back-edge).
+	// Collect all "rangeint.done" blocks encountered.
+	visited := make(map[*BasicBlock]bool)
+	queue := []*BasicBlock{bodyBlock}
+	visited[bodyBlock] = true
+	if loopBlock != bodyBlock {
+		visited[loopBlock] = true // don't re-enter loop block
+	}
+	var candidates []*BasicBlock
+	for len(queue) > 0 {
+		b := queue[0]
+		queue = queue[1:]
+		if strings.Contains(b.Comment, "rangeint.done") {
+			candidates = append(candidates, b)
+			continue // don't explore past the done block
+		}
+		for _, succ := range b.Succs {
+			if visited[succ] {
+				continue
+			}
+			visited[succ] = true
+			queue = append(queue, succ)
+		}
+	}
+	if len(candidates) == 1 {
+		return candidates[0]
+	}
+	// Ambiguous or not found: if there is exactly one "rangeint.done" in the
+	// entire function, use it (common single-loop case).
+	if len(doneByPrefix) == 1 {
+		for _, b := range doneByPrefix {
+			return b
+		}
+	}
+	return nil
+}
+
+// spmdFindVaryingBreaks finds varying break patterns inside a regular for-loop.
+// A varying break is: a varying If (IsVarying=true) in the loop body whose
+// then-block (Succs[0]) has a single Jump to the loop's done block.
+func spmdFindVaryingBreaks(fn *Function, fl *spmdRegularForLoop) []*spmdVaryingBreak {
+	// Build the set of blocks in the loop body (between bodyBlock and doneBlock).
+	loopBodyBlocks := spmdRegularLoopScopeBlocks(fl)
+
+	var breaks []*spmdVaryingBreak
+	for block := range loopBodyBlocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		vif, ok := block.Instrs[len(block.Instrs)-1].(*If)
+		if !ok || !vif.IsVarying {
+			continue
+		}
+		thenBlock := block.Succs[0]
+		elseBlock := block.Succs[1]
+
+		// Check if thenBlock is a break block: single instruction (Jump) to doneBlock.
+		if !spmdIsBreakBlock(thenBlock, fl.doneBlock) {
+			continue
+		}
+		breaks = append(breaks, &spmdVaryingBreak{
+			ifBlock:   block,
+			thenBlock: thenBlock,
+			elseBlock: elseBlock,
+			vif:       vif,
+		})
+	}
+	return breaks
+}
+
+// spmdRegularLoopScopeBlocks returns the set of blocks in a regular for-loop's
+// body: blocks reachable from bodyBlock without passing through doneBlock.
+func spmdRegularLoopScopeBlocks(fl *spmdRegularForLoop) map[*BasicBlock]bool {
+	scope := make(map[*BasicBlock]bool)
+	queue := []*BasicBlock{fl.bodyBlock}
+	scope[fl.bodyBlock] = true
+	if fl.loopBlock != fl.bodyBlock {
+		queue = append(queue, fl.loopBlock)
+		scope[fl.loopBlock] = true
+	}
+	for len(queue) > 0 {
+		b := queue[0]
+		queue = queue[1:]
+		for _, succ := range b.Succs {
+			if succ == fl.doneBlock || scope[succ] {
+				continue
+			}
+			scope[succ] = true
+			queue = append(queue, succ)
+		}
+	}
+	return scope
+}
+
+// spmdIsBreakBlock reports whether block ends with a single Jump to doneBlock
+// and contains only the Jump instruction (i.e., it is a bare break block with
+// no other computation). Also accepts blocks that are the then-branch of a
+// varying If and directly jump to doneBlock with at most one instruction.
+func spmdIsBreakBlock(block, doneBlock *BasicBlock) bool {
+	// The block must have exactly one successor: the done block.
+	if len(block.Succs) != 1 || block.Succs[0] != doneBlock {
+		return false
+	}
+	// The block must end with a Jump (not another If or Return).
+	if len(block.Instrs) == 0 {
+		return false
+	}
+	_, ok := block.Instrs[len(block.Instrs)-1].(*Jump)
+	return ok
+}
+
+// predicateVaryingBreaks transforms varying breaks in a regular for-loop into
+// break mask accumulation. For each varying break, the then-block (which jumped
+// to doneBlock) is linearized: control flows to elseBlock instead, and the
+// break lanes are accumulated into a break mask phi at the loop header.
+//
+// For each result phi at doneBlock that has a break-edge value, an accumulator
+// phi is also created at the loop header, carrying the break-selected result
+// across iterations. This ensures the accumulated break result dominates the
+// done block (since the accumulator phi lives in the loop header, which
+// dominates the done block).
+//
+// Transformed structure:
+//
+//	loopBlock:
+//	    break_mask  = phi [entry: zero_mask, back_edge: new_break_mask]
+//	    result_accum = phi [entry: default_val, back_edge: sel_result]  (per result phi)
+//	    jump bodyBlock
+//
+//	bodyBlock / ifBlock:
+//	    active_mask = AND_NOT(all_ones, break_mask)
+//	    mask_cond   = convert(vif.Cond)
+//	    break_lanes = AND(active_mask, mask_cond)
+//	    new_break_mask = OR(break_mask, break_lanes)
+//	    sel_result = SPMDSelect(break_lanes, break_val, result_accum, Lanes)
+//	    jump elseBlock  (linearized: no jump to doneBlock)
+//
+//	doneBlock:
+//	    result = result_accum  (replaced with reference to accumulator phi)
+func predicateVaryingBreaks(fn *Function, fl *spmdRegularForLoop, breaks []*spmdVaryingBreak, lanes int) {
+	// Step A: Identify the entry and back-edge predecessors of the loop header.
+	loopBlock := fl.loopBlock
+	entryPred, _ := spmdLoopHeaderPreds(loopBlock, fl.bodyBlock, fl.doneBlock)
+	if entryPred == nil {
+		// Cannot identify entry predecessor; skip transformation.
+		return
+	}
+
+	// Step B: Create the break mask phi at the loop header.
+	// break_mask = phi [entry: zero_mask, back_edge: new_break_mask]
+	zeroMask := NewConst(constant.MakeBool(false), spmdpkg.NewVaryingMask())
+	breakMaskPhi := &Phi{Comment: "spmd.break.mask"}
+	breakMaskPhi.setType(spmdpkg.NewVaryingMask())
+	breakMaskPhi.Edges = make([]Value, len(loopBlock.Preds))
+	for i := range loopBlock.Preds {
+		breakMaskPhi.Edges[i] = zeroMask // placeholder; entry and back-edge both start as zero
+	}
+	spmdInsertPhiAtFront(loopBlock, breakMaskPhi)
+	spmdAddReferrer(zeroMask, breakMaskPhi) // entry edge
+
+	// Step C: Snapshot result phis at doneBlock before any CFG rewiring.
+	// We need the edge values (from then-blocks) before removePred compacts them.
+	type resultPhiInfo struct {
+		phi      *Phi
+		breakVal map[*BasicBlock]Value // break-block → break value
+		normVal  Value                 // value from the normal (non-break) loop exit
+	}
+	var resultPhis []resultPhiInfo
+	for _, instr := range fl.doneBlock.Instrs {
+		phi, ok := instr.(*Phi)
+		if !ok {
+			break
+		}
+		info := resultPhiInfo{
+			phi:      phi,
+			breakVal: make(map[*BasicBlock]Value),
+		}
+		for j, pred := range fl.doneBlock.Preds {
+			isBreakPred := false
+			for _, vb := range breaks {
+				if pred == vb.thenBlock {
+					info.breakVal[pred] = phi.Edges[j]
+					isBreakPred = true
+					break
+				}
+			}
+			if !isBreakPred && info.normVal == nil {
+				info.normVal = phi.Edges[j]
+			}
+		}
+		resultPhis = append(resultPhis, info)
+	}
+
+	// Step D: For each varying break, insert mask computation and SPMDSelect,
+	// then linearize the If → Jump.
+	//
+	// The SPMDSelect is placed in ifBlock (inside the loop body). Its result
+	// is passed out of the loop by updating the doneBlock phi's loop-exit edge.
+	// This preserves the done block phi's entry edge (for the n=0 case), while
+	// the loop-exit edge carries the accumulated break result.
+	var lastBreakMask Value = breakMaskPhi
+	// runningAccum[i] is the accumulated break result for resultPhis[i].
+	// Starts as normVal; updated per break via SPMDSelect.
+	runningAccum := make([]Value, len(resultPhis))
+	for i, rpi := range resultPhis {
+		runningAccum[i] = rpi.normVal
+	}
+
+	for _, vb := range breaks {
+		ifBlock := vb.ifBlock
+		thenBlock := vb.thenBlock
+		elseBlock := vb.elseBlock
+
+		// Compute active mask: AND_NOT(all_ones, lastBreakMask)
+		activeMask := spmdInsertMaskAndNot(ifBlock, spmdAllOnesMask(), lastBreakMask)
+
+		// Convert the condition to a mask and compute which lanes break.
+		maskCond := spmdInsertConvertToMask(ifBlock, vb.vif.Cond)
+		breakLanes := spmdInsertMaskAnd(ifBlock, activeMask, maskCond)
+
+		// Accumulate break mask.
+		newBreakMask := spmdInsertMaskOr(ifBlock, lastBreakMask, breakLanes)
+		lastBreakMask = newBreakMask
+
+		// For each result phi that has a break value from this break block,
+		// create SPMDSelect: sel = select(breakLanes, break_val, prev_accum).
+		for i, rpi := range resultPhis {
+			breakVal, hasBreakVal := rpi.breakVal[thenBlock]
+			if !hasBreakVal {
+				continue
+			}
+			sel := &SPMDSelect{
+				Mask:  breakLanes,
+				X:     breakVal,
+				Y:     runningAccum[i],
+				Lanes: lanes,
+			}
+			sel.setType(rpi.phi.Type())
+			sel.setBlock(ifBlock)
+			spmdInsertBeforeTerminator(ifBlock, sel)
+			spmdAddReferrer(breakLanes, sel)
+			spmdAddReferrer(breakVal, sel)
+			spmdAddReferrer(runningAccum[i], sel)
+			runningAccum[i] = sel
+		}
+
+		// Linearize: replace the varying If with a Jump to elseBlock.
+		spmdReplaceIfWithJump(ifBlock, elseBlock, thenBlock)
+
+		// Detach thenBlock from doneBlock.
+		fl.doneBlock.removePred(thenBlock)
+		thenBlock.Succs = nil
+		thenBlock.Instrs = nil // mark as dead
+	}
+
+	// Step E: Close the break mask phi's back-edge.
+	// The back-edge is the predecessor that is NOT the entry predecessor.
+	for i, pred := range loopBlock.Preds {
+		if pred == entryPred {
+			continue
+		}
+		// Remove the placeholder zero referrer and install the real value.
+		if refs := zeroMask.Referrers(); refs != nil {
+			*refs = removeInstr(*refs, breakMaskPhi)
+		}
+		breakMaskPhi.Edges[i] = lastBreakMask
+		spmdAddReferrer(lastBreakMask, breakMaskPhi)
+	}
+
+	// Step F: Update doneBlock result phis to carry the accumulated break result.
+	//
+	// Instead of replacing the done block phi entirely (which would break the
+	// entry → done path when n=0), we update the phi's loop-exit edge to point
+	// to runningAccum[i] (the last SPMDSelect in the loop body).
+	//
+	// The loop-exit edge predecessor is the block that exits the loop to done.
+	// That is: any predecessor of doneBlock that is NOT the entryPred and is NOT
+	// a thenBlock (break block, already removed). After removing break predecessors
+	// in Step D, the remaining doneBlock predecessors are: entryPred (direct entry
+	// when n=0) and the loop-exit block (the block that exits via bound check).
+	for i, rpi := range resultPhis {
+		if runningAccum[i] == rpi.normVal {
+			// No SPMDSelect was created for this phi; nothing to update.
+			continue
+		}
+		// Update the done block phi's loop-exit edge (non-entry predecessor)
+		// to use the accumulated break result.
+		for j, pred := range fl.doneBlock.Preds {
+			if pred == entryPred {
+				continue // keep the entry edge as normVal
+			}
+			// This is the loop-exit edge. Update it to the accumulated result.
+			// Use spmdRemoveOneReferrer to remove exactly one occurrence of the
+			// old edge value from its referrer list. The value may appear in
+			// other edges of this phi (e.g., entry edge), so we must not remove
+			// all occurrences.
+			if j < len(rpi.phi.Edges) {
+				oldEdge := rpi.phi.Edges[j]
+				if oldEdge != nil {
+					if refs := oldEdge.Referrers(); refs != nil {
+						*refs = spmdRemoveOneReferrer(*refs, rpi.phi)
+					}
+				}
+				rpi.phi.Edges[j] = runningAccum[i]
+				spmdAddReferrer(runningAccum[i], rpi.phi)
+			}
+		}
+	}
+}
+
+// spmdLoopHeaderPreds identifies the entry predecessor and back-edge predecessor
+// of a loop header block.
+// The entry predecessor is the one that is NOT in the loop body (i.e., it does
+// not reach loopBlock through a path that goes through bodyBlock or loopBlock).
+// Returns (entryPred, backEdgePred). Returns (nil, nil) if ambiguous.
+func spmdLoopHeaderPreds(loopBlock, bodyBlock, doneBlock *BasicBlock) (entryPred, backEdge *BasicBlock) {
+	// Build the set of blocks reachable from loopBlock (the loop body).
+	// A back-edge predecessor is one that is reachable from loopBlock itself.
+	reachable := make(map[*BasicBlock]bool)
+	queue := []*BasicBlock{loopBlock}
+	reachable[loopBlock] = true
+	for len(queue) > 0 {
+		b := queue[0]
+		queue = queue[1:]
+		for _, succ := range b.Succs {
+			if succ == doneBlock || reachable[succ] {
+				continue
+			}
+			reachable[succ] = true
+			queue = append(queue, succ)
+		}
+	}
+
+	for _, pred := range loopBlock.Preds {
+		if reachable[pred] {
+			backEdge = pred
+		} else {
+			entryPred = pred
+		}
+	}
+	return entryPred, backEdge
+}
+
+// spmdRemoveOneReferrer removes exactly one occurrence of instr from refs.
+// Unlike removeInstr (which removes ALL occurrences), this is used when a
+// value appears multiple times as an operand but only one occurrence is being
+// replaced. Returns the updated slice.
+func spmdRemoveOneReferrer(refs []Instruction, instr Instruction) []Instruction {
+	for i, r := range refs {
+		if r == instr {
+			return slices.Delete(refs, i, i+1)
+		}
+	}
+	return refs
+}
+
+// spmdInsertPhiAtFront inserts phi at the very beginning of block b's Instrs,
+// before any existing instructions (including existing phis).
+func spmdInsertPhiAtFront(b *BasicBlock, phi *Phi) {
+	phi.setBlock(b)
+	b.Instrs = append(b.Instrs, nil)
+	copy(b.Instrs[1:], b.Instrs)
+	b.Instrs[0] = phi
+}
+
+// spmdCompactInstrs removes nil slots from b.Instrs.
+// Used after replacing instructions that leave nil gaps.
+func spmdCompactInstrs(b *BasicBlock) {
+	j := 0
+	for _, instr := range b.Instrs {
+		if instr != nil {
+			b.Instrs[j] = instr
+			j++
+		}
+	}
+	for k := j; k < len(b.Instrs); k++ {
+		b.Instrs[k] = nil // clear for GC
+	}
+	b.Instrs = b.Instrs[:j]
 }
 
 // spmdBuildExcludedIfs builds a set of If instructions that should NOT be

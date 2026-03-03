@@ -393,8 +393,13 @@ func (f *Function) finishBody() {
 	}
 
 	// Resolve SPMD loop phis after lift has promoted allocs to phis.
+	// Also run predication for SPMD function bodies (varying params) even when
+	// there are no go-for loops, since they may have regular for-loops with
+	// varying breaks that need break mask transformation.
 	if len(f.SPMDLoops) > 0 {
 		resolveSPMDLoops(f)
+	}
+	if len(f.SPMDLoops) > 0 || hasSPMDParams(f) {
 		// Transform varying control flow into predicated form with explicit
 		// mask-gated operations. Runs after loop resolution so LaneCount is
 		// available, and before numberRegisters so new instructions get numbered.
