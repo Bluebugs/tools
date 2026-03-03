@@ -1464,11 +1464,19 @@ func spmdReplaceSwitchPhisWithChainedSelect(
 		baseBlock = cases[len(cases)-1].bodyBlock
 	}
 
-	for phiIdx, phi := range phis {
+	// Collect all new instructions to insert, per-phi. We process
+	// phis in order and track {instructions, outermost value} for each.
+	type phiReplacement struct {
+		instrs []Instruction // all SPMDSelects in dependency order (inner first)
+		val    Value         // outermost value (may be a pre-existing Value, not Instruction)
+		phi    *Phi
+	}
+	var replacements []phiReplacement
+
+	for _, phi := range phis {
 		// Look up the base value from the snapshotted edge map.
 		baseEdges, ok := phiEdges[baseBlock]
 		if !ok {
-			// baseBlock not found in snapshot — defensive skip.
 			continue
 		}
 		baseVal, ok := baseEdges[phi]
@@ -1479,16 +1487,16 @@ func spmdReplaceSwitchPhisWithChainedSelect(
 		// Build chained selects from last case to first (bottom-up).
 		// Cases whose bodyBlock == baseBlock provide the starting value and
 		// skip select emission (no-default: last case IS the base).
+		var chainInstrs []Instruction
 		sel := Value(baseVal)
 		for i := len(cases) - 1; i >= 0; i-- {
 			ci := cases[i]
 			if ci.bodyBlock == baseBlock {
-				// Last case in a no-default switch: already the base value.
 				continue
 			}
 			caseEdges, ok := phiEdges[ci.bodyBlock]
 			if !ok {
-				continue // body block not in snapshot (defensive)
+				continue
 			}
 			caseVal, ok := caseEdges[phi]
 			if !ok {
@@ -1506,33 +1514,51 @@ func spmdReplaceSwitchPhisWithChainedSelect(
 			spmdAddReferrer(ci.mask, newSel)
 			spmdAddReferrer(caseVal, newSel)
 			spmdAddReferrer(sel, newSel)
+			chainInstrs = append(chainInstrs, newSel)
 			sel = newSel
 		}
 
-		// Replace the Phi slot with the outermost SPMDSelect in the Instrs slice.
-		if selInstr, ok := sel.(Instruction); ok {
-			doneBlock.Instrs[phiIdx] = selInstr
+		replacements = append(replacements, phiReplacement{
+			instrs: chainInstrs,
+			val:    sel,
+			phi:    phi,
+		})
+	}
+
+	// Rebuild the Instrs slice: replace each Phi with its full chain of
+	// SPMDSelects (innermost first so dependencies are satisfied), then
+	// append remaining non-Phi instructions.
+	var newInstrs []Instruction
+	phiSet := make(map[*Phi]bool, len(phis))
+	for _, phi := range phis {
+		phiSet[phi] = true
+	}
+	repIdx := 0
+	for _, instr := range doneBlock.Instrs {
+		if phi, ok := instr.(*Phi); ok && phiSet[phi] {
+			if repIdx < len(replacements) && replacements[repIdx].phi == phi {
+				r := replacements[repIdx]
+				newInstrs = append(newInstrs, r.instrs...)
+				repIdx++
+			}
+			// else: phi had no replacement (defensive skip above)
 		} else {
-			// Degenerate case: single-case no-default switch where no SPMDSelect
-			// was built (sel is a pre-existing Value, not an Instruction).
-			// Mark the slot for removal to avoid leaving a zombie Phi with
-			// block=nil in a live block's Instrs slice.
-			doneBlock.Instrs[phiIdx] = nil
+			newInstrs = append(newInstrs, instr)
 		}
+	}
+	doneBlock.Instrs = newInstrs
 
-		// Redirect all uses of the old Phi to the new value.
-		replaceAll(phi, sel)
-
-		// Clean up the Phi's remaining edge referrers (post-CFG-rewiring,
-		// some edges may already have been removed by removePred above).
-		for _, edge := range phi.Edges {
+	// Redirect uses and clean up old Phis.
+	for _, r := range replacements {
+		replaceAll(r.phi, r.val)
+		for _, edge := range r.phi.Edges {
 			if edge != nil {
 				if refs := edge.Referrers(); refs != nil {
-					*refs = removeInstr(*refs, phi)
+					*refs = removeInstr(*refs, r.phi)
 				}
 			}
 		}
-		phi.block = nil
+		r.phi.block = nil
 	}
 
 	// Compact nil slots from degenerate Phi replacements.

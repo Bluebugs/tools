@@ -404,6 +404,11 @@ func (f *Function) finishBody() {
 		// mask-gated operations. Runs after loop resolution so LaneCount is
 		// available, and before numberRegisters so new instructions get numbered.
 		predicateSPMD(f)
+		// Predication rewrites the CFG (If→Jump, block rewiring) which may
+		// create unreachable blocks and invalidate the dominator tree.
+		// Clean up and rebuild so DomPreorder() reflects the linearized CFG.
+		deleteUnreachableBlocks(f)
+		buildDomTree(f)
 	}
 
 	// clear remaining builder state
