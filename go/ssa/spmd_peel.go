@@ -384,8 +384,28 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	spmdInsertPhiAtFront(mainBody, mainIterPhi)
 	spmdAddReferrer(zeroConst, mainIterPhi)
 
-	// Clone body instructions, mapping the original IterPhi to mainIterPhi.
+	// Create accumulator phis in mainBody BEFORE cloning so the valueMap
+	// maps each original accumulator phi to its mainBody counterpart. The
+	// back-edge for each mainAccPhi is filled in after spmdCloneBlock, once
+	// the cloned back-edge value is available.
+	//
+	// spmdInsertPhiAtFront inserts at position 0, so multiple accumulator
+	// phis end up in reverse declaration order; this is acceptable because
+	// edge ordering only needs to match Preds ordering, which it does.
+	mainAccPhis := make([]*Phi, len(loop.Accumulators))
 	mainValueMap := map[Value]Value{loop.IterPhi: mainIterPhi}
+	for i, acc := range loop.Accumulators {
+		mainAccPhi := &Phi{Comment: "spmd.main.acc"}
+		mainAccPhi.setType(acc.Phi.Type())
+		mainAccPhi.Edges = []Value{acc.InitValue, nil} // back-edge filled after clone
+		spmdInsertPhiAtFront(mainBody, mainAccPhi)
+		spmdAddReferrer(acc.InitValue, mainAccPhi)
+		mainValueMap[acc.Phi] = mainAccPhi
+		mainAccPhis[i] = mainAccPhi
+	}
+
+	// Clone body instructions using mainValueMap so that references to the
+	// original IterPhi and accumulator phis resolve to their mainBody copies.
 	spmdCloneBlock(fn, body, mainBody, mainValueMap)
 
 	// mainIncr = mainIterPhi + laneCount  (advance by a full SIMD width).
@@ -401,6 +421,14 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	// Fill in the back-edge of mainIterPhi now that mainIncr exists.
 	mainIterPhi.Edges[1] = mainIncr
 	spmdAddReferrer(mainIncr, mainIterPhi)
+
+	// Fill in the back-edges of accumulator phis now that the cloned
+	// back-edge values are available in mainValueMap.
+	for i, acc := range loop.Accumulators {
+		backVal := spmdTranslateValue(acc.BackValue, mainValueMap)
+		mainAccPhis[i].Edges[1] = backVal
+		spmdAddReferrer(backVal, mainAccPhis[i])
+	}
 
 	// mainCond = mainIncr < alignedBound.
 	mainCond := &BinOp{Op: token.LSS}
@@ -424,6 +452,21 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	addEdge(mainBody, mainBody)
 	addEdge(mainBody, tailCheck)
 
+	// --- Determine exit target for tailCheck and tailBody ---
+	// When the loop has accumulators, the done block may have phis that consume
+	// the final accumulator value. After peeling, done can be reached from two
+	// paths (tailCheck when no tail, tailBody after tail executes) and those
+	// paths carry different accumulator values. A trampoline block merges them.
+	// For loops without accumulators, both tailCheck and tailBody branch directly
+	// to done; exitBlock is set to done in that case.
+	exitBlock := done
+	var trampoline *BasicBlock
+	if len(loop.Accumulators) > 0 {
+		trampoline = fn.newBasicBlock("spmd.trampoline")
+		exitBlock = trampoline
+		loop.TrampolineBlock = trampoline
+	}
+
 	// --- Populate tail check ---
 	// tailIter = phi [entry: 0, mainBody: mainIncr]
 	// tailCheck.Preds will be [entry, mainBody] because addEdge(entry, tailCheck)
@@ -435,6 +478,26 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	spmdAddReferrer(zeroConst, tailIterPhi)
 	spmdAddReferrer(mainIncr, tailIterPhi)
 
+	// Create accumulator phis in tailCheck, parallel to the iter phi.
+	// Each tailAccPhi receives the initial value on the entry edge and the
+	// main body's final accumulator result on the mainBody edge.
+	// tailValueMap maps the original acc.Phi to the tailAccPhi so the
+	// tail body clone resolves accumulator references correctly.
+	tailAccPhis := make([]*Phi, len(loop.Accumulators))
+	tailValueMap := map[Value]Value{loop.IterPhi: tailIterPhi}
+	for i, acc := range loop.Accumulators {
+		mainAccResult := spmdTranslateValue(acc.BackValue, mainValueMap)
+		tailAccPhi := &Phi{Comment: "spmd.tail.acc"}
+		tailAccPhi.setType(acc.Phi.Type())
+		// Edges align with tailCheck.Preds = [entry, mainBody].
+		tailAccPhi.Edges = []Value{acc.InitValue, mainAccResult}
+		spmdInsertPhiAtFront(tailCheck, tailAccPhi)
+		spmdAddReferrer(acc.InitValue, tailAccPhi)
+		spmdAddReferrer(mainAccResult, tailAccPhi)
+		tailValueMap[acc.Phi] = tailAccPhi
+		tailAccPhis[i] = tailAccPhi
+	}
+
 	// hasTail = tailIterPhi < typedBound.
 	hasTail := &BinOp{Op: token.LSS}
 	hasTail.X = tailIterPhi
@@ -445,27 +508,60 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	spmdAddReferrer(tailIterPhi, hasTail)
 	spmdAddReferrer(typedBound, hasTail)
 
-	// If(hasTail) → tailBody, done.
+	// If(hasTail) → tailBody, exitBlock (done or trampoline).
 	tailCheckIf := &If{Cond: hasTail}
 	tailCheckIf.setBlock(tailCheck)
 	tailCheck.Instrs = append(tailCheck.Instrs, tailCheckIf)
 	spmdAddReferrer(hasTail, tailCheckIf)
 
-	// Wire tailCheck → tailBody and tailCheck → done.
+	// Wire tailCheck → tailBody and tailCheck → exitBlock.
 	addEdge(tailCheck, tailBody)
-	addEdge(tailCheck, done)
+	addEdge(tailCheck, exitBlock)
 
 	// --- Populate tail body ---
-	tailValueMap := map[Value]Value{loop.IterPhi: tailIterPhi}
 	spmdCloneBlock(fn, body, tailBody, tailValueMap)
 
-	// Jump → done.
+	// Jump → exitBlock (done or trampoline).
 	tailJump := &Jump{}
 	tailJump.setBlock(tailBody)
 	tailBody.Instrs = append(tailBody.Instrs, tailJump)
 
-	// Wire tailBody → done.
-	addEdge(tailBody, done)
+	// Wire tailBody → exitBlock.
+	addEdge(tailBody, exitBlock)
+
+	// --- Build trampoline (only when accumulators are present) ---
+	// The trampoline merges the accumulator value from the two paths that
+	// reach it: tailCheck (no tail iterations) and tailBody (after tail).
+	// It then jumps unconditionally to done.
+	//
+	// trampoline.Preds = [tailCheck, tailBody] in the order addEdge was called,
+	// so mergePhi.Edges = [tailAccPhi, tailAccResult] matches that order.
+	if trampoline != nil {
+		for i, acc := range loop.Accumulators {
+			tailAccResult := spmdTranslateValue(acc.BackValue, tailValueMap)
+			mergePhi := &Phi{Comment: "spmd.acc.merge"}
+			mergePhi.setType(acc.Phi.Type())
+			// Edges align with trampoline.Preds = [tailCheck, tailBody].
+			mergePhi.Edges = []Value{tailAccPhis[i], tailAccResult}
+			spmdInsertPhiAtFront(trampoline, mergePhi)
+			spmdAddReferrer(tailAccPhis[i], mergePhi)
+			spmdAddReferrer(tailAccResult, mergePhi)
+
+			// Redirect post-loop uses of the original accumulator phi to the
+			// merged result. We deliberately skip uses that are in the original
+			// body block: those instructions are about to become unreachable
+			// (deleteUnreachableBlocks runs after peeling), and updating them
+			// would add dead instructions to mergePhi.Referrers(), which
+			// causes the post-build sanity checker to fail.
+			spmdReplaceAccUses(acc.Phi, mergePhi, body)
+		}
+
+		// Add unconditional Jump → done and wire the edge.
+		trampJump := &Jump{}
+		trampJump.setBlock(trampoline)
+		trampoline.Instrs = append(trampoline.Instrs, trampJump)
+		addEdge(trampoline, done)
+	}
 
 	// --- Update loop metadata ---
 	loop.IsPeeled = true
@@ -474,7 +570,41 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	loop.TailBodyBlock = tailBody
 	loop.AlignedBound = alignedBound
 	loop.TailIterPhi = tailIterPhi
-	// TrampolineBlock remains nil for loops without accumulators.
+	// TrampolineBlock is set above when accumulators are present, nil otherwise.
+}
+
+// spmdReplaceAccUses replaces uses of the original accumulator phi (oldPhi)
+// with newVal (the merge phi in the trampoline block), but only for instructions
+// that are NOT in excludeBlock (the original loop body block). Instructions in
+// excludeBlock are about to become unreachable and must not be added to
+// newVal.Referrers(); doing so would cause the post-build sanity checker to
+// report a stale referrer error.
+func spmdReplaceAccUses(oldPhi *Phi, newVal Value, excludeBlock *BasicBlock) {
+	pxrefs := oldPhi.Referrers()
+	if pxrefs == nil {
+		return
+	}
+	pyrefs := newVal.Referrers()
+	var remaining []Instruction
+	for _, instr := range *pxrefs {
+		if instr.Block() == excludeBlock {
+			// Keep this referrer on the old phi; it lives in the dead block.
+			remaining = append(remaining, instr)
+			continue
+		}
+		// Update instr's operand pointer from oldPhi to newVal.
+		var rands []*Value
+		rands = instr.Operands(rands[:0])
+		for _, rand := range rands {
+			if rand != nil && *rand == Value(oldPhi) {
+				*rand = newVal
+			}
+		}
+		if pyrefs != nil {
+			*pyrefs = append(*pyrefs, instr)
+		}
+	}
+	*pxrefs = remaining
 }
 
 // spmdTypedBound returns a typed version of bound for use in integer arithmetic.

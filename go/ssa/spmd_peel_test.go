@@ -397,6 +397,126 @@ func main() {
 	}
 }
 
+// TestPeelSPMDLoopWithAccumulator verifies that peelSPMDLoops creates the
+// expected CFG structure for a rangeint SPMD loop with a loop-carried
+// accumulator. A trampoline block must be inserted between the tail check /
+// tail body and the done block so that the two accumulator paths are merged
+// before the done block is reached.
+func TestPeelSPMDLoopWithAccumulator(t *testing.T) {
+	src := `package main
+
+func main() {
+	sum := 0
+	for i := range 16 {
+		_ = i
+		sum += 1
+	}
+	_ = sum
+}
+`
+	pkg := buildSSAForPeelTest(t, src)
+	fn := pkg.Func("main")
+	if fn == nil {
+		t.Fatal("main function not found")
+	}
+	if len(fn.SPMDLoops) == 0 {
+		t.Fatal("no SPMD loops found")
+	}
+	loop := fn.SPMDLoops[0]
+
+	if !loop.IsPeeled {
+		t.Fatal("loop was not peeled")
+	}
+	if len(loop.Accumulators) == 0 {
+		t.Fatal("expected at least one accumulator")
+	}
+	if loop.TrampolineBlock == nil {
+		t.Fatal("TrampolineBlock should not be nil for loop with accumulators")
+	}
+
+	// Verify trampoline structure: exactly one successor (done).
+	tramp := loop.TrampolineBlock
+	if len(tramp.Succs) != 1 {
+		t.Fatalf("trampoline has %d succs, want 1", len(tramp.Succs))
+	}
+	if tramp.Succs[0] != loop.DoneBlock {
+		t.Errorf("trampoline.Succs[0] = %s, want Done", tramp.Succs[0].Comment)
+	}
+
+	// Trampoline must have at least one phi (the accumulator merge).
+	hasPhi := false
+	for _, instr := range tramp.Instrs {
+		if _, ok := instr.(*Phi); ok {
+			hasPhi = true
+			break
+		}
+	}
+	if !hasPhi {
+		t.Error("trampoline should have at least one phi for accumulator merge")
+	}
+
+	// TailCheck must branch to TailBody (true) and trampoline (false), not done.
+	tc := loop.TailCheckBlock
+	if len(tc.Succs) != 2 {
+		t.Fatalf("TailCheck has %d succs, want 2", len(tc.Succs))
+	}
+	if tc.Succs[0] != loop.TailBodyBlock {
+		t.Errorf("TailCheck.Succs[0] = %s, want TailBody", tc.Succs[0].Comment)
+	}
+	if tc.Succs[1] != tramp {
+		t.Errorf("TailCheck.Succs[1] = %s, want Trampoline", tc.Succs[1].Comment)
+	}
+
+	// TailBody must jump to trampoline, not done.
+	tb := loop.TailBodyBlock
+	if len(tb.Succs) != 1 {
+		t.Fatalf("TailBody has %d succs, want 1", len(tb.Succs))
+	}
+	if tb.Succs[0] != tramp {
+		t.Errorf("TailBody.Succs[0] = %s, want Trampoline", tb.Succs[0].Comment)
+	}
+
+	// Done must have Trampoline as its only predecessor (not TailCheck or TailBody directly).
+	done := loop.DoneBlock
+	hasTrampPred := false
+	for _, p := range done.Preds {
+		if p == tramp {
+			hasTrampPred = true
+		}
+		if p == tc {
+			t.Error("Done should not have TailCheck as direct predecessor when trampoline exists")
+		}
+		if p == tb {
+			t.Error("Done should not have TailBody as direct predecessor when trampoline exists")
+		}
+	}
+	if !hasTrampPred {
+		t.Error("Done should have Trampoline as a predecessor")
+	}
+
+	// Trampoline must have exactly two predecessors: TailCheck and TailBody.
+	if len(tramp.Preds) != 2 {
+		t.Fatalf("trampoline has %d preds, want 2", len(tramp.Preds))
+	}
+	if tramp.Preds[0] != tc {
+		t.Errorf("tramp.Preds[0] = %s, want TailCheck", tramp.Preds[0].Comment)
+	}
+	if tramp.Preds[1] != tb {
+		t.Errorf("tramp.Preds[1] = %s, want TailBody", tramp.Preds[1].Comment)
+	}
+
+	// Verify the merge phi's edge count matches the trampoline's predecessors.
+	for _, instr := range tramp.Instrs {
+		phi, ok := instr.(*Phi)
+		if !ok {
+			continue
+		}
+		if len(phi.Edges) != 2 {
+			t.Errorf("merge phi %q has %d edges, want 2", phi.Comment, len(phi.Edges))
+		}
+	}
+}
+
 // TestSPMDCloneBlock_OperandTranslation verifies that operands of cloned
 // instructions are translated through the valueMap: no cloned instruction
 // should reference an original value that was itself cloned.
