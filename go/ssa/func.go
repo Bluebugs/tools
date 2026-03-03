@@ -399,7 +399,7 @@ func (f *Function) finishBody() {
 	if len(f.SPMDLoops) > 0 {
 		resolveSPMDLoops(f)
 	}
-	if len(f.SPMDLoops) > 0 || hasSPMDParams(f) {
+	if len(f.SPMDLoops) > 0 {
 		// Transform varying control flow into predicated form with explicit
 		// mask-gated operations. Runs after loop resolution so LaneCount is
 		// available, and before numberRegisters so new instructions get numbered.

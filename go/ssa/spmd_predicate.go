@@ -55,19 +55,16 @@ func hasSPMDParams(fn *Function) bool {
 //  1. Functions with SPMDLoops (go-for loops): linearizes varying Ifs in scope.
 //  2. Functions with SPMDType parameters (SPMD bodies): handles varying breaks
 //     inside regular for-range loops via break mask accumulation.
+//     NOTE: Case 2 is currently disabled — TinyGo still uses its own break mask
+//     handling for SPMD function bodies (spmdFuncIsBody, spmdBreakRedirect, etc.).
+//     Enable when TinyGo's old handling is removed.
 func predicateSPMD(fn *Function) {
-	if len(fn.SPMDLoops) == 0 && !hasSPMDParams(fn) {
+	if len(fn.SPMDLoops) == 0 {
 		return
 	}
 
 	for _, loop := range fn.SPMDLoops {
 		predicateSPMDLoop(fn, loop)
-	}
-
-	// Handle SPMD function bodies: functions with varying params but no go-for loops.
-	// These may contain regular for-loops with varying breaks that need masking.
-	if hasSPMDParams(fn) {
-		predicateSPMDFuncBody(fn)
 	}
 }
 
