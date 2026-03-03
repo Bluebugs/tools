@@ -1406,3 +1406,293 @@ func main() {
 		t.Error("unexpected 'if varying' after predicateSPMD ran")
 	}
 }
+
+// ----------------------------------------------------------------------------
+// Boolean chain predication tests (predicateBooleanChain)
+
+// TestPredicateSPMD_BooleanChainAnd verifies that an && boolean chain is
+// linearized: all varying Ifs removed, combined AND mask computed, memory
+// ops in the then-block are masked, and SPMDSelect replaces any live Phis.
+func TestPredicateSPMD_BooleanChainAnd(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		if i > 2 && i < 10 {
+			_ = i + 1
+		}
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+	if mainFn == nil {
+		t.Fatal("main function not found")
+	}
+
+	// No varying If should remain after boolean chain linearization.
+	for _, block := range mainFn.Blocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		if vif, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok {
+			if vif.IsVarying {
+				t.Errorf("block %d: varying If remains after boolean chain linearization", block.Index)
+			}
+		}
+	}
+
+	// Mask computation instructions must be present (Convert + AND for && chain).
+	var buf bytes.Buffer
+	mainFn.WriteTo(&buf)
+	output := buf.String()
+	if !strings.Contains(output, "lanes.Varying[mask]") {
+		t.Error("expected Varying[mask] mask instructions from boolean chain && predication")
+	}
+	if strings.Contains(output, "if varying") {
+		t.Error("unexpected 'if varying' after boolean chain linearization")
+	}
+}
+
+// TestPredicateSPMD_BooleanChainOr verifies that an || boolean chain is
+// linearized: all varying Ifs removed, combined OR mask computed, mask
+// instructions present in SSA output.
+func TestPredicateSPMD_BooleanChainOr(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		if i < 2 || i > 10 {
+			_ = i + 1
+		}
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+	if mainFn == nil {
+		t.Fatal("main function not found")
+	}
+
+	// No varying If should remain.
+	for _, block := range mainFn.Blocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		if vif, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok {
+			if vif.IsVarying {
+				t.Errorf("block %d: varying If remains after boolean chain OR linearization", block.Index)
+			}
+		}
+	}
+
+	var buf bytes.Buffer
+	mainFn.WriteTo(&buf)
+	output := buf.String()
+	if !strings.Contains(output, "lanes.Varying[mask]") {
+		t.Error("expected Varying[mask] mask instructions from boolean chain || predication")
+	}
+	if strings.Contains(output, "if varying") {
+		t.Error("unexpected 'if varying' after boolean chain || linearization")
+	}
+}
+
+// TestPredicateSPMD_BooleanChainWithElse verifies that && with an else branch
+// is linearized correctly: no varying Ifs remain, mask instructions present,
+// both then and else branches appear in the output.
+func TestPredicateSPMD_BooleanChainWithElse(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		x := i
+		if i > 2 && i < 10 {
+			x = i + 1
+		} else {
+			x = i - 1
+		}
+		_ = x
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	mainFn := pkg.Func("main")
+	if mainFn == nil {
+		t.Fatal("main function not found")
+	}
+
+	// No varying If should remain.
+	for _, block := range mainFn.Blocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		if vif, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok {
+			if vif.IsVarying {
+				t.Errorf("block %d: varying If remains after && with else linearization", block.Index)
+			}
+		}
+	}
+
+	var buf bytes.Buffer
+	mainFn.WriteTo(&buf)
+	output := buf.String()
+	if !strings.Contains(output, "lanes.Varying[mask]") {
+		t.Error("expected Varying[mask] mask instructions from && with else predication")
+	}
+	if strings.Contains(output, "if varying") {
+		t.Error("unexpected 'if varying' after && with else linearization")
+	}
+}
+
+// TestPredicateSPMD_BooleanChainMemOps verifies that memory operations in
+// the then-block of a boolean chain are masked with SPMDStore.
+func TestPredicateSPMD_BooleanChainMemOps(t *testing.T) {
+	src := `package main
+
+func f(dst []int) {
+	for i := range dst {
+		if i > 2 && i < 10 {
+			dst[i] = i * 2
+		}
+	}
+}
+
+func main() { f(make([]int, 16)) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	// SPMDStore must appear — the store inside the && body was masked.
+	foundSPMDStore := false
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if _, ok := instr.(*ssa.SPMDStore); ok {
+				foundSPMDStore = true
+			}
+		}
+	}
+	if !foundSPMDStore {
+		t.Error("expected SPMDStore in then-block of && chain (store must be masked)")
+	}
+
+	// No varying If should remain.
+	for _, block := range fn.Blocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		if vif, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok {
+			if vif.IsVarying {
+				t.Errorf("block %d: varying If remains after boolean chain mem-ops test", block.Index)
+			}
+		}
+	}
+}
+
+// TestPredicateSPMD_BooleanChainPhiMerge verifies that if-without-else boolean
+// chains correctly replace Phis at the merge block with SPMDSelect. This tests
+// the case where a value is conditionally modified under a && condition and
+// used after the if — producing a Phi at the merge that must become an SPMDSelect.
+func TestPredicateSPMD_BooleanChainPhiMerge(t *testing.T) {
+	src := `package main
+
+func f(dst []int) {
+	for i := range dst {
+		x := i
+		if i > 2 && i < 10 {
+			x = i + 100
+		}
+		dst[i] = x
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	// After predication, the Phi at the merge block should be replaced
+	// with an SPMDSelect. Check that at least one SPMDSelect exists.
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+
+	if !strings.Contains(output, "spmd_select") {
+		t.Error("expected SPMDSelect in output for if-without-else && chain with Phi merge")
+		t.Logf("SSA output:\n%s", output)
+	}
+
+	// No varying If should remain.
+	for _, block := range fn.Blocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		if vif, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok && vif.IsVarying {
+			t.Errorf("varying If still present in block %s after predication", block)
+		}
+	}
+}
+
+// TestPredicateSPMD_BooleanChainSanity verifies the sanity checker passes
+// after predicateSPMD linearizes an && boolean chain (if-without-else).
+func TestPredicateSPMD_BooleanChainSanity(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		if i > 2 && i < 10 {
+			_ = i + 1
+		}
+	}
+}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setSPMDOnRange(f)
+
+	// SanityCheckFunctions will panic if predicateBooleanChain leaves the SSA invalid.
+	_, _, err = ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{f},
+		ssa.SanityCheckFunctions,
+	)
+	if err != nil {
+		t.Fatalf("BuildPackage with SanityCheckFunctions failed on && chain: %v", err)
+	}
+}
+
+// TestPredicateSPMD_BooleanChainOrSanity verifies the sanity checker passes
+// after predicateSPMD linearizes an || boolean chain.
+func TestPredicateSPMD_BooleanChainOrSanity(t *testing.T) {
+	src := `package main
+
+func main() {
+	for i := range 16 {
+		if i < 2 || i > 10 {
+			_ = i + 1
+		}
+	}
+}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setSPMDOnRange(f)
+
+	_, _, err = ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{f},
+		ssa.SanityCheckFunctions,
+	)
+	if err != nil {
+		t.Fatalf("BuildPackage with SanityCheckFunctions failed on || chain: %v", err)
+	}
+}

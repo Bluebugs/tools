@@ -153,17 +153,23 @@ func main() {
 	pkg := buildSSAWithSPMD(t, src)
 	mainFn := pkg.Func("main")
 
-	varyingCount := 0
+	// predicateBooleanChain runs as part of build and linearizes all chain Ifs.
+	// After predication no varying If instructions should remain.
 	for _, block := range mainFn.Blocks {
 		if len(block.Instrs) == 0 {
 			continue
 		}
 		if ifInstr, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok && ifInstr.IsVarying {
-			varyingCount++
+			t.Errorf("block %d: varying If remains after boolean chain && predication", block.Index)
 		}
 	}
-	if varyingCount < 2 {
-		t.Errorf("expected at least 2 varying If instructions for && condition, got %d", varyingCount)
+
+	// The SPMDBooleanChain metadata must still be present and record the && pattern.
+	if len(mainFn.SPMDBooleanChains) != 1 {
+		t.Fatalf("expected 1 SPMDBooleanChain, got %d", len(mainFn.SPMDBooleanChains))
+	}
+	if mainFn.SPMDBooleanChains[0].Op != token.LAND {
+		t.Errorf("expected LAND chain op, got %v", mainFn.SPMDBooleanChains[0].Op)
 	}
 }
 
@@ -181,17 +187,23 @@ func main() {
 	pkg := buildSSAWithSPMD(t, src)
 	mainFn := pkg.Func("main")
 
-	varyingCount := 0
+	// predicateBooleanChain runs as part of build and linearizes all chain Ifs.
+	// After predication no varying If instructions should remain.
 	for _, block := range mainFn.Blocks {
 		if len(block.Instrs) == 0 {
 			continue
 		}
 		if ifInstr, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok && ifInstr.IsVarying {
-			varyingCount++
+			t.Errorf("block %d: varying If remains after boolean chain || predication", block.Index)
 		}
 	}
-	if varyingCount < 2 {
-		t.Errorf("expected at least 2 varying If instructions for || condition, got %d", varyingCount)
+
+	// The SPMDBooleanChain metadata must still be present and record the || pattern.
+	if len(mainFn.SPMDBooleanChains) != 1 {
+		t.Fatalf("expected 1 SPMDBooleanChain, got %d", len(mainFn.SPMDBooleanChains))
+	}
+	if mainFn.SPMDBooleanChains[0].Op != token.LOR {
+		t.Errorf("expected LOR chain op, got %v", mainFn.SPMDBooleanChains[0].Op)
 	}
 }
 
@@ -373,13 +385,10 @@ func main() {
 	if !chain.IsVarying {
 		t.Error("expected IsVarying=true")
 	}
-	// All chain blocks should share the same false successor (ElseBlock).
-	for i, blk := range chain.Blocks {
-		if blk.Succs[1] != chain.ElseBlock {
-			t.Errorf("block %d (index %d): false successor is block %d, want %d",
-				i, blk.Index, blk.Succs[1].Index, chain.ElseBlock.Index)
-		}
-	}
+	// Note: Succs structure is checked before predicateBooleanChain runs.
+	// After predication, blocks have Jump (1 successor) instead of If (2 successors),
+	// so Succs[1] is no longer valid. The pre-predication invariant is validated
+	// by the metadata (ThenBlock/ElseBlock) captured in SPMDBooleanChain.
 }
 
 func TestBooleanChain_Or(t *testing.T) {
@@ -410,13 +419,10 @@ func main() {
 	if !chain.IsVarying {
 		t.Error("expected IsVarying=true")
 	}
-	// All chain blocks should share the same true successor (ThenBlock).
-	for i, blk := range chain.Blocks {
-		if blk.Succs[0] != chain.ThenBlock {
-			t.Errorf("block %d: true successor is block %d, want %d",
-				i, blk.Succs[0].Index, chain.ThenBlock.Index)
-		}
-	}
+	// Note: Succs structure is checked before predicateBooleanChain runs.
+	// After predication, blocks have Jump (1 successor) instead of If (2 successors),
+	// so Succs[0] is the jump target, not the pre-predication true successor.
+	// The pre-predication invariant is validated by ThenBlock in SPMDBooleanChain.
 }
 
 func TestBooleanChain_TripleAnd(t *testing.T) {

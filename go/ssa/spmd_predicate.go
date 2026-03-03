@@ -24,6 +24,13 @@ import (
 	spmdpkg "golang.org/x/tools/go/types/spmd"
 )
 
+// spmdPhiSnapshot captures the edge values of a Phi before CFG rewiring.
+// Used to reconstruct Phi→SPMDSelect when predecessors are removed.
+type spmdPhiSnapshot struct {
+	phi     *Phi
+	edgeVal map[*BasicBlock]Value // predecessor → edge value
+}
+
 // predicateSPMD transforms varying control flow in SPMD functions.
 // Called from finishBody after resolveSPMDLoops.
 func predicateSPMD(fn *Function) {
@@ -46,9 +53,34 @@ func predicateSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	// Build a set of If instructions to exclude from the generic If predication
 	// pass. Both boolean-chain and switch-chain Ifs are excluded so the generic
 	// loop below does not linearize them independently. Switch-chain Ifs are
-	// handled by predicateVaryingSwitch below, which processes the whole chain
-	// as a unit. Boolean chains will be handled by a future phase.
+	// handled by predicateVaryingSwitch below. Boolean chains are handled by
+	// predicateBooleanChain below.
 	excludedIfs := spmdBuildExcludedIfs(fn)
+
+	// Linearize each varying boolean chain whose first block is in scope.
+	// Process boolean chains before the generic If pass so that after
+	// collapsing the chain blocks into a linear sequence, no remaining
+	// varying Ifs from those blocks survive into the generic loop below.
+	for _, chain := range fn.SPMDBooleanChains {
+		if !chain.IsVarying {
+			continue
+		}
+		if len(chain.Blocks) == 0 {
+			continue
+		}
+		if !scopeBlocks[chain.Blocks[0]] {
+			continue
+		}
+		// Guard: skip if the first block's If has already been linearized
+		// (block() == nil after spmdReplaceIfWithJump).
+		if len(chain.Blocks[0].Instrs) == 0 {
+			continue
+		}
+		if _, ok := chain.Blocks[0].Instrs[len(chain.Blocks[0].Instrs)-1].(*If); !ok {
+			continue
+		}
+		predicateBooleanChain(fn, loop, chain)
+	}
 
 	// Find all varying If instructions in scope and linearize them.
 	// We iterate fn.Blocks in program order, which is sufficient for
@@ -308,6 +340,196 @@ func spmdInsertMaskAndNot(b *BasicBlock, x, y Value) *BinOp {
 	spmdAddReferrer(x, op)
 	spmdAddReferrer(y, op)
 	return op
+}
+
+// spmdInsertMaskOr inserts a BinOp(OR, x, y) of Varying[mask] type before
+// the last instruction of block b. Returns the BinOp value.
+func spmdInsertMaskOr(b *BasicBlock, x, y Value) *BinOp {
+	op := &BinOp{Op: token.OR, X: x, Y: y}
+	op.setType(spmdpkg.NewVaryingMask())
+	spmdInsertBeforeTerminator(b, op)
+	spmdAddReferrer(x, op)
+	spmdAddReferrer(y, op)
+	return op
+}
+
+// predicateBooleanChain linearizes a varying SPMDBooleanChain (&&/||) into a
+// linear sequence of blocks that computes a combined condition mask, then
+// applies standard predication (mask-gated memory ops, SPMDSelect at merge).
+//
+// For `if a && b { then } else { else_ }`:
+//
+//	B0: compute a; If a → B1 else ElseBlock  (LAND: false exits early)
+//	B1: compute b; If b → ThenBlock else ElseBlock
+//
+// Transforms to:
+//
+//	B0: maskA=convert(a); combined=maskA; Jump B1
+//	B1: maskB=convert(b); combined=AND(combined,maskB); thenMask=AND(active,combined); Jump ThenBlock
+//	ThenBlock: [SPMDLoad/SPMDStore with thenMask] Jump ElseBlock
+//	ElseBlock: [SPMDLoad/SPMDStore with elseMask] Jump Merge
+//	Merge: SPMDSelect(thenMask, thenVal, elseVal)
+//
+// For `if a || b { then } else { else_ }`:
+//
+//	B0: compute a; If a → ThenBlock else B1  (LOR: true exits early)
+//	B1: compute b; If b → ThenBlock else ElseBlock
+//
+// Same transformation: B0 → B1 → ThenBlock, combined=OR(maskA, maskB).
+func predicateBooleanChain(fn *Function, loop *SPMDLoopInfo, chain *SPMDBooleanChain) {
+	if len(chain.Blocks) < 2 {
+		return
+	}
+
+	lanes := loop.LaneCount
+	thenBlock := chain.ThenBlock
+	elseBlock := chain.ElseBlock
+
+	// Step 0: Find the merge block and snapshot Phi edges BEFORE any CFG
+	// rewiring. spmdReplaceIfWithJump calls removePred which compacts
+	// Phi.Edges, losing the "else" values needed for SPMDSelect.
+	mergeBlock := findMergeBlock(thenBlock, elseBlock)
+
+	// Snapshot Phi edge values at the merge block. For if-without-else
+	// (elseBlock == mergeBlock), chain blocks are predecessors of mergeBlock
+	// and will be removed during linearization.
+	var phiSnapshots []spmdPhiSnapshot
+	if mergeBlock != nil {
+		for _, instr := range mergeBlock.Instrs {
+			phi, ok := instr.(*Phi)
+			if !ok {
+				break
+			}
+			edges := make(map[*BasicBlock]Value)
+			for j, pred := range mergeBlock.Preds {
+				edges[pred] = phi.Edges[j]
+			}
+			phiSnapshots = append(phiSnapshots, spmdPhiSnapshot{phi: phi, edgeVal: edges})
+		}
+	}
+
+	// Step 1: For each chain block, convert its condition to a mask and
+	// accumulate the combined mask. Insert all operations before the block's
+	// If terminator. Because each chain block dominates the next (they form
+	// a linear path), combined values flow naturally across blocks via SSA.
+	var combinedMask Value
+	for i, block := range chain.Blocks {
+		vif := block.Instrs[len(block.Instrs)-1].(*If)
+		maskCond := spmdInsertConvertToMask(block, vif.Cond)
+
+		if i == 0 {
+			combinedMask = maskCond
+		} else if chain.Op == token.LAND {
+			combinedMask = spmdInsertMaskAnd(block, combinedMask, maskCond)
+		} else { // LOR
+			combinedMask = spmdInsertMaskOr(block, combinedMask, maskCond)
+		}
+
+		// Step 2: Replace each chain block's If with a Jump to either the
+		// next chain block or ThenBlock (for the last block). Remove the
+		// short-circuit edge that bypasses the remaining conditions.
+		var jumpTo, removeTo *BasicBlock
+		if i < len(chain.Blocks)-1 {
+			nextBlock := chain.Blocks[i+1]
+			// For LAND: Succs[0]=nextBlock(keep), Succs[1]=ElseBlock(remove)
+			// For LOR:  Succs[0]=ThenBlock(remove), Succs[1]=nextBlock(keep)
+			if chain.Op == token.LAND {
+				jumpTo = nextBlock
+				removeTo = elseBlock
+			} else {
+				jumpTo = nextBlock
+				removeTo = thenBlock
+			}
+		} else {
+			// Last block always jumps to ThenBlock.
+			jumpTo = thenBlock
+			removeTo = elseBlock
+		}
+		spmdReplaceIfWithJump(block, jumpTo, removeTo)
+	}
+
+	// combinedMask is now the final combined condition, computed in the last
+	// chain block which dominates ThenBlock.
+	lastBlock := chain.Blocks[len(chain.Blocks)-1]
+
+	if mergeBlock == nil {
+		// Complex CFG: cannot safely predicate. Mask memory ops in then/else
+		// with the combined mask even without SPMDSelect (best-effort).
+		activeMask := spmdAllOnesMask()
+		thenMask := spmdInsertMaskAnd(lastBlock, activeMask, combinedMask)
+		spmdMaskMemOps(thenBlock, thenMask, lanes)
+		return
+	}
+
+	// Step 3: Apply predication using the combined mask.
+	activeMask := spmdAllOnesMask()
+	thenMask := spmdInsertMaskAnd(lastBlock, activeMask, combinedMask)
+
+	ifWithoutElse := elseBlock == mergeBlock
+	var elseMask Value
+	if !ifWithoutElse {
+		elseMask = spmdInsertMaskAndNot(lastBlock, activeMask, combinedMask)
+	}
+
+	if ifWithoutElse {
+		// if-without-else: chain → ThenBlock → ElseBlock (=merge).
+		// Use snapshotted Phi edges to find the "else" (original) value.
+		// The first chain block was the original predecessor that provided
+		// the fall-through value to the merge.
+		firstBlock := chain.Blocks[0]
+		spmdReplaceBooleanChainPhis(mergeBlock, thenBlock, firstBlock, thenMask, lanes, phiSnapshots)
+		spmdMaskMemOps(thenBlock, thenMask, lanes)
+	} else {
+		// if-else: chain → ThenBlock → ElseBlock → Merge.
+		// Rewire ThenBlock's successor from Merge to ElseBlock.
+		spmdRewireThenToElse(thenBlock, mergeBlock, elseBlock)
+		spmdReplacePhisWithSelect(mergeBlock, thenBlock, elseBlock, thenMask, elseMask, lanes)
+		spmdMaskMemOps(thenBlock, thenMask, lanes)
+		spmdMaskMemOps(elseBlock, elseMask, lanes)
+	}
+}
+
+// spmdReplaceBooleanChainPhis replaces Phis at mergeBlock using snapshotted
+// edge values. Used for if-without-else boolean chains where chain blocks
+// have been removed from mergeBlock.Preds before Phi replacement.
+//
+// thenPred is the then-block whose edge provides the "then" value.
+// elsePred is a chain block whose snapshotted edge provides the "else" value.
+func spmdReplaceBooleanChainPhis(mergeBlock, thenPred, elsePred *BasicBlock, thenMask Value, lanes int, snapshots []spmdPhiSnapshot) {
+	for i, snap := range snapshots {
+		thenVal, hasThen := snap.edgeVal[thenPred]
+		elseVal, hasElse := snap.edgeVal[elsePred]
+		if !hasThen || !hasElse {
+			continue // defensive: Phi not driven by expected predecessors
+		}
+
+		sel := &SPMDSelect{
+			Mask:  thenMask,
+			X:     thenVal,
+			Y:     elseVal,
+			Lanes: lanes,
+		}
+		sel.setType(snap.phi.Type())
+		sel.setBlock(mergeBlock)
+
+		spmdAddReferrer(thenMask, sel)
+		spmdAddReferrer(thenVal, sel)
+		spmdAddReferrer(elseVal, sel)
+
+		mergeBlock.Instrs[i] = sel
+		replaceAll(snap.phi, sel)
+
+		// Clean up old Phi referrers using the snapshotted edges
+		// (the live Phi.Edges may have been compacted by removePred).
+		for _, edge := range snap.edgeVal {
+			if edge != nil {
+				if refs := edge.Referrers(); refs != nil {
+					*refs = removeInstr(*refs, snap.phi)
+				}
+			}
+		}
+		snap.phi.block = nil
+	}
 }
 
 // spmdInsertBeforeTerminator inserts instr into block b just before the
