@@ -776,6 +776,14 @@ func WriteFunction(buf *bytes.Buffer, f *Function) {
 			fmt.Fprintf(buf, " incr=%s", info.IncrBinOp.Name())
 		}
 		fmt.Fprintf(buf, " accumulators=%d", len(info.Accumulators))
+		if info.IsPeeled {
+			fmt.Fprintf(buf, " Peeled(Main=%s Tail=%s TailCheck=%s",
+				info.MainBodyBlock.Comment, info.TailBodyBlock.Comment, info.TailCheckBlock.Comment)
+			if info.TrampolineBlock != nil {
+				fmt.Fprintf(buf, " Tramp=%s", info.TrampolineBlock.Comment)
+			}
+			buf.WriteString(")")
+		}
 		fmt.Fprintln(buf)
 	}
 

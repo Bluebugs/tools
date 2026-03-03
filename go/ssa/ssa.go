@@ -412,6 +412,15 @@ type SPMDLoopInfo struct {
 	// Accumulators: loop-carried values other than the iterator (resolved after lift)
 	Accumulators []SPMDAccumulator
 
+	// Peeling (populated by peelSPMDLoop after predicateSPMD)
+	IsPeeled        bool        // true after successful peeling
+	MainBodyBlock   *BasicBlock // main loop body (full-width, all-ones mask)
+	TailCheckBlock  *BasicBlock // tail iteration check block
+	TailBodyBlock   *BasicBlock // tail loop body (masked, at most once)
+	TrampolineBlock *BasicBlock // accumulator merge block before DoneBlock (nil if no accumulators)
+	AlignedBound    Value       // bound & ~(laneCount-1)
+	TailIterPhi     *Phi        // iter phi in TailCheckBlock
+
 	// iterAlloc is the Alloc for the loop iterator, saved during construction
 	// for post-lift phi resolution. Cleared after resolution.
 	iterAlloc *Alloc

@@ -353,6 +353,25 @@ func main() {
 	}
 }
 
+func TestSPMDLoopPeelFieldsDefault(t *testing.T) {
+	info := &ssa.SPMDLoopInfo{}
+	if info.IsPeeled {
+		t.Error("IsPeeled should default to false")
+	}
+	if info.MainBodyBlock != nil || info.TailCheckBlock != nil || info.TailBodyBlock != nil {
+		t.Error("peeling blocks should default to nil")
+	}
+	if info.TrampolineBlock != nil {
+		t.Error("TrampolineBlock should default to nil")
+	}
+	if info.AlignedBound != nil {
+		t.Error("AlignedBound should default to nil")
+	}
+	if info.TailIterPhi != nil {
+		t.Error("TailIterPhi should default to nil")
+	}
+}
+
 func TestSPMDLoopInfo_MultipleAccumulators(t *testing.T) {
 	src := `package main
 
