@@ -1033,6 +1033,71 @@ func main() {
 	}
 }
 
+// TestPredicateSPMD_LoopBackNotLinearized verifies that a varying if/else
+// whose both branches jump back to the loop header is NOT linearized by
+// predicateSPMD. In this pattern the "merge block" is the loop header, which
+// has extra predecessors (the loop entry) and loop-carried Phis — not if/else
+// merge Phis. Replacing those Phis with SPMDSelect would violate SSA dominance
+// (the mask is computed inside the loop body but referenced in the loop header,
+// which precedes the body in DomPreorder). findMergeBlock now rejects such
+// merge blocks by requiring exactly two predecessors.
+func TestPredicateSPMD_LoopBackNotLinearized(t *testing.T) {
+	// This pattern models a rangeindex loop (range over slice) where the
+	// if/else branches both jump back to the loop header. The loop header
+	// must NOT have its iterator Phi replaced by SPMDSelect.
+	src := `package main
+
+func encode(dst, src []byte) {
+	for i := range dst {
+		if i%2 == 0 {
+			dst[i] = src[i>>1] >> 4
+		} else {
+			dst[i] = src[i>>1] & 0x0f
+		}
+	}
+}
+
+func main() { encode(make([]byte, 4), make([]byte, 2)) }
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setSPMDOnRange(f)
+
+	// SanityCheckFunctions panics if dominance is violated.
+	_, _, err = ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{f},
+		ssa.SanityCheckFunctions,
+	)
+	if err != nil {
+		t.Fatalf("BuildPackage failed: %v", err)
+	}
+
+	// Build to inspect the generated SSA.
+	pkg := buildSSAWithSPMD(t, src)
+	encodeFn := pkg.Func("encode")
+	if encodeFn == nil {
+		t.Fatal("encode function not found")
+	}
+
+	// The loop header must still be reachable and have its iterator phi.
+	// It must NOT have any SPMDSelect instructions (because the if/else merge
+	// is the loop header with extra predecessors — not a true diamond merge).
+	for _, block := range encodeFn.Blocks {
+		if block.Comment != "rangeindex.loop" {
+			continue
+		}
+		for _, instr := range block.Instrs {
+			if _, ok := instr.(*ssa.SPMDSelect); ok {
+				t.Errorf("rangeindex.loop has SPMDSelect: loop-back if/else was incorrectly linearized")
+			}
+		}
+	}
+}
+
 // TestPredicateSPMD_WriteFunction verifies WriteFunction does not panic on a
 // function after predicateSPMD runs. Mask computation instructions (from
 // linearizing a varying if) must appear in the output.

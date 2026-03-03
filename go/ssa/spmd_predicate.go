@@ -205,17 +205,34 @@ func predicateVaryingIf(fn *Function, loop *SPMDLoopInfo, ifBlock *BasicBlock, v
 //
 // Only two structural patterns are recognised:
 //  1. Simple diamond: thenBlock and elseBlock each have exactly one successor
-//     and they are the same block.
+//     and they are the same block, AND that block has only those two as
+//     predecessors (so it is a true merge, not a loop header).
 //  2. If-without-else: thenBlock has exactly one successor which is elseBlock
 //     (i.e., the "else" is a fall-through and elseBlock IS the merge).
 //
-// Any more complex pattern (compound boolean, multi-block chains) returns nil
-// and the varying If will be skipped by the caller to avoid incorrect CFG rewiring.
+// Any more complex pattern (compound boolean, multi-block chains, or a merge
+// block that is also a loop header with extra predecessors) returns nil
+// and the varying If will be skipped by the caller to avoid incorrect CFG
+// rewiring. In particular, if both then/else jump back to a loop header, the
+// merge block would be the loop header — which has additional predecessors
+// (e.g., the loop entry) and whose Phis are loop-carried values, not if-else
+// merge values. Replacing those Phis with SPMDSelect would be incorrect
+// because the mask is defined inside the loop body (domination violation).
 func findMergeBlock(thenBlock, elseBlock *BasicBlock) *BasicBlock {
 	// Simple diamond: both branches have a single common successor.
 	if len(thenBlock.Succs) == 1 && len(elseBlock.Succs) == 1 {
-		if thenBlock.Succs[0] == elseBlock.Succs[0] {
-			return thenBlock.Succs[0]
+		merge := thenBlock.Succs[0]
+		if merge == elseBlock.Succs[0] {
+			// Guard: the merge block must have exactly two predecessors
+			// (thenBlock and elseBlock). If it has more (e.g., a loop header
+			// also reachable from the loop entry), it is not a safe merge
+			// point for SPMDSelect because loop-carried Phis would be
+			// incorrectly replaced, and the mask (computed in the loop body)
+			// would not dominate uses in the loop header.
+			if len(merge.Preds) != 2 {
+				return nil
+			}
+			return merge
 		}
 	}
 
