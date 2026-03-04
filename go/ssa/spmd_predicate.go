@@ -70,11 +70,15 @@ func predicateSPMD(fn *Function) {
 
 // predicateSPMDLoop transforms varying control flow within a single SPMD loop.
 func predicateSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
-	// Build the set of blocks that are in this loop's scope (body + loop).
-	// A block is "in scope" if it is reachable from the body block and
-	// dominated by the body block (i.e., it is between the loop entry and exit).
 	scopeBlocks := spmdLoopScopeBlocks(loop)
+	predicateSPMDScope(fn, scopeBlocks, loop.LaneCount, loop.LoopBlock, loop.BodyBlock)
+}
 
+// predicateSPMDScope linearizes varying control flow in scopeBlocks.
+// spmdLoopBlock and spmdBodyBlock identify the SPMD loop header blocks (used
+// by switch predication to avoid replacing loop-carried phis). Pass nil for
+// both when predicating a function body (no enclosing SPMD loop).
+func predicateSPMDScope(fn *Function, scopeBlocks map[*BasicBlock]bool, lanes int, spmdLoopBlock, spmdBodyBlock *BasicBlock) {
 	// Build a set of If instructions to exclude from the generic If predication
 	// pass. Both boolean-chain and switch-chain Ifs are excluded so the generic
 	// loop below does not linearize them independently. Switch-chain Ifs are
@@ -104,7 +108,7 @@ func predicateSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 		if _, ok := chain.Blocks[0].Instrs[len(chain.Blocks[0].Instrs)-1].(*If); !ok {
 			continue
 		}
-		predicateBooleanChain(fn, loop, chain)
+		predicateBooleanChain(fn, lanes, chain)
 	}
 
 	// Find all varying If instructions in scope and linearize them.
@@ -123,7 +127,7 @@ func predicateSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 			continue // skip boolean-chain and switch-chain Ifs
 		}
 		// linearize this varying If.
-		predicateVaryingIf(fn, loop, block, vif)
+		predicateVaryingIf(fn, lanes, block, vif)
 	}
 
 	// Linearize each varying switch chain whose DoneBlock is in scope.
@@ -142,7 +146,7 @@ func predicateSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 		if !scopeBlocks[firstBlock] {
 			continue
 		}
-		predicateVaryingSwitch(fn, loop, chain)
+		predicateVaryingSwitch(fn, lanes, chain, spmdLoopBlock, spmdBodyBlock)
 	}
 }
 
@@ -570,6 +574,15 @@ func predicateVaryingBreaks(fn *Function, fl *spmdRegularForLoop, breaks []*spmd
 		// Linearize: replace the varying If with a Jump to elseBlock.
 		spmdReplaceIfWithJump(ifBlock, elseBlock, thenBlock)
 
+		// Relocate thenBlock's non-terminator instructions into ifBlock before
+		// killing thenBlock. SPMDSelect instructions inserted into ifBlock may
+		// reference values (e.g., ChangeType, Convert) that were computed in
+		// thenBlock. TinyGo's DomPreorder never visits dead blocks, so those
+		// values would be invisible and getValue() would fail. Moving them into
+		// ifBlock (which dominates thenBlock) ensures all operands remain
+		// reachable.
+		spmdRelocateToBlock(thenBlock, ifBlock)
+
 		// Detach thenBlock from doneBlock.
 		fl.doneBlock.removePred(thenBlock)
 		thenBlock.Succs = nil
@@ -780,8 +793,7 @@ func spmdLoopScopeBlocks(loop *SPMDLoopInfo) map[*BasicBlock]bool {
 //	T: ... [SPMDLoad/SPMDStore with then_mask] ... jump E
 //	E: ... [SPMDLoad/SPMDStore with else_mask] ... jump M
 //	M: SPMDSelect(then_mask, v1, v2) replaces phi [T: v1, E: v2] ...
-func predicateVaryingIf(fn *Function, loop *SPMDLoopInfo, ifBlock *BasicBlock, vif *If) {
-	lanes := loop.LaneCount
+func predicateVaryingIf(fn *Function, lanes int, ifBlock *BasicBlock, vif *If) {
 	thenBlock := ifBlock.Succs[0] // If.Cond true → Succs[0]
 	elseBlock := ifBlock.Succs[1] // If.Cond false → Succs[1]
 
@@ -957,12 +969,11 @@ func spmdInsertMaskOr(b *BasicBlock, x, y Value) *BinOp {
 //	B1: compute b; If b → ThenBlock else ElseBlock
 //
 // Same transformation: B0 → B1 → ThenBlock, combined=OR(maskA, maskB).
-func predicateBooleanChain(fn *Function, loop *SPMDLoopInfo, chain *SPMDBooleanChain) {
+func predicateBooleanChain(fn *Function, lanes int, chain *SPMDBooleanChain) {
 	if len(chain.Blocks) < 2 {
 		return
 	}
 
-	lanes := loop.LaneCount
 	thenBlock := chain.ThenBlock
 	elseBlock := chain.ElseBlock
 
@@ -1130,6 +1141,47 @@ func spmdInsertBeforeTerminator(b *BasicBlock, instr Instruction) {
 	b.Instrs[n-1] = instr        // insert instr before terminator
 }
 
+// spmdRelocateToBlock moves all non-terminator instructions from src into dst,
+// inserting them before dst's terminator. Each moved instruction's block pointer
+// is updated to dst via setBlock. src's instructions are left as-is; the caller
+// is responsible for subsequently clearing src.Instrs.
+//
+// This is used when src is being killed (made unreachable) but its instructions
+// are referenced by instructions in dst (e.g., SPMDSelect operands). Moving them
+// ensures DomPreorder traversal in TinyGo can find them via getValue().
+//
+// Precondition: src has at least one instruction (its terminator). dst has at
+// least one instruction (its terminator). ifBlock dominates thenBlock so all
+// operands of thenBlock's non-terminator instructions are available in ifBlock.
+func spmdRelocateToBlock(src, dst *BasicBlock) {
+	// Identify the slice of non-terminator instructions in src.
+	// The terminator is the last instruction; skip it.
+	n := len(src.Instrs)
+	if n <= 1 {
+		// src has only a terminator (or is empty); nothing to relocate.
+		return
+	}
+	nonTerms := src.Instrs[:n-1]
+
+	// Find insertion point in dst: just before dst's terminator (last instruction).
+	dstN := len(dst.Instrs)
+	if dstN == 0 {
+		panic("spmdRelocateToBlock: dst block has no instructions")
+	}
+
+	// Grow dst.Instrs to hold the relocated instructions.
+	dst.Instrs = append(dst.Instrs, make([]Instruction, len(nonTerms))...)
+	// Shift dst's terminator to the end to make room.
+	copy(dst.Instrs[dstN+len(nonTerms)-1:], dst.Instrs[dstN-1:dstN])
+	// Copy non-terminator instructions from src into the gap.
+	copy(dst.Instrs[dstN-1:], nonTerms)
+
+	// Update each relocated instruction's block pointer.
+	for _, instr := range nonTerms {
+		instr.setBlock(dst)
+	}
+}
+
 // spmdAddReferrer registers instr as a referrer of val, if val has a referrer list.
 // This is needed when inserting new instructions after buildReferrers has already run.
 func spmdAddReferrer(val Value, instr Instruction) {
@@ -1293,7 +1345,7 @@ type spmdSwitchCaseInfo struct {
 //	body1: ... [mem ops with mask1] Jump default/done
 //	default: ... [mem ops with defaultMask] Jump done  (if present)
 //	done: SPMDSelect(mask0, v0, SPMDSelect(mask1, v1, vDefault))
-func predicateVaryingSwitch(fn *Function, loop *SPMDLoopInfo, chain *SPMDSwitchChain) {
+func predicateVaryingSwitch(fn *Function, lanes int, chain *SPMDSwitchChain, spmdLoopBlock, spmdBodyBlock *BasicBlock) {
 	if len(chain.Cases) == 0 {
 		return
 	}
@@ -1301,7 +1353,6 @@ func predicateVaryingSwitch(fn *Function, loop *SPMDLoopInfo, chain *SPMDSwitchC
 		return
 	}
 
-	lanes := loop.LaneCount
 	doneBlock := chain.DoneBlock
 
 	// Phase 0: Snapshot Phi edge values at DoneBlock BEFORE any CFG rewiring.
@@ -1316,7 +1367,7 @@ func predicateVaryingSwitch(fn *Function, loop *SPMDLoopInfo, chain *SPMDSwitchC
 	// Skip snapshotting when doneBlock is a loop header: in that case all
 	// Phis are loop-carried (not switch-merge), and Phase 3 will be skipped.
 	type phiEdgeMap = map[*Phi]Value
-	doneIsLoopBlock := doneBlock == loop.LoopBlock || doneBlock == loop.BodyBlock
+	doneIsLoopBlock := doneBlock == spmdLoopBlock || doneBlock == spmdBodyBlock
 	var phiEdges map[*BasicBlock]phiEdgeMap
 	if !doneIsLoopBlock {
 		phiEdges = make(map[*BasicBlock]phiEdgeMap, len(doneBlock.Preds))
