@@ -531,6 +531,40 @@ func predicateVaryingBreaks(fn *Function, fl *spmdRegularForLoop, breaks []*spmd
 		resultPhis = append(resultPhis, info)
 	}
 
+	// Step B2: Create result accumulator phis at the loop header.
+	// These carry the accumulated break result across iterations so that each
+	// SPMDSelect merges new break values with the prior accumulated result,
+	// rather than always falling back to the static default (normVal).
+	//
+	// Without these phis, runningAccum[i] would start as normVal each iteration
+	// (because the SPMDSelect lives in ifBlock, not the loop header), causing
+	// break results from earlier iterations to be discarded.
+	//
+	//   loopBlock:
+	//       result_accum = phi [entry: normVal, back_edge: sel_result]
+	accums := make([]*Phi, len(resultPhis))
+	for i, rpi := range resultPhis {
+		if len(rpi.breakVal) == 0 {
+			continue
+		}
+		if rpi.normVal == nil {
+			// All doneBlock predecessors are break-blocks; no normal-exit value
+			// exists to seed the accumulator. Skip creating the phi.
+			continue
+		}
+		accumPhi := &Phi{Comment: "spmd.break.accum"}
+		accumPhi.setType(rpi.phi.Type())
+		accumPhi.Edges = make([]Value, len(loopBlock.Preds))
+		for j := range loopBlock.Preds {
+			// All edges start as normVal: entry edge is the real value; back-edge
+			// is a placeholder that will be replaced in Step E2 below.
+			accumPhi.Edges[j] = rpi.normVal
+			spmdAddReferrer(rpi.normVal, accumPhi)
+		}
+		spmdInsertPhiAtFront(loopBlock, accumPhi)
+		accums[i] = accumPhi
+	}
+
 	// Step D: For each varying break, insert mask computation and SPMDSelect,
 	// then linearize the If → Jump.
 	//
@@ -540,16 +574,28 @@ func predicateVaryingBreaks(fn *Function, fl *spmdRegularForLoop, breaks []*spmd
 	// the loop-exit edge carries the accumulated break result.
 	var lastBreakMask Value = breakMaskPhi
 	// runningAccum[i] is the accumulated break result for resultPhis[i].
-	// Starts as normVal; updated per break via SPMDSelect.
+	// Initialized from the accumulator phi (loop-carried) so that SPMDSelect
+	// merges with the prior iteration's result rather than the static default.
 	runningAccum := make([]Value, len(resultPhis))
 	for i, rpi := range resultPhis {
-		runningAccum[i] = rpi.normVal
+		if accums[i] != nil {
+			runningAccum[i] = accums[i] // loop-carried accumulator
+		} else {
+			runningAccum[i] = rpi.normVal
+		}
 	}
 
 	for _, vb := range breaks {
 		ifBlock := vb.ifBlock
 		thenBlock := vb.thenBlock
 		elseBlock := vb.elseBlock
+
+		// Relocate FIRST: move thenBlock's non-terminator instructions into
+		// ifBlock before inserting mask ops and SPMDSelect. This ensures values
+		// defined in thenBlock (e.g., ChangeType for break-value assignments)
+		// appear before the SPMDSelect that references them, maintaining the
+		// producer-before-consumer ordering that TinyGo requires.
+		spmdRelocateToBlock(thenBlock, ifBlock)
 
 		// Compute active mask: AND_NOT(all_ones, lastBreakMask)
 		activeMask := spmdInsertMaskAndNot(ifBlock, spmdAllOnesMask(), lastBreakMask)
@@ -587,16 +633,7 @@ func predicateVaryingBreaks(fn *Function, fl *spmdRegularForLoop, breaks []*spmd
 		// Linearize: replace the varying If with a Jump to elseBlock.
 		spmdReplaceIfWithJump(ifBlock, elseBlock, thenBlock)
 
-		// Relocate thenBlock's non-terminator instructions into ifBlock before
-		// killing thenBlock. SPMDSelect instructions inserted into ifBlock may
-		// reference values (e.g., ChangeType, Convert) that were computed in
-		// thenBlock. TinyGo's DomPreorder never visits dead blocks, so those
-		// values would be invisible and getValue() would fail. Moving them into
-		// ifBlock (which dominates thenBlock) ensures all operands remain
-		// reachable.
-		spmdRelocateToBlock(thenBlock, ifBlock)
-
-		// Detach thenBlock from doneBlock.
+		// Detach thenBlock from doneBlock (instrs already relocated above).
 		fl.doneBlock.removePred(thenBlock)
 		thenBlock.Succs = nil
 		thenBlock.Instrs = nil // mark as dead
@@ -614,6 +651,28 @@ func predicateVaryingBreaks(fn *Function, fl *spmdRegularForLoop, breaks []*spmd
 		}
 		breakMaskPhi.Edges[i] = lastBreakMask
 		spmdAddReferrer(lastBreakMask, breakMaskPhi)
+	}
+
+	// Step E2: Close result accumulator phi back-edges.
+	// Replace the placeholder normVal back-edge with the final SPMDSelect result
+	// (runningAccum[i]), which is the value that should be carried into the next
+	// loop iteration as the accumulated break result.
+	for i, acc := range accums {
+		if acc == nil {
+			continue
+		}
+		for j, pred := range loopBlock.Preds {
+			if pred == entryPred {
+				continue // keep the entry edge as normVal
+			}
+			// Remove the placeholder normVal referrer for the back-edge and
+			// install the real accumulated value (last SPMDSelect in loop body).
+			if refs := resultPhis[i].normVal.Referrers(); refs != nil {
+				*refs = spmdRemoveOneReferrer(*refs, acc)
+			}
+			acc.Edges[j] = runningAccum[i]
+			spmdAddReferrer(runningAccum[i], acc)
+		}
 	}
 
 	// Step F: Update doneBlock result phis to carry the accumulated break result.

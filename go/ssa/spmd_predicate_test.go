@@ -2182,6 +2182,129 @@ func main() {}
 	}
 }
 
+// TestPredicateSPMD_VaryingBreakAccumulator verifies that predicateVaryingBreaks
+// creates a result accumulator phi at the loop header so that SPMDSelect merges
+// new break values with the LOOP-CARRIED accumulated result rather than the
+// static default. Without this phi, each iteration's SPMDSelect would fall back
+// to normVal (the static default) and discard break results from prior iterations.
+//
+// Regression test for: L4b_varying_break returning 39 instead of 21.
+// The fix: an "spmd.break.accum" phi at the loop header carries the accumulated
+// break result across iterations.
+func TestPredicateSPMD_VaryingBreakAccumulator(t *testing.T) {
+	src := `package main
+import "lanes"
+func f(v lanes.Varying[int], n int) lanes.Varying[int] {
+	result := lanes.Varying[int](10)
+	for i := range n {
+		vi := lanes.Varying[int](i)
+		if v == vi {
+			result = vi
+			break
+		}
+	}
+	return result
+}
+func main() {}
+`
+	pkg := buildSPMDFuncBody(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	// Find the loop header block (rangeint.body for merged body+loop).
+	var loopBlock *ssa.BasicBlock
+	for _, block := range fn.Blocks {
+		if strings.Contains(block.Comment, "rangeint.body") {
+			loopBlock = block
+			break
+		}
+	}
+	if loopBlock == nil {
+		t.Fatal("rangeint.body (loop header) block not found")
+	}
+
+	// The loop header must contain an "spmd.break.accum" phi.
+	// This phi carries the accumulated break result across iterations, ensuring
+	// the SPMDSelect's Y operand is the prior accumulated result rather than
+	// the static default (normVal).
+	foundAccumPhi := false
+	for _, instr := range loopBlock.Instrs {
+		phi, ok := instr.(*ssa.Phi)
+		if !ok {
+			break // phis are always at the front; stop at first non-phi
+		}
+		if strings.Contains(phi.Comment, "spmd.break.accum") {
+			foundAccumPhi = true
+			break
+		}
+	}
+	if !foundAccumPhi {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Errorf("expected spmd.break.accum phi at loop header for cross-iteration accumulation, SSA:\n%s", buf.String())
+	}
+
+	// The SPMDSelect's Y operand must reference the accumulator phi, NOT the
+	// static default (normVal). Verify by checking that the SPMDSelect inside
+	// the loop body has a phi (not a Const) as its Y operand.
+	foundSPMDSelectWithPhiY := false
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			sel, ok := instr.(*ssa.SPMDSelect)
+			if !ok {
+				continue
+			}
+			if _, ok := sel.Y.(*ssa.Phi); ok {
+				foundSPMDSelectWithPhiY = true
+			}
+		}
+	}
+	if !foundSPMDSelectWithPhiY {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Errorf("expected SPMDSelect.Y to be accum phi (not static default), SSA:\n%s", buf.String())
+	}
+}
+
+// TestPredicateSPMD_VaryingBreakAccumulatorSanity verifies the SSA sanity
+// checker passes after predicateVaryingBreaks transforms a varying break that
+// includes result accumulator phis. Uses the same function source as
+// TestPredicateSPMD_VaryingBreakAccumulator.
+func TestPredicateSPMD_VaryingBreakAccumulatorSanity(t *testing.T) {
+	src := `package main
+import "lanes"
+func f(v lanes.Varying[int], n int) lanes.Varying[int] {
+	result := lanes.Varying[int](10)
+	for i := range n {
+		vi := lanes.Varying[int](i)
+		if v == vi {
+			result = vi
+			break
+		}
+	}
+	return result
+}
+func main() {}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// SanityCheckFunctions panics if the transformed SSA has invalid def/use.
+	_, _, err = ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{f},
+		ssa.SanityCheckFunctions,
+	)
+	if err != nil {
+		t.Fatalf("BuildPackage with SanityCheckFunctions failed: %v", err)
+	}
+}
+
 // TestPredicateSPMD_VaryingBreakNoLoop verifies that an SPMD function body
 // without a for-loop is not affected by predicateSPMDFuncBody.
 func TestPredicateSPMD_VaryingBreakNoLoop(t *testing.T) {
