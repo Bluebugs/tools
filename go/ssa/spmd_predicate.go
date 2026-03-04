@@ -33,6 +33,27 @@ type spmdPhiSnapshot struct {
 	edgeVal map[*BasicBlock]Value // predecessor → edge value
 }
 
+// spmdDeferredMerge captures a varying-if where both branches merge at a loop
+// header. The If is linearized (replaced with Jump, mem ops masked) but the
+// loop-header phis are NOT converted to SPMDSelect during predicateVaryingIf
+// because the merge block has >2 predecessors. Instead, this info is collected
+// and processed after all varying-Ifs in the scope are linearized.
+//
+// After CFG rewiring (spmdReplaceIfWithJump + spmdRewireThenToElse), the
+// thenBlock no longer jumps to the loop header — it jumps to elseBlock instead.
+// The loopHeader retains elseBlock as a predecessor but loses thenBlock.
+// The phi edge values from thenBlock are snapshotted in phiSnaps before rewiring
+// so they can be used to build SPMDSelect instructions later.
+type spmdDeferredMerge struct {
+	thenBlock  *BasicBlock
+	elseBlock  *BasicBlock
+	mergeBlock *BasicBlock // the loop header
+	thenMask   Value
+	elseMask   Value
+	lanes      int
+	phiSnaps   []spmdPhiSnapshot
+}
+
 // hasSPMDParams reports whether any parameter of fn has *types.SPMDType.
 // Such functions are "SPMD function bodies" that process per-lane varying values.
 func hasSPMDParams(fn *Function) bool {
@@ -66,16 +87,120 @@ func predicateSPMD(fn *Function) {
 }
 
 // predicateSPMDLoop transforms varying control flow within a single SPMD loop.
+// It performs two passes over the loop body blocks:
+//
+//  1. predicateSPMDScope linearizes varying Ifs (if/else, switch, boolean chains)
+//     within the loop scope. For loop-header merge patterns — where both then and
+//     else branches jump to the loop header — the varying If is linearized (B→T→E)
+//     but phi conversion is deferred because the loop header has >2 predecessors.
+//
+//  2. spmdConvertDeferredMerges resolves the deferred loop-header phi→SPMDSelect
+//     conversions collected during pass 1.
+//
+// Straight-line mem op conversion (spmdConvertScopedMemOps) and SPMD call masking
+// (spmdMaskScopedCallOps) are NOT called here because this function runs BEFORE
+// peelSPMDLoops. Converting mem ops before peeling would leave orphaned referrers
+// in the original body block after deleteUnreachableBlocks removes it. Instead,
+// spmdConvertLoopOps (called from func.go after peeling and cleanup) handles those
+// passes on the live peeled blocks.
 func predicateSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	scopeBlocks := spmdLoopScopeBlocks(loop)
-	predicateSPMDScope(fn, scopeBlocks, loop.LaneCount, loop.LoopBlock, loop.BodyBlock, spmdAllOnesMask())
+	activeMask := spmdAllOnesMask()
+
+	// Pass 1: linearize varying control flow; collect deferred loop-header merges.
+	var deferred []*spmdDeferredMerge
+	predicateSPMDScope(fn, scopeBlocks, loop.LaneCount, loop.LoopBlock, loop.BodyBlock, activeMask, &deferred)
+
+	// Pass 2: convert deferred loop-header phi→SPMDSelect.
+	spmdConvertDeferredMerges(fn, deferred)
+}
+
+// spmdConvertLoopOps converts straight-line mem ops and masks SPMD function calls
+// in all live SPMD loop scope blocks. Called after peelSPMDLoops and
+// deleteUnreachableBlocks so that peeled blocks (spmd.main.body, spmd.tail.body)
+// are live, and the original (pre-peeling) body blocks that were converted and
+// then made unreachable by peeling have been removed.
+//
+// For each SPMDLoopInfo, the scope blocks are recomputed from the current live
+// function blocks (post-peeling) by BFS from the loop/body blocks. Because
+// deleteUnreachableBlocks has already run, any unreachable cloned blocks are gone.
+// The BFS correctly enumerates only live scope blocks.
+func spmdConvertLoopOps(fn *Function) {
+	if len(fn.SPMDLoops) == 0 {
+		return
+	}
+	activeMask := spmdAllOnesMask()
+	for _, loop := range fn.SPMDLoops {
+		// Recompute scope blocks post-peeling: BFS over live blocks.
+		// spmdLoopScopeBlocks uses loop.BodyBlock and loop.LoopBlock as roots;
+		// after peeling, these may be the original blocks (now unreachable and
+		// deleted) OR the peeled mainBody (if the loop was MergedBodyLoop and got
+		// peeled). In either case, the BFS stops at loop.DoneBlock so only
+		// in-loop blocks are visited.
+		//
+		// For non-peeled loops (rangeindex, multi-block, unsupported), the
+		// original scope blocks are still live and the BFS is correct as-is.
+		//
+		// For peeled rangeint loops, loop.BodyBlock may now be unreachable (the
+		// original merged body+loop block was cloned into mainBody and tailBody).
+		// We detect this and fall back to scanning all live blocks that are
+		// inside an SPMD loop scope by checking for the "spmd." comment prefix.
+		scopeBlocks := spmdLoopScopeBlocks(loop)
+		// Intersect with live blocks (fn.Blocks after deleteUnreachableBlocks).
+		liveSet := make(map[*BasicBlock]bool, len(fn.Blocks))
+		for _, b := range fn.Blocks {
+			liveSet[b] = true
+		}
+		liveScopeBlocks := make(map[*BasicBlock]bool)
+		for b := range scopeBlocks {
+			if liveSet[b] {
+				liveScopeBlocks[b] = true
+			}
+		}
+		// If BFS yielded no live scope blocks (peeled loop with original body
+		// removed), fall back to BFS from EntryBlock through peeled blocks
+		// (spmd.main.*, spmd.tail.*) bounded by DoneBlock. This correctly
+		// scopes the search to blocks belonging to THIS loop, avoiding
+		// cross-contamination in multi-loop functions.
+		if len(liveScopeBlocks) == 0 && loop.EntryBlock != nil {
+			queue := []*BasicBlock{loop.EntryBlock}
+			visited := map[*BasicBlock]bool{loop.EntryBlock: true}
+			for len(queue) > 0 {
+				b := queue[0]
+				queue = queue[1:]
+				if b == loop.DoneBlock {
+					continue
+				}
+				if strings.HasPrefix(b.Comment, "spmd.main.") ||
+					strings.HasPrefix(b.Comment, "spmd.tail.") {
+					liveScopeBlocks[b] = true
+				}
+				for _, succ := range b.Succs {
+					if !visited[succ] {
+						visited[succ] = true
+						queue = append(queue, succ)
+					}
+				}
+			}
+		}
+		if len(liveScopeBlocks) == 0 {
+			continue
+		}
+		spmdConvertScopedMemOps(fn, liveScopeBlocks, activeMask, loop.LaneCount)
+		spmdMaskScopedCallOps(fn, liveScopeBlocks, activeMask)
+	}
 }
 
 // predicateSPMDScope linearizes varying control flow in scopeBlocks.
 // spmdLoopBlock and spmdBodyBlock identify the SPMD loop header blocks (used
 // by switch predication to avoid replacing loop-carried phis). Pass nil for
 // both when predicating a function body (no enclosing SPMD loop).
-func predicateSPMDScope(fn *Function, scopeBlocks map[*BasicBlock]bool, lanes int, spmdLoopBlock, spmdBodyBlock *BasicBlock, activeMask Value) {
+//
+// deferred, when non-nil, collects loop-header merge patterns encountered during
+// the varying-If pass. These are handled by the caller after this function returns
+// via spmdConvertDeferredMerges. Pass nil when predicating a function body (no
+// deferred merges needed because the trampoline approach is used instead).
+func predicateSPMDScope(fn *Function, scopeBlocks map[*BasicBlock]bool, lanes int, spmdLoopBlock, spmdBodyBlock *BasicBlock, activeMask Value, deferred *[]*spmdDeferredMerge) {
 	// Build a set of If instructions to exclude from the generic If predication
 	// pass. Both boolean-chain and switch-chain Ifs are excluded so the generic
 	// loop below does not linearize them independently. Switch-chain Ifs are
@@ -113,12 +238,12 @@ func predicateSPMDScope(fn *Function, scopeBlocks map[*BasicBlock]bool, lanes in
 	// non-nested varying Ifs. For nested mask threading (Phase 8),
 	// dominator-tree order will be needed.
 	//
-	// Loop-header merge trampolines (spmdInsertMergeTrampoline) are only
-	// inserted in SPMD function body context (spmdLoopBlock == nil), not
-	// in go-for SPMD loop context (spmdLoopBlock != nil). In go-for loops,
-	// TinyGo's own mask transitions (pushThen/swapElse/pop) handle this
-	// pattern. Applying SSA-level predication would conflict with TinyGo's
-	// byte-widening codegen for WASM targets.
+	// In SPMD function body context (spmdLoopBlock == nil), loop-header merges
+	// are handled by inserting a trampoline merge block (allowLoopHeaderMerge=true).
+	// In go-for loop context (spmdLoopBlock != nil), trampolines are not inserted
+	// because they could break SSA-level loop peeling. Instead, loop-header merge
+	// patterns are linearized and deferred into the provided deferred slice for
+	// phi→SPMDSelect conversion after all Ifs in the scope are processed.
 	allowLoopHeaderMerge := spmdLoopBlock == nil
 	for _, block := range fn.Blocks {
 		if !scopeBlocks[block] {
@@ -132,7 +257,7 @@ func predicateSPMDScope(fn *Function, scopeBlocks map[*BasicBlock]bool, lanes in
 			continue // skip boolean-chain and switch-chain Ifs
 		}
 		// linearize this varying If.
-		predicateVaryingIf(fn, lanes, block, vif, allowLoopHeaderMerge, activeMask)
+		predicateVaryingIf(fn, lanes, block, vif, allowLoopHeaderMerge, activeMask, deferred)
 	}
 
 	// Linearize each varying switch chain whose DoneBlock is in scope.
@@ -208,7 +333,7 @@ func predicateSPMDFuncBody(fn *Function) {
 	for _, b := range fn.Blocks {
 		scope[b] = true
 	}
-	predicateSPMDScope(fn, scope, lanes, nil, nil, activeMask)
+	predicateSPMDScope(fn, scope, lanes, nil, nil, activeMask, nil)
 
 	// Step 2: Varying breaks in regular for-loops.
 	// Note: Step 1 does not consume break-case varying Ifs because
@@ -878,7 +1003,7 @@ func spmdLoopScopeBlocks(loop *SPMDLoopInfo) map[*BasicBlock]bool {
 
 // predicateVaryingIf linearizes a single varying If instruction.
 //
-// Pattern:
+// Standard pattern (simple diamond or if-without-else):
 //
 //	B: ... if cond goto T else E (IsVarying)
 //	T: ... [some values] ... jump M
@@ -891,7 +1016,13 @@ func spmdLoopScopeBlocks(loop *SPMDLoopInfo) map[*BasicBlock]bool {
 //	T: ... [SPMDLoad/SPMDStore with then_mask] ... jump E
 //	E: ... [SPMDLoad/SPMDStore with else_mask] ... jump M
 //	M: SPMDSelect(then_mask, v1, v2) replaces phi [T: v1, E: v2] ...
-func predicateVaryingIf(fn *Function, lanes int, ifBlock *BasicBlock, vif *If, allowLoopHeaderMerge bool, activeMask Value) {
+//
+// deferred, when non-nil (go-for loop context), receives loop-header merge
+// records when both then and else branches jump to the same loop header.
+// The If is linearized (B→T→E→loopHeader) and phi edge values are snapshotted,
+// but phi→SPMDSelect conversion is deferred to spmdConvertDeferredMerges so that
+// the loop header's pred list is fully stable before any SPMDSelect is inserted.
+func predicateVaryingIf(fn *Function, lanes int, ifBlock *BasicBlock, vif *If, allowLoopHeaderMerge bool, activeMask Value, deferred *[]*spmdDeferredMerge) {
 	thenBlock := ifBlock.Succs[0] // If.Cond true → Succs[0]
 	elseBlock := ifBlock.Succs[1] // If.Cond false → Succs[1]
 
@@ -901,14 +1032,23 @@ func predicateVaryingIf(fn *Function, lanes int, ifBlock *BasicBlock, vif *If, a
 	if mergeBlock == nil {
 		// Check for loop-header merge pattern: both branches converge
 		// to the same block but it has >2 predecessors (loop header).
-		// Insert a trampoline merge block to create a proper diamond.
-		// Only allowed in SPMD function body context, not go-for loops
-		// (where TinyGo's mask transitions handle this pattern).
 		if allowLoopHeaderMerge &&
 			len(thenBlock.Succs) == 1 && len(elseBlock.Succs) == 1 &&
 			thenBlock.Succs[0] == elseBlock.Succs[0] {
+			// SPMD function body context: insert a trampoline merge block to
+			// create a proper 2-predecessor diamond. This is safe here because
+			// there are no SSA-level loop peeling operations that could be broken.
 			loopHeader := thenBlock.Succs[0]
 			mergeBlock = spmdInsertMergeTrampoline(fn, thenBlock, elseBlock, loopHeader)
+		} else if !allowLoopHeaderMerge && deferred != nil &&
+			len(thenBlock.Succs) == 1 && len(elseBlock.Succs) == 1 &&
+			thenBlock.Succs[0] == elseBlock.Succs[0] {
+			// Go-for loop context: both branches jump to the loop header.
+			// We cannot insert a trampoline (would break peelSPMDLoop's structural
+			// expectations). Instead, linearize B→T→E→loopHeader and defer the
+			// phi→SPMDSelect conversion until after all varying Ifs are processed.
+			spmdLinearizeLoopHeaderMerge(fn, ifBlock, vif, thenBlock, elseBlock, activeMask, lanes, deferred)
+			return
 		}
 		if mergeBlock == nil {
 			return // genuinely complex pattern, skip
@@ -952,6 +1092,264 @@ func predicateVaryingIf(fn *Function, lanes int, ifBlock *BasicBlock, vif *If, a
 		// Replace loads/stores in both branches.
 		spmdMaskMemOps(thenBlock, thenMask, lanes)
 		spmdMaskMemOps(elseBlock, elseMask, lanes)
+	}
+}
+
+// spmdLinearizeLoopHeaderMerge handles the go-for loop case where both then and
+// else branches of a varying If jump to the same loop header. We cannot insert
+// a trampoline (that would break peelSPMDLoop's block-structure expectations),
+// so instead we:
+//  1. Snapshot phi edges at the loop header before any CFG modification.
+//  2. Compute then/else masks, insert them before the If terminator.
+//  3. Replace the If with a Jump to thenBlock (B→T).
+//  4. Rewire thenBlock→loopHeader to thenBlock→elseBlock (B→T→E→loopHeader).
+//  5. Mask memory ops in both branches.
+//  6. Record a spmdDeferredMerge for phi→SPMDSelect conversion after all
+//     varying Ifs in the scope have been processed.
+//
+// The phi→SPMDSelect conversion cannot happen here because the loop header may
+// gain or lose other predecessors as sibling varying Ifs are linearized in the
+// same scope pass.
+func spmdLinearizeLoopHeaderMerge(fn *Function, ifBlock *BasicBlock, vif *If, thenBlock, elseBlock *BasicBlock, activeMask Value, lanes int, deferred *[]*spmdDeferredMerge) {
+	loopHeader := thenBlock.Succs[0]
+
+	// Step 1: Snapshot phi edges at loopHeader BEFORE any CFG rewiring.
+	// After spmdRewireThenToElse, thenBlock is removed from loopHeader.Preds
+	// and the corresponding Phi edges are compacted away. We need those edge
+	// values to build the SPMDSelect instructions later.
+	var phiSnaps []spmdPhiSnapshot
+	for _, instr := range loopHeader.Instrs {
+		phi, ok := instr.(*Phi)
+		if !ok {
+			break // phis are always first
+		}
+		snap := spmdPhiSnapshot{phi: phi, edgeVal: make(map[*BasicBlock]Value, len(loopHeader.Preds))}
+		for j, pred := range loopHeader.Preds {
+			snap.edgeVal[pred] = phi.Edges[j]
+		}
+		phiSnaps = append(phiSnaps, snap)
+	}
+
+	// Step 2: Compute masks (insert before the If terminator in ifBlock).
+	maskCond := spmdInsertConvertToMask(ifBlock, vif.Cond)
+	thenMask := spmdInsertMaskAnd(ifBlock, activeMask, maskCond)
+	elseMask := spmdInsertMaskAndNot(ifBlock, activeMask, maskCond)
+
+	// Step 3: Replace the If with a Jump to thenBlock. Removes ifBlock→elseBlock edge.
+	spmdReplaceIfWithJump(ifBlock, thenBlock, elseBlock)
+
+	// Step 4: Rewire thenBlock→loopHeader to thenBlock→elseBlock.
+	// spmdRewireThenToElse updates thenBlock.Succs and adds thenBlock to
+	// elseBlock.Preds, but intentionally does NOT call loopHeader.removePred.
+	// (The normal non-deferred path relies on spmdReplacePhisWithSelect doing that.)
+	// Here we must explicitly remove thenBlock from loopHeader.Preds and compact
+	// the phi edges. The phi edge values were already snapshotted above.
+	spmdRewireThenToElse(thenBlock, loopHeader, elseBlock)
+	loopHeader.removePred(thenBlock)
+
+	// Step 5: Mask memory ops in both branches.
+	spmdMaskMemOps(thenBlock, thenMask, lanes)
+	spmdMaskMemOps(elseBlock, elseMask, lanes)
+
+	// Step 6: Record deferred merge for phi→SPMDSelect conversion.
+	*deferred = append(*deferred, &spmdDeferredMerge{
+		thenBlock:  thenBlock,
+		elseBlock:  elseBlock,
+		mergeBlock: loopHeader,
+		thenMask:   thenMask,
+		elseMask:   elseMask,
+		lanes:      lanes,
+		phiSnaps:   phiSnaps,
+	})
+}
+
+// spmdConvertDeferredMerges processes loop-header merge records collected during
+// predicateSPMDScope. For each record, it inserts an SPMDSelect in elseBlock for
+// every loop-header phi that had different values from thenBlock and elseBlock,
+// and redirects the phi's elseBlock edge to the SPMDSelect result.
+//
+// After spmdLinearizeLoopHeaderMerge ran:
+//   - loopHeader lost thenBlock as a predecessor (its phi edges were compacted).
+//   - elseBlock still flows to loopHeader, so values placed in elseBlock dominate
+//     loopHeader.
+//   - phiSnaps holds the original thenBlock and elseBlock edge values for each phi.
+//
+// For each phi at loopHeader with snapshotted then/else edge values:
+//   - If thenVal == elseVal: no select needed; the existing edge is already correct.
+//   - Otherwise: insert SPMDSelect(thenMask, thenVal, elseVal) in elseBlock just
+//     before its terminator, and update the phi's elseBlock edge to reference it.
+func spmdConvertDeferredMerges(fn *Function, deferred []*spmdDeferredMerge) {
+	for _, dm := range deferred {
+		for _, snap := range dm.phiSnaps {
+			thenVal, hasThen := snap.edgeVal[dm.thenBlock]
+			elseVal, hasElse := snap.edgeVal[dm.elseBlock]
+			if !hasThen || !hasElse {
+				// Phi was not driven by both branches; nothing to do.
+				continue
+			}
+			if thenVal == elseVal {
+				// Both branches carried the same value; no select needed.
+				continue
+			}
+
+			// Create SPMDSelect: select(thenMask, thenVal, elseVal).
+			// The result type matches the phi type.
+			sel := &SPMDSelect{
+				Mask:  dm.thenMask,
+				X:     thenVal,
+				Y:     elseVal,
+				Lanes: dm.lanes,
+			}
+			sel.setType(snap.phi.Type())
+
+			// Insert SPMDSelect in elseBlock just before its terminator.
+			// elseBlock still flows to loopHeader, so the select dominates the phi.
+			spmdInsertBeforeTerminator(dm.elseBlock, sel)
+			spmdAddReferrer(dm.thenMask, sel)
+			spmdAddReferrer(thenVal, sel)
+			spmdAddReferrer(elseVal, sel)
+
+			// Update the phi's elseBlock edge to reference the SPMDSelect result.
+			// The phi.Edges slice was compacted when thenBlock was removed, so we
+			// must find the current position of elseBlock in mergeBlock.Preds.
+			for j, pred := range dm.mergeBlock.Preds {
+				if pred == dm.elseBlock {
+					oldEdge := snap.phi.Edges[j]
+					if oldEdge != nil {
+						if refs := oldEdge.Referrers(); refs != nil {
+							*refs = spmdRemoveOneReferrer(*refs, snap.phi)
+						}
+					}
+					snap.phi.Edges[j] = sel
+					spmdAddReferrer(sel, snap.phi)
+					break
+				}
+			}
+		}
+	}
+}
+
+// spmdConvertScopedMemOps converts UnOp{MUL} (pointer loads) and Store
+// instructions in scopeBlocks to SPMDLoad/SPMDStore with the given active mask.
+// This is the scoped variant of spmdConvertAllMemOps for go-for loop bodies.
+//
+// Unlike spmdConvertAllMemOps (used for func bodies), this function includes
+// contiguity detection via spmdIsContiguousIndex: loads/stores whose address is
+// an IndexAddr with an iter-based index are marked Contiguous so TinyGo can emit
+// a single contiguous load/store instruction instead of a gather/scatter.
+//
+// Instructions already converted to SPMDLoad/SPMDStore (by spmdMaskMemOps inside
+// varying branches) are not present as UnOp/Store and are therefore skipped.
+func spmdConvertScopedMemOps(fn *Function, scopeBlocks map[*BasicBlock]bool, mask Value, lanes int) {
+	for _, block := range fn.Blocks {
+		if !scopeBlocks[block] {
+			continue
+		}
+		for i := 0; i < len(block.Instrs); i++ {
+			instr := block.Instrs[i]
+
+			switch instr := instr.(type) {
+			case *UnOp:
+				if instr.Op != token.MUL {
+					continue
+				}
+				// Only convert loads of SPMD-compatible element types.
+				if !spmdIsVectorizableElemType(instr.Type()) {
+					continue
+				}
+				load := &SPMDLoad{
+					Addr:  instr.X,
+					Mask:  mask,
+					Lanes: lanes,
+					pos:   instr.Pos(),
+				}
+				// Detect contiguous access: IndexAddr with iter-based index.
+				if indexAddr, ok := instr.X.(*IndexAddr); ok {
+					if spmdIsContiguousIndex(fn, indexAddr.Index) {
+						load.Contiguous = true
+						load.Source = indexAddr.X
+					}
+				}
+				load.setType(instr.Type())
+				load.setBlock(block)
+
+				spmdAddReferrer(instr.X, load)
+				spmdAddReferrer(mask, load)
+				if load.Source != nil {
+					spmdAddReferrer(load.Source, load)
+				}
+
+				block.Instrs[i] = load
+				replaceAll(instr, load)
+
+				if refs := instr.X.Referrers(); refs != nil {
+					*refs = removeInstr(*refs, instr)
+				}
+				instr.block = nil
+
+			case *Store:
+				// Only convert stores of SPMD-compatible element types.
+				if !spmdIsVectorizableElemType(instr.Val.Type()) {
+					continue
+				}
+				store := &SPMDStore{
+					Addr:  instr.Addr,
+					Val:   instr.Val,
+					Mask:  mask,
+					Lanes: lanes,
+					pos:   instr.Pos(),
+				}
+				// Detect contiguous access: IndexAddr with iter-based index.
+				if indexAddr, ok := instr.Addr.(*IndexAddr); ok {
+					if spmdIsContiguousIndex(fn, indexAddr.Index) {
+						store.Contiguous = true
+						store.Source = indexAddr.X
+					}
+				}
+				store.setBlock(block)
+
+				spmdAddReferrer(instr.Addr, store)
+				spmdAddReferrer(instr.Val, store)
+				spmdAddReferrer(mask, store)
+				if store.Source != nil {
+					spmdAddReferrer(store.Source, store)
+				}
+
+				block.Instrs[i] = store
+
+				if refs := instr.Addr.Referrers(); refs != nil {
+					*refs = removeInstr(*refs, instr)
+				}
+				if refs := instr.Val.Referrers(); refs != nil {
+					*refs = removeInstr(*refs, instr)
+				}
+				instr.block = nil
+			}
+		}
+	}
+}
+
+// spmdMaskScopedCallOps sweeps Call instructions in scopeBlocks and sets
+// SPMDMask = defaultMask for any SPMD function call that does not already have
+// a mask assigned (i.e., calls in straight-line code that were not inside a
+// varying if/else/switch, which already received narrowed masks via spmdMaskMemOps).
+func spmdMaskScopedCallOps(fn *Function, scopeBlocks map[*BasicBlock]bool, defaultMask Value) {
+	for _, block := range fn.Blocks {
+		if !scopeBlocks[block] {
+			continue
+		}
+		for _, instr := range block.Instrs {
+			call, ok := instr.(*Call)
+			if !ok || call.Call.SPMDMask != nil {
+				continue
+			}
+			callee := call.Call.StaticCallee()
+			if callee == nil || !hasSPMDParams(callee) {
+				continue
+			}
+			call.Call.SPMDMask = defaultMask
+			spmdAddReferrer(defaultMask, call)
+		}
 	}
 }
 

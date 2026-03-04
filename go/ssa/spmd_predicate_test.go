@@ -1312,8 +1312,10 @@ func main() {
 // go-for context the pattern is left for TinyGo's mask transitions.
 func TestPredicateSPMD_LoopBackNotLinearized(t *testing.T) {
 	// This pattern models a rangeindex loop (range over slice) where the
-	// if/else branches both jump back to the loop header. The loop header
-	// must NOT have its iterator Phi replaced by SPMDSelect.
+	// if/else branches both jump back to the loop header. The new deferred-merge
+	// path linearizes the varying If (B→T→E→loopHeader) and inserts SPMDSelect
+	// in the else block, but the loop header itself must NOT have its iterator
+	// Phi replaced by SPMDSelect.
 	src := `package main
 
 func encode(dst, src []byte) {
@@ -1352,33 +1354,37 @@ func main() { encode(make([]byte, 4), make([]byte, 2)) }
 		t.Fatal("encode function not found")
 	}
 
-	// The loop header must still be reachable and have its iterator phi.
-	// It must NOT have any SPMDSelect instructions (because the if/else merge
-	// is the loop header with extra predecessors — not a true diamond merge).
+	// The loop header must NOT have any SPMDSelect instructions. The deferred
+	// merge path places SPMDSelect in the else block (elseBlock→loopHeader), not
+	// in the loop header itself. Loop-carried phis at the loop header are updated
+	// to reference the SPMDSelect result via their elseBlock edge.
 	for _, block := range encodeFn.Blocks {
 		if block.Comment != "rangeindex.loop" {
 			continue
 		}
 		for _, instr := range block.Instrs {
 			if _, ok := instr.(*ssa.SPMDSelect); ok {
-				t.Errorf("rangeindex.loop has SPMDSelect: loop-back if/else was incorrectly linearized")
+				t.Errorf("rangeindex.loop has SPMDSelect — loop-carried phi was incorrectly replaced in the loop header")
 			}
 		}
 	}
 
-	// The varying If must still exist — it was NOT linearized in go-for context.
-	var foundVaryingIf bool
+	// After deferred-merge linearization, no varying If should survive.
 	for _, block := range encodeFn.Blocks {
 		if len(block.Instrs) == 0 {
 			continue
 		}
 		if vif, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok && vif.IsVarying {
-			foundVaryingIf = true
-			break
+			t.Errorf("block %d still has a varying If after deferred-merge linearization", block.Index)
 		}
 	}
-	if !foundVaryingIf {
-		t.Error("expected varying If to persist in go-for context (trampoline not applied)")
+
+	// Mask computation instructions must be present (the linearization ran).
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, encodeFn)
+	output := buf.String()
+	if !strings.Contains(output, "lanes.Varying[mask]") {
+		t.Errorf("expected mask computation instructions in output:\n%s", output)
 	}
 }
 
@@ -3019,10 +3025,10 @@ func main() {}
 	}
 }
 
-// TestPredicateSPMD_ConvertAllMemOps_NoEffectOnGoFor verifies that
-// spmdConvertAllMemOps is NOT called for go-for loop functions (it's only
-// called from predicateSPMDFuncBody, which only runs on func bodies).
-func TestPredicateSPMD_ConvertAllMemOps_NoEffectOnGoFor(t *testing.T) {
+// TestPredicateSPMD_ConvertAllMemOps_GoForConverted verifies that
+// spmdConvertScopedMemOps IS called for go-for loop bodies, converting
+// straight-line loads/stores to SPMDLoad/SPMDStore via predicateSPMDLoop.
+func TestPredicateSPMD_ConvertAllMemOps_GoForConverted(t *testing.T) {
 	src := `package main
 
 func f(arr []int) {
@@ -3034,7 +3040,7 @@ func f(arr []int) {
 func main() { f(make([]int, 16)) }
 `
 	// Build without SanityCheckFunctions to avoid a pre-existing referrer
-	// issue with loop peeling (not related to spmdConvertAllMemOps).
+	// issue with loop peeling (not related to spmdConvertScopedMemOps).
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "input.go", src, 0)
 	if err != nil {
@@ -3053,24 +3059,316 @@ func main() { f(make([]int, 16)) }
 		t.Fatal("function f not found")
 	}
 
-	// Go-for loop functions have SPMDLoops but no SPMD params, so
-	// predicateSPMDFuncBody is not called. Loads/stores in straight-line
-	// body code remain as regular UnOp/Store (they are handled by TinyGo's
-	// contiguous detection during compilation).
-	hasRegularMemOp := false
+	// Go-for loop bodies now have their straight-line loads/stores converted
+	// to SPMDLoad/SPMDStore by spmdConvertScopedMemOps (called from
+	// predicateSPMDLoop). No plain UnOp{MUL} or Store should remain in scope
+	// blocks after this pass.
+	//
+	// Note: blocks outside the loop scope (entry, done) retain regular mem ops.
+	// We check that at least one SPMDLoad and one SPMDStore exist in the function.
+	var foundSPMDLoad, foundSPMDStore bool
+	var foundPlainLoad, foundPlainStore bool
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
 			switch instr := instr.(type) {
+			case *ssa.SPMDLoad:
+				foundSPMDLoad = true
+			case *ssa.SPMDStore:
+				foundSPMDStore = true
 			case *ssa.UnOp:
 				if instr.Op == token.MUL {
-					hasRegularMemOp = true
+					// Check if this block is a scope block (body or loop).
+					// Entry and done blocks are outside scope and may retain
+					// plain loads (e.g., bounds checks).
+					if strings.Contains(block.Comment, "rangeint.body") ||
+						strings.Contains(block.Comment, "rangeint.loop") ||
+						strings.Contains(block.Comment, "rangeindex.body") ||
+						strings.Contains(block.Comment, "rangeindex.loop") {
+						foundPlainLoad = true
+					}
 				}
 			case *ssa.Store:
-				hasRegularMemOp = true
+				if strings.Contains(block.Comment, "rangeint.body") ||
+					strings.Contains(block.Comment, "rangeint.loop") ||
+					strings.Contains(block.Comment, "rangeindex.body") ||
+					strings.Contains(block.Comment, "rangeindex.loop") {
+					foundPlainStore = true
+				}
 			}
 		}
 	}
-	if !hasRegularMemOp {
-		t.Error("go-for loop function should retain regular UnOp/Store (not converted by spmdConvertAllMemOps)")
+
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+
+	if !foundSPMDLoad {
+		t.Errorf("expected at least one SPMDLoad in go-for loop body:\n%s", output)
+	}
+	if !foundSPMDStore {
+		t.Errorf("expected at least one SPMDStore in go-for loop body:\n%s", output)
+	}
+	if foundPlainLoad {
+		t.Errorf("plain UnOp{MUL} remains in go-for loop scope block:\n%s", output)
+	}
+	if foundPlainStore {
+		t.Errorf("plain Store remains in go-for loop scope block:\n%s", output)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Deferred loop-header merge tests (Task 1)
+
+// TestPredicateSPMD_GoForLoopHeaderMergeLinearized verifies that a varying
+// if/else inside a go-for loop where both branches jump back to the loop header
+// is linearized via the deferred-merge path.
+//
+// The varying If is replaced with a Jump (B→T→E→loopHeader) and mask
+// computation is inserted. The loop header's Phi must NOT be replaced with an
+// SPMDSelect at the loop header itself; any SPMDSelect for differing phi values
+// is placed in the else block (just before its jump to the loop header).
+//
+// Note: for the encode function, the rangeindex.loop phi carries the same value
+// (the incremented index) from both then and else branches, so no SPMDSelect
+// is emitted for that particular phi. The important checks are that the varying
+// If was linearized, the loop header has no SPMDSelect, and mask ops are present.
+func TestPredicateSPMD_GoForLoopHeaderMergeLinearized(t *testing.T) {
+	src := `package main
+
+func encode(dst, src []byte) {
+	for i := range dst {
+		if i%2 == 0 {
+			dst[i] = src[i>>1] >> 4
+		} else {
+			dst[i] = src[i>>1] & 0x0f
+		}
+	}
+}
+
+func main() { encode(make([]byte, 4), make([]byte, 2)) }
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setSPMDOnRange(f)
+
+	// SSA sanity check must pass after deferred-merge linearization.
+	_, _, err = ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{f},
+		ssa.SanityCheckFunctions,
+	)
+	if err != nil {
+		t.Fatalf("BuildPackage sanity check failed: %v", err)
+	}
+
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("encode")
+	if fn == nil {
+		t.Fatal("function encode not found")
+	}
+
+	// No varying If should survive predication.
+	for _, block := range fn.Blocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		if vif, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok && vif.IsVarying {
+			t.Errorf("block %d still has a varying If after deferred-merge linearization", block.Index)
+		}
+	}
+
+	// The loop header must NOT have SPMDSelect in it. Any SPMDSelect for phi
+	// values that differ between then/else is placed in the else block, not
+	// the loop header. Loop-carried index phis (that carry the same value from
+	// both branches) need no select and remain as plain Phi.
+	for _, block := range fn.Blocks {
+		if !strings.Contains(block.Comment, "rangeindex.loop") {
+			continue
+		}
+		for _, instr := range block.Instrs {
+			if _, ok := instr.(*ssa.SPMDSelect); ok {
+				t.Errorf("loop header block %q contains SPMDSelect — loop-carried phi replaced incorrectly", block.Comment)
+			}
+		}
+	}
+
+	// Mask computation must be present (linearization occurred).
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+	if !strings.Contains(output, "lanes.Varying[mask]") {
+		t.Errorf("expected mask computation instructions:\n%s", output)
+	}
+}
+
+// TestPredicateSPMD_GoForLoopHeaderMergeSanity verifies the SSA sanity checker
+// passes after deferred-merge linearization in go-for loop context.
+func TestPredicateSPMD_GoForLoopHeaderMergeSanity(t *testing.T) {
+	src := `package main
+
+func encode(dst, src []byte) {
+	for i := range dst {
+		if i%2 == 0 {
+			dst[i] = src[i>>1] >> 4
+		} else {
+			dst[i] = src[i>>1] & 0x0f
+		}
+	}
+}
+
+func main() { encode(make([]byte, 4), make([]byte, 2)) }
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setSPMDOnRange(f)
+
+	_, _, err = ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{f},
+		ssa.SanityCheckFunctions,
+	)
+	if err != nil {
+		t.Fatalf("SanityCheck failed: %v", err)
+	}
+}
+
+// TestPredicateSPMD_GoForLoopStraightLineMem verifies that straight-line
+// loads/stores in a go-for loop body (not inside a varying if) are converted
+// to SPMDLoad/SPMDStore by spmdConvertScopedMemOps.
+func TestPredicateSPMD_GoForLoopStraightLineMem(t *testing.T) {
+	src := `package main
+
+func f(arr []int) {
+	for i := range len(arr) {
+		// Straight-line load and store (no varying if around them).
+		arr[i] = arr[i] + 1
+	}
+}
+
+func main() { f(make([]int, 16)) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	var spmdLoads, spmdStores int
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			switch instr.(type) {
+			case *ssa.SPMDLoad:
+				spmdLoads++
+			case *ssa.SPMDStore:
+				spmdStores++
+			}
+		}
+	}
+
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+
+	if spmdLoads == 0 {
+		t.Errorf("expected SPMDLoad(s) in straight-line go-for loop:\n%s", output)
+	}
+	if spmdStores == 0 {
+		t.Errorf("expected SPMDStore(s) in straight-line go-for loop:\n%s", output)
+	}
+}
+
+// TestPredicateSPMD_GoForLoopCallMask verifies that SPMD function calls inside
+// a go-for loop body receive the active mask via spmdMaskScopedCallOps.
+func TestPredicateSPMD_GoForLoopCallMask(t *testing.T) {
+	src := `package main
+import "lanes"
+
+func helper(v lanes.Varying[int]) lanes.Varying[int] {
+	return v
+}
+
+func f(arr []int) {
+	for i := range len(arr) {
+		vi := lanes.Varying[int](arr[i])
+		result := helper(vi)
+		arr[i] = int(result)
+	}
+}
+
+func main() { f(make([]int, 16)) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	// Find the Call to helper and check that SPMDMask is set.
+	var helperCall *ssa.Call
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			call, ok := instr.(*ssa.Call)
+			if !ok {
+				continue
+			}
+			callee := call.Call.StaticCallee()
+			if callee != nil && callee.Name() == "helper" {
+				helperCall = call
+			}
+		}
+	}
+
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+
+	if helperCall == nil {
+		t.Fatalf("call to helper not found in:\n%s", output)
+	}
+	if helperCall.Call.SPMDMask == nil {
+		t.Errorf("expected SPMDMask on call to helper in go-for loop:\n%s", output)
+	}
+}
+
+// TestPredicateSPMD_GoForLoopCallMaskSanity verifies the SSA sanity checker
+// passes after spmdMaskScopedCallOps sets masks on SPMD calls in a go-for loop.
+func TestPredicateSPMD_GoForLoopCallMaskSanity(t *testing.T) {
+	src := `package main
+import "lanes"
+
+func helper(v lanes.Varying[int]) lanes.Varying[int] {
+	return v
+}
+
+func f(arr []int) {
+	for i := range len(arr) {
+		vi := lanes.Varying[int](arr[i])
+		result := helper(vi)
+		arr[i] = int(result)
+	}
+}
+
+func main() { f(make([]int, 16)) }
+`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setSPMDOnRange(file)
+
+	_, _, err = ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{file},
+		ssa.SanityCheckFunctions,
+	)
+	if err != nil {
+		t.Fatalf("SanityCheck failed: %v", err)
 	}
 }

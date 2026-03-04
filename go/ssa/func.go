@@ -414,6 +414,11 @@ func (f *Function) finishBody() {
 		// DomPreorder() reflects the final CFG.
 		deleteUnreachableBlocks(f)
 		buildDomTree(f)
+		// Convert straight-line loads/stores in SPMD loop bodies to
+		// SPMDLoad/SPMDStore, and set masks on SPMD function calls.
+		// Runs after peeling and cleanup so peeled blocks (spmd.main.body,
+		// spmd.tail.body) are live and original unreachable blocks are gone.
+		spmdConvertLoopOps(f)
 	}
 	if len(f.SPMDLoops) == 0 && hasSPMDParams(f) {
 		// Create the implicit mask parameter for this SPMD function body.

@@ -31,6 +31,13 @@ func markReachable(b *BasicBlock) {
 
 // deleteUnreachableBlocks marks all reachable blocks of f and
 // eliminates (nils) all others, including possibly cyclic subgraphs.
+//
+// Before deleting each unreachable block, all instructions in that block are
+// dropped from their operands' Referrers lists. This prevents stale referrer
+// entries for values (e.g., function parameters) that are still live in
+// reachable blocks. Stale referrers would otherwise cause sanity check
+// failures when the SSA pipeline creates new instructions after
+// buildReferrers has already run (e.g., during SPMD loop peeling).
 func deleteUnreachableBlocks(f *Function) {
 	const white, black = 0, -1
 	// We borrow b.Index temporarily as the mark bit.
@@ -41,11 +48,27 @@ func deleteUnreachableBlocks(f *Function) {
 	if f.Recover != nil {
 		markReachable(f.Recover)
 	}
+	var rands []*Value
 	for i, b := range f.Blocks {
 		if b.Index == white {
 			for _, c := range b.Succs {
 				if c.Index == black {
 					c.removePred(b) // delete white->black edge
+				}
+			}
+			// Remove this block's instructions from their operands'
+			// Referrers lists so that live values (e.g., parameters,
+			// constants, instructions from reachable blocks) do not
+			// retain stale back-references to instructions in this
+			// deleted block.
+			for _, instr := range b.Instrs {
+				rands = instr.Operands(rands[:0])
+				for _, rand := range rands {
+					if r := *rand; r != nil {
+						if refs := r.Referrers(); refs != nil {
+							*refs = removeInstr(*refs, instr)
+						}
+					}
 				}
 			}
 			if debugBlockOpt {
