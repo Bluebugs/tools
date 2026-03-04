@@ -362,6 +362,23 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	body.removePred(entry)
 	done.removePred(entry)
 
+	// Also remove body → done edge. The body block becomes unreachable after
+	// peeling (no predecessor reaches it), but its If terminator still has
+	// done as a successor. Removing body from done's predecessors here prevents
+	// phi/pred count mismatches when new blocks (trampoline) are connected to
+	// done later. Save each done-phi's body-edge value so we can wire the
+	// correct values when adding the replacement predecessor.
+	donePhiBodyEdges := map[*Phi]Value{}
+	for _, instr := range done.phis() {
+		phi := instr.(*Phi)
+		for j, pred := range done.Preds {
+			if pred == body {
+				donePhiBodyEdges[phi] = phi.Edges[j]
+			}
+		}
+	}
+	done.removePred(body)
+
 	// Append alignedBound = typedBound & ^(laneCount-1) into entry.
 	alignedBound := &BinOp{Op: token.AND}
 	alignedBound.X = typedBound
@@ -555,6 +572,11 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	// trampoline.Preds = [tailCheck, tailBody] in the order addEdge was called,
 	// so mergePhi.Edges = [tailAccPhi, tailAccResult] matches that order.
 	if trampoline != nil {
+		// Build a map from original accumulator values → merge phi so we can
+		// wire done-block phis correctly below. The done-block phi may
+		// reference either acc.Phi (the loop-carried phi) or acc.BackValue
+		// (the updated value, e.g. accPhi + something), so map both.
+		accMergeMap := make(map[Value]Value, len(loop.Accumulators)*2)
 		for i, acc := range loop.Accumulators {
 			tailAccResult := spmdTranslateValue(acc.BackValue, tailValueMap)
 			mergePhi := &Phi{Comment: "spmd.acc.merge"}
@@ -564,6 +586,9 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 			spmdInsertPhiAtFront(trampoline, mergePhi)
 			spmdAddReferrer(tailAccPhis[i], mergePhi)
 			spmdAddReferrer(tailAccResult, mergePhi)
+
+			accMergeMap[acc.Phi] = mergePhi
+			accMergeMap[acc.BackValue] = mergePhi
 
 			// Redirect post-loop uses of the original accumulator phi to the
 			// merged result. We deliberately skip uses that are in the original
@@ -579,6 +604,21 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 		trampJump.setBlock(trampoline)
 		trampoline.Instrs = append(trampoline.Instrs, trampJump)
 		addEdge(trampoline, done)
+
+		// Wire done-block phis for the new trampoline predecessor. We removed
+		// body from done's preds earlier (body is unreachable), so done's phis
+		// currently have 0 edges. The trampoline is now the sole predecessor.
+		for _, instr := range done.phis() {
+			phi := instr.(*Phi)
+			bodyEdge := donePhiBodyEdges[phi]
+			if mergeVal, ok := accMergeMap[bodyEdge]; ok {
+				phi.Edges = append(phi.Edges, mergeVal)
+				spmdAddReferrer(mergeVal, phi)
+				continue
+			}
+			// Non-accumulator phi: carry the original body-edge value.
+			phi.Edges = append(phi.Edges, bodyEdge)
+		}
 	}
 
 	// --- Update loop metadata ---

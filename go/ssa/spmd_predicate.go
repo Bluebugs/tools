@@ -1055,10 +1055,13 @@ func predicateBooleanChain(fn *Function, loop *SPMDLoopInfo, chain *SPMDBooleanC
 	if ifWithoutElse {
 		// if-without-else: chain → ThenBlock → ElseBlock (=merge).
 		// Use snapshotted Phi edges to find the "else" (original) value.
-		// The first chain block was the original predecessor that provided
-		// the fall-through value to the merge.
-		firstBlock := chain.Blocks[0]
-		spmdReplaceBooleanChainPhis(mergeBlock, thenBlock, firstBlock, thenMask, lanes, phiSnapshots)
+		// For LAND: every chain block's false edge goes to merge, so Blocks[0] works.
+		// For LOR: only the last chain block's false edge goes to merge.
+		elsePred := chain.Blocks[0]
+		if chain.Op == token.LOR {
+			elsePred = chain.Blocks[len(chain.Blocks)-1]
+		}
+		spmdReplaceBooleanChainPhis(mergeBlock, thenBlock, elsePred, thenMask, lanes, phiSnapshots)
 		spmdMaskMemOps(thenBlock, thenMask, lanes)
 	} else {
 		// if-else: chain → ThenBlock → ElseBlock → Merge.

@@ -1636,6 +1636,50 @@ func f(dst []int) {
 	}
 }
 
+// TestPredicateSPMD_BooleanChainOrPhiMerge verifies that if-without-else
+// || chains correctly replace Phis at the merge block with SPMDSelect.
+// For LOR, the last chain block (not the first) is the merge predecessor.
+func TestPredicateSPMD_BooleanChainOrPhiMerge(t *testing.T) {
+	src := `package main
+
+func f(dst []int) {
+	for i := range dst {
+		x := i
+		if i < 2 || i > 10 {
+			x = i + 100
+		}
+		dst[i] = x
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	// After predication, the Phi at the merge block should be replaced
+	// with an SPMDSelect. Check that at least one SPMDSelect exists.
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+
+	if !strings.Contains(output, "spmd_select") {
+		t.Error("expected SPMDSelect in output for if-without-else || chain with Phi merge")
+		t.Logf("SSA output:\n%s", output)
+	}
+
+	// No varying If should remain.
+	for _, block := range fn.Blocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		if vif, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok && vif.IsVarying {
+			t.Errorf("varying If still present in block %s after predication", block)
+		}
+	}
+}
+
 // TestPredicateSPMD_BooleanChainSanity verifies the sanity checker passes
 // after predicateSPMD linearizes an && boolean chain (if-without-else).
 func TestPredicateSPMD_BooleanChainSanity(t *testing.T) {
