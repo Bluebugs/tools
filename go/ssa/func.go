@@ -414,6 +414,13 @@ func (f *Function) finishBody() {
 		deleteUnreachableBlocks(f)
 		buildDomTree(f)
 	}
+	if len(f.SPMDLoops) == 0 && hasSPMDParams(f) {
+		// SPMD function body with no go-for loops: linearize varying control
+		// flow and handle varying breaks in regular for-range loops.
+		predicateSPMDFuncBody(f)
+		deleteUnreachableBlocks(f)
+		buildDomTree(f)
+	}
 
 	// clear remaining builder state
 	f.results = nil    // (used by lifting)

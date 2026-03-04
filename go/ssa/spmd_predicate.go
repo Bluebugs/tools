@@ -49,15 +49,12 @@ func hasSPMDParams(fn *Function) bool {
 	return false
 }
 
-// predicateSPMD transforms varying control flow in SPMD functions.
-// Called from finishBody after resolveSPMDLoops.
-// Handles two cases:
-//  1. Functions with SPMDLoops (go-for loops): linearizes varying Ifs in scope.
-//  2. Functions with SPMDType parameters (SPMD bodies): handles varying breaks
-//     inside regular for-range loops via break mask accumulation.
-//     NOTE: Case 2 is currently disabled — TinyGo still uses its own break mask
-//     handling for SPMD function bodies (spmdFuncIsBody, spmdBreakRedirect, etc.).
-//     Enable when TinyGo's old handling is removed.
+// predicateSPMD transforms varying control flow in SPMD functions with go-for
+// loops. Called from finishBody after resolveSPMDLoops.
+// Handles functions with SPMDLoops (go-for loops): linearizes varying Ifs in
+// each loop's scope.
+// For SPMD function bodies with no go-for loops, finishBody calls
+// predicateSPMDFuncBody directly after the SPMDLoops block.
 func predicateSPMD(fn *Function) {
 	if len(fn.SPMDLoops) == 0 {
 		return
@@ -177,15 +174,31 @@ type spmdVaryingBreak struct {
 	vif       *If         // the varying If instruction
 }
 
-// predicateSPMDFuncBody handles varying breaks in SPMD function bodies.
-// It finds regular for-range loops in fn and, for each loop with at least one
-// varying break, transforms the break into break mask accumulation.
+// predicateSPMDFuncBody transforms varying control flow in SPMD function bodies
+// (functions with SPMDType parameters but no go-for loops).
+// Step 1 linearizes all varying if/else/switch/boolean-chain control flow in
+// the entire function body via predicateSPMDScope.
+// Step 2 handles varying breaks inside regular for-range loops by transforming
+// them into break mask accumulation via predicateVaryingBreaks.
 func predicateSPMDFuncBody(fn *Function) {
 	lanes := spmdFuncBodyLaneCount(fn)
 	if lanes == 0 {
 		return
 	}
 
+	// Step 1: General varying control flow linearization.
+	// Compute scope = ALL function blocks.
+	scope := make(map[*BasicBlock]bool, len(fn.Blocks))
+	for _, b := range fn.Blocks {
+		scope[b] = true
+	}
+	predicateSPMDScope(fn, scope, lanes, nil, nil)
+
+	// Step 2: Varying breaks in regular for-loops.
+	// Note: Step 1 does not consume break-case varying Ifs because
+	// findMergeBlock returns nil for the break pattern (then-block jumps
+	// to doneBlock, else-block jumps to loopBlock — they diverge). Those
+	// Ifs survive Step 1 and are handled here via break mask accumulation.
 	forLoops := spmdFindRegularForLoops(fn)
 	for _, fl := range forLoops {
 		vbreaks := spmdFindVaryingBreaks(fn, fl)
