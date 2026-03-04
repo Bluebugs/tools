@@ -68,14 +68,14 @@ func predicateSPMD(fn *Function) {
 // predicateSPMDLoop transforms varying control flow within a single SPMD loop.
 func predicateSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	scopeBlocks := spmdLoopScopeBlocks(loop)
-	predicateSPMDScope(fn, scopeBlocks, loop.LaneCount, loop.LoopBlock, loop.BodyBlock)
+	predicateSPMDScope(fn, scopeBlocks, loop.LaneCount, loop.LoopBlock, loop.BodyBlock, spmdAllOnesMask())
 }
 
 // predicateSPMDScope linearizes varying control flow in scopeBlocks.
 // spmdLoopBlock and spmdBodyBlock identify the SPMD loop header blocks (used
 // by switch predication to avoid replacing loop-carried phis). Pass nil for
 // both when predicating a function body (no enclosing SPMD loop).
-func predicateSPMDScope(fn *Function, scopeBlocks map[*BasicBlock]bool, lanes int, spmdLoopBlock, spmdBodyBlock *BasicBlock) {
+func predicateSPMDScope(fn *Function, scopeBlocks map[*BasicBlock]bool, lanes int, spmdLoopBlock, spmdBodyBlock *BasicBlock, activeMask Value) {
 	// Build a set of If instructions to exclude from the generic If predication
 	// pass. Both boolean-chain and switch-chain Ifs are excluded so the generic
 	// loop below does not linearize them independently. Switch-chain Ifs are
@@ -105,7 +105,7 @@ func predicateSPMDScope(fn *Function, scopeBlocks map[*BasicBlock]bool, lanes in
 		if _, ok := chain.Blocks[0].Instrs[len(chain.Blocks[0].Instrs)-1].(*If); !ok {
 			continue
 		}
-		predicateBooleanChain(fn, lanes, chain)
+		predicateBooleanChain(fn, lanes, chain, activeMask)
 	}
 
 	// Find all varying If instructions in scope and linearize them.
@@ -132,7 +132,7 @@ func predicateSPMDScope(fn *Function, scopeBlocks map[*BasicBlock]bool, lanes in
 			continue // skip boolean-chain and switch-chain Ifs
 		}
 		// linearize this varying If.
-		predicateVaryingIf(fn, lanes, block, vif, allowLoopHeaderMerge)
+		predicateVaryingIf(fn, lanes, block, vif, allowLoopHeaderMerge, activeMask)
 	}
 
 	// Linearize each varying switch chain whose DoneBlock is in scope.
@@ -151,7 +151,7 @@ func predicateSPMDScope(fn *Function, scopeBlocks map[*BasicBlock]bool, lanes in
 		if !scopeBlocks[firstBlock] {
 			continue
 		}
-		predicateVaryingSwitch(fn, lanes, chain, spmdLoopBlock, spmdBodyBlock)
+		predicateVaryingSwitch(fn, lanes, chain, spmdLoopBlock, spmdBodyBlock, activeMask)
 	}
 }
 
@@ -194,13 +194,21 @@ func predicateSPMDFuncBody(fn *Function) {
 		return
 	}
 
+	// Determine the active mask for this function body.
+	var activeMask Value
+	if fn.SPMDMask != nil {
+		activeMask = fn.SPMDMask
+	} else {
+		activeMask = spmdAllOnesMask()
+	}
+
 	// Step 1: General varying control flow linearization.
 	// Compute scope = ALL function blocks.
 	scope := make(map[*BasicBlock]bool, len(fn.Blocks))
 	for _, b := range fn.Blocks {
 		scope[b] = true
 	}
-	predicateSPMDScope(fn, scope, lanes, nil, nil)
+	predicateSPMDScope(fn, scope, lanes, nil, nil, activeMask)
 
 	// Step 2: Varying breaks in regular for-loops.
 	// Note: Step 1 does not consume break-case varying Ifs because
@@ -213,8 +221,12 @@ func predicateSPMDFuncBody(fn *Function) {
 		if len(vbreaks) == 0 {
 			continue
 		}
-		predicateVaryingBreaks(fn, fl, vbreaks, lanes)
+		predicateVaryingBreaks(fn, fl, vbreaks, lanes, activeMask)
 	}
+
+	// Step 3: Set mask on remaining SPMD function calls that weren't inside
+	// a varying if/else/switch (which already got narrowed masks).
+	spmdMaskCallOps(fn, activeMask)
 }
 
 // spmdFuncBodyLaneCount returns the lane count for an SPMD function body by
@@ -485,7 +497,7 @@ func spmdIsBreakBlock(block, doneBlock *BasicBlock) bool {
 //
 //	doneBlock:
 //	    result = result_accum  (replaced with reference to accumulator phi)
-func predicateVaryingBreaks(fn *Function, fl *spmdRegularForLoop, breaks []*spmdVaryingBreak, lanes int) {
+func predicateVaryingBreaks(fn *Function, fl *spmdRegularForLoop, breaks []*spmdVaryingBreak, lanes int, activeMask Value) {
 	// Step A: Identify the entry and back-edge predecessors of the loop header.
 	loopBlock := fl.loopBlock
 	entryPred, _ := spmdLoopHeaderPreds(loopBlock, fl.bodyBlock, fl.doneBlock)
@@ -605,12 +617,12 @@ func predicateVaryingBreaks(fn *Function, fl *spmdRegularForLoop, breaks []*spmd
 		// producer-before-consumer ordering that TinyGo requires.
 		spmdRelocateToBlock(thenBlock, ifBlock)
 
-		// Compute active mask: AND_NOT(all_ones, lastBreakMask)
-		activeMask := spmdInsertMaskAndNot(ifBlock, spmdAllOnesMask(), lastBreakMask)
+		// Compute active mask: AND_NOT(entryMask, lastBreakMask)
+		breakActiveMask := spmdInsertMaskAndNot(ifBlock, activeMask, lastBreakMask)
 
 		// Convert the condition to a mask and compute which lanes break.
 		maskCond := spmdInsertConvertToMask(ifBlock, vb.vif.Cond)
-		breakLanes := spmdInsertMaskAnd(ifBlock, activeMask, maskCond)
+		breakLanes := spmdInsertMaskAnd(ifBlock, breakActiveMask, maskCond)
 
 		// Accumulate break mask.
 		newBreakMask := spmdInsertMaskOr(ifBlock, lastBreakMask, breakLanes)
@@ -873,7 +885,7 @@ func spmdLoopScopeBlocks(loop *SPMDLoopInfo) map[*BasicBlock]bool {
 //	T: ... [SPMDLoad/SPMDStore with then_mask] ... jump E
 //	E: ... [SPMDLoad/SPMDStore with else_mask] ... jump M
 //	M: SPMDSelect(then_mask, v1, v2) replaces phi [T: v1, E: v2] ...
-func predicateVaryingIf(fn *Function, lanes int, ifBlock *BasicBlock, vif *If, allowLoopHeaderMerge bool) {
+func predicateVaryingIf(fn *Function, lanes int, ifBlock *BasicBlock, vif *If, allowLoopHeaderMerge bool, activeMask Value) {
 	thenBlock := ifBlock.Succs[0] // If.Cond true → Succs[0]
 	elseBlock := ifBlock.Succs[1] // If.Cond false → Succs[1]
 
@@ -896,10 +908,6 @@ func predicateVaryingIf(fn *Function, lanes int, ifBlock *BasicBlock, vif *If, a
 			return // genuinely complex pattern, skip
 		}
 	}
-
-	// Compute the active mask. For now we use the all-ones constant mask
-	// (all lanes active), as we do not yet thread masks through nested ifs.
-	activeMask := spmdAllOnesMask()
 
 	// Build mask instructions: insert before the If terminator in ifBlock.
 	maskCond := spmdInsertConvertToMask(ifBlock, vif.Cond)
@@ -1214,7 +1222,7 @@ func spmdInsertMaskOr(b *BasicBlock, x, y Value) *BinOp {
 //	B1: compute b; If b → ThenBlock else ElseBlock
 //
 // Same transformation: B0 → B1 → ThenBlock, combined=OR(maskA, maskB).
-func predicateBooleanChain(fn *Function, lanes int, chain *SPMDBooleanChain) {
+func predicateBooleanChain(fn *Function, lanes int, chain *SPMDBooleanChain, activeMask Value) {
 	if len(chain.Blocks) < 2 {
 		return
 	}
@@ -1292,14 +1300,12 @@ func predicateBooleanChain(fn *Function, lanes int, chain *SPMDBooleanChain) {
 	if mergeBlock == nil {
 		// Complex CFG: cannot safely predicate. Mask memory ops in then/else
 		// with the combined mask even without SPMDSelect (best-effort).
-		activeMask := spmdAllOnesMask()
 		thenMask := spmdInsertMaskAnd(lastBlock, activeMask, combinedMask)
 		spmdMaskMemOps(thenBlock, thenMask, lanes)
 		return
 	}
 
 	// Step 3: Apply predication using the combined mask.
-	activeMask := spmdAllOnesMask()
 	thenMask := spmdInsertMaskAnd(lastBlock, activeMask, combinedMask)
 
 	ifWithoutElse := elseBlock == mergeBlock
@@ -1590,7 +1596,7 @@ type spmdSwitchCaseInfo struct {
 //	body1: ... [mem ops with mask1] Jump default/done
 //	default: ... [mem ops with defaultMask] Jump done  (if present)
 //	done: SPMDSelect(mask0, v0, SPMDSelect(mask1, v1, vDefault))
-func predicateVaryingSwitch(fn *Function, lanes int, chain *SPMDSwitchChain, spmdLoopBlock, spmdBodyBlock *BasicBlock) {
+func predicateVaryingSwitch(fn *Function, lanes int, chain *SPMDSwitchChain, spmdLoopBlock, spmdBodyBlock *BasicBlock, activeMask Value) {
 	if len(chain.Cases) == 0 {
 		return
 	}
@@ -1631,13 +1637,10 @@ func predicateVaryingSwitch(fn *Function, lanes int, chain *SPMDSwitchChain, spm
 		}
 	}
 
-	activeMask := spmdAllOnesMask()
-
 	// Phase 1: Compute per-case masks and linearize the comparison blocks.
 	//
 	// remaining tracks the mask of lanes not yet claimed by an earlier case.
-	// It starts as the all-ones active mask and is narrowed by AND_NOT after
-	// each case.
+	// It starts as the active mask and is narrowed by AND_NOT after each case.
 	remaining := Value(activeMask)
 	cases := make([]spmdSwitchCaseInfo, len(chain.Cases))
 
@@ -1941,6 +1944,35 @@ func spmdMaskMemOps(b *BasicBlock, mask Value, lanes int) {
 				*refs = removeInstr(*refs, instr)
 			}
 			instr.block = nil
+
+		case *Call:
+			// Set mask on calls to SPMD functions (those with varying params).
+			callee := instr.Call.StaticCallee()
+			if callee != nil && hasSPMDParams(callee) {
+				instr.Call.SPMDMask = mask
+				spmdAddReferrer(mask, instr)
+			}
+		}
+	}
+}
+
+// spmdMaskCallOps sweeps all Call instructions in fn and sets their SPMDMask
+// to defaultMask for any SPMD function call that doesn't already have a mask
+// (i.e., calls not inside a varying if/else/switch that already received a
+// narrowed mask via spmdMaskMemOps).
+func spmdMaskCallOps(fn *Function, defaultMask Value) {
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			call, ok := instr.(*Call)
+			if !ok || call.Call.SPMDMask != nil {
+				continue
+			}
+			callee := call.Call.StaticCallee()
+			if callee == nil || !hasSPMDParams(callee) {
+				continue
+			}
+			call.Call.SPMDMask = defaultMask
+			spmdAddReferrer(defaultMask, call)
 		}
 	}
 }

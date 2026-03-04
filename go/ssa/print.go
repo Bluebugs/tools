@@ -130,11 +130,17 @@ func printCall(v *CallCommon, prefix string, instr Instruction) string {
 		fmt.Fprintf(&b, "invoke %s.%s", relName(v.Value, instr), v.Method.Name())
 	}
 	b.WriteString("(")
-	for i, arg := range v.Args {
-		if i > 0 {
+	first := true
+	if v.SPMDMask != nil {
+		b.WriteString(relName(v.SPMDMask, instr))
+		first = false
+	}
+	for _, arg := range v.Args {
+		if !first {
 			b.WriteString(", ")
 		}
 		b.WriteString(relName(arg, instr))
+		first = false
 	}
 	if v.Signature().Variadic() {
 		b.WriteString("...")

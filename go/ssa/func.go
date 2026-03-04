@@ -17,6 +17,7 @@ import (
 	"os"
 	"strings"
 
+	spmdpkg "golang.org/x/tools/go/types/spmd"
 	"golang.org/x/tools/internal/typeparams"
 )
 
@@ -415,6 +416,13 @@ func (f *Function) finishBody() {
 		buildDomTree(f)
 	}
 	if len(f.SPMDLoops) == 0 && hasSPMDParams(f) {
+		// Create the implicit mask parameter for this SPMD function body.
+		f.SPMDMask = &Parameter{
+			name:   "spmd.mask",
+			typ:    spmdpkg.NewVaryingMask(),
+			parent: f,
+		}
+
 		// SPMD function body with no go-for loops: linearize varying control
 		// flow and handle varying breaks in regular for-range loops.
 		predicateSPMDFuncBody(f)
@@ -676,6 +684,10 @@ func WriteFunction(buf *bytes.Buffer, f *Function) {
 	}
 
 	from := f.relPkg()
+
+	if f.SPMDMask != nil {
+		fmt.Fprintf(buf, "# SPMD mask: %s %s\n", f.SPMDMask.Name(), relType(f.SPMDMask.Type(), from))
+	}
 
 	if f.FreeVars != nil {
 		buf.WriteString("# Free variables:\n")

@@ -2448,3 +2448,244 @@ func main() {}
 		t.Fatalf("BuildPackage failed (sanity check): %v", err)
 	}
 }
+
+// ----------------------------------------------------------------------------
+// SPMDMask parameter tests
+
+// TestPredicateSPMD_FuncBodyMaskParam verifies that fn.SPMDMask is set for
+// SPMD functions with varying params, and not set for non-SPMD functions.
+func TestPredicateSPMD_FuncBodyMaskParam(t *testing.T) {
+	src := `package main
+import "lanes"
+func spmdFunc(v lanes.Varying[int]) lanes.Varying[int] {
+	return v
+}
+func normalFunc(x int) int {
+	return x
+}
+func main() {}
+`
+	pkg := buildSPMDFuncBody(t, src)
+
+	// SPMD function should have SPMDMask set.
+	spmdFn := pkg.Func("spmdFunc")
+	if spmdFn == nil {
+		t.Fatal("function spmdFunc not found")
+	}
+	if spmdFn.SPMDMask == nil {
+		t.Fatal("expected SPMDMask to be set for SPMD function")
+	}
+	if spmdFn.SPMDMask.Name() != "spmd.mask" {
+		t.Errorf("SPMDMask name = %q, want %q", spmdFn.SPMDMask.Name(), "spmd.mask")
+	}
+	if !spmd.IsVaryingMask(spmdFn.SPMDMask.Type()) {
+		t.Errorf("SPMDMask type = %s, want Varying[mask]", spmdFn.SPMDMask.Type())
+	}
+	if spmdFn.SPMDMask.Parent() != spmdFn {
+		t.Errorf("SPMDMask.Parent() = %v, want %v", spmdFn.SPMDMask.Parent(), spmdFn)
+	}
+
+	// WriteFunction should show the mask parameter.
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, spmdFn)
+	output := buf.String()
+	if !strings.Contains(output, "# SPMD mask: spmd.mask") {
+		t.Errorf("WriteFunction output should contain SPMD mask header:\n%s", output)
+	}
+
+	// Non-SPMD function should NOT have SPMDMask set.
+	normalFn := pkg.Func("normalFunc")
+	if normalFn == nil {
+		t.Fatal("function normalFunc not found")
+	}
+	if normalFn.SPMDMask != nil {
+		t.Error("expected SPMDMask to be nil for non-SPMD function")
+	}
+}
+
+// TestPredicateSPMD_CallMask verifies that SPMD function body calls to another
+// SPMD function get their SPMDMask set to the caller's mask parameter.
+func TestPredicateSPMD_CallMask(t *testing.T) {
+	src := `package main
+import "lanes"
+func callee(v lanes.Varying[int]) lanes.Varying[int] {
+	return v
+}
+func caller(v lanes.Varying[int]) lanes.Varying[int] {
+	return callee(v)
+}
+func main() {}
+`
+	pkg := buildSPMDFuncBody(t, src)
+	fn := pkg.Func("caller")
+	if fn == nil {
+		t.Fatal("function caller not found")
+	}
+	if fn.SPMDMask == nil {
+		t.Fatal("expected SPMDMask on caller")
+	}
+
+	// Find the Call instruction.
+	var callInstr *ssa.Call
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if call, ok := instr.(*ssa.Call); ok {
+				if callee := call.Call.StaticCallee(); callee != nil && callee.Name() == "callee" {
+					callInstr = call
+				}
+			}
+		}
+	}
+	if callInstr == nil {
+		t.Fatal("call to callee not found")
+	}
+	if callInstr.Call.SPMDMask == nil {
+		t.Fatal("expected SPMDMask on call to callee")
+	}
+	// The mask should be the caller's SPMDMask parameter.
+	if callInstr.Call.SPMDMask != fn.SPMDMask {
+		t.Errorf("call SPMDMask = %v, want caller's SPMDMask %v",
+			callInstr.Call.SPMDMask, fn.SPMDMask)
+	}
+
+	// Verify printed output shows mask in call.
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+	if !strings.Contains(output, "spmd.mask") {
+		t.Errorf("expected spmd.mask in call output:\n%s", output)
+	}
+}
+
+// TestPredicateSPMD_CallMaskInVaryingIf verifies that a call to an SPMD
+// function inside a varying-if gets the narrowed thenMask, not the entry mask.
+func TestPredicateSPMD_CallMaskInVaryingIf(t *testing.T) {
+	src := `package main
+import "lanes"
+func callee(v lanes.Varying[int]) lanes.Varying[int] {
+	return v
+}
+func caller(v lanes.Varying[int]) lanes.Varying[int] {
+	vi := lanes.Varying[int](10)
+	var result lanes.Varying[int]
+	if v > vi {
+		result = callee(v)
+	} else {
+		result = v
+	}
+	return result
+}
+func main() {}
+`
+	pkg := buildSPMDFuncBody(t, src)
+	fn := pkg.Func("caller")
+	if fn == nil {
+		t.Fatal("function caller not found")
+	}
+	if fn.SPMDMask == nil {
+		t.Fatal("expected SPMDMask on caller")
+	}
+
+	// Find the Call instruction to callee.
+	var callInstr *ssa.Call
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if call, ok := instr.(*ssa.Call); ok {
+				if callee := call.Call.StaticCallee(); callee != nil && callee.Name() == "callee" {
+					callInstr = call
+				}
+			}
+		}
+	}
+	if callInstr == nil {
+		t.Fatal("call to callee not found")
+	}
+	if callInstr.Call.SPMDMask == nil {
+		t.Fatal("expected SPMDMask on call to callee inside varying if")
+	}
+	// Inside a varying if/else, the mask should be narrowed (not the entry mask).
+	// It should be a mask AND result, not the raw SPMDMask parameter.
+	if callInstr.Call.SPMDMask == fn.SPMDMask {
+		t.Error("call inside varying-if should have narrowed mask, not entry mask")
+	}
+	// The mask should be of Varying[mask] type.
+	if !spmd.IsVaryingMask(callInstr.Call.SPMDMask.Type()) {
+		t.Errorf("call SPMDMask type = %s, want Varying[mask]",
+			callInstr.Call.SPMDMask.Type())
+	}
+}
+
+// TestPredicateSPMD_CallMaskSanity verifies the SSA sanity checker passes
+// after mask parameter creation and call masking.
+func TestPredicateSPMD_CallMaskSanity(t *testing.T) {
+	src := `package main
+import "lanes"
+func callee(v lanes.Varying[int]) lanes.Varying[int] {
+	return v
+}
+func caller(v lanes.Varying[int]) lanes.Varying[int] {
+	return callee(v)
+}
+func main() {}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{f},
+		ssa.SanityCheckFunctions,
+	)
+	if err != nil {
+		t.Fatalf("BuildPackage with SanityCheckFunctions failed: %v", err)
+	}
+}
+
+// TestPredicateSPMD_FuncBodyVaryingIfElseMaskRef verifies that mask computation
+// in a function body references the SPMDMask parameter rather than a constant.
+func TestPredicateSPMD_FuncBodyVaryingIfElseMaskRef(t *testing.T) {
+	src := `package main
+import "lanes"
+func f(v lanes.Varying[int]) lanes.Varying[int] {
+	var result lanes.Varying[int]
+	vi := lanes.Varying[int](10)
+	if v > vi {
+		result = v
+	} else {
+		result = vi
+	}
+	return result
+}
+func main() {}
+`
+	pkg := buildSPMDFuncBody(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+	if fn.SPMDMask == nil {
+		t.Fatal("expected SPMDMask on function f")
+	}
+
+	// Find mask AND instructions (used to compute thenMask/elseMask).
+	// At least one should reference the SPMDMask parameter.
+	foundMaskRef := false
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			binOp, ok := instr.(*ssa.BinOp)
+			if !ok {
+				continue
+			}
+			if binOp.X == fn.SPMDMask || binOp.Y == fn.SPMDMask {
+				foundMaskRef = true
+			}
+		}
+	}
+	if !foundMaskRef {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Errorf("expected mask AND instructions referencing SPMDMask parameter:\n%s", buf.String())
+	}
+}

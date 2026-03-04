@@ -710,6 +710,22 @@ func (s *sanity) checkFunction(fn *Function) bool {
 		}
 	}
 
+	// Validate SPMDMask consistency.
+	if fn.SPMDMask != nil {
+		if fn.SPMDMask.parent != fn {
+			s.errorf("SPMDMask.parent is %s, want %s", fn.SPMDMask.parent, fn)
+		}
+		if !spmd.IsVaryingMask(fn.SPMDMask.Type()) {
+			s.errorf("SPMDMask type is %s, want Varying[mask]", fn.SPMDMask.Type())
+		}
+		if !hasSPMDParams(fn) {
+			s.errorf("SPMDMask is set but function has no SPMDType parameters")
+		}
+		if len(fn.SPMDLoops) > 0 {
+			s.errorf("SPMDMask is set but function has SPMDLoops (go-for loops use implicit masks)")
+		}
+	}
+
 	for i, anon := range fn.AnonFuncs {
 		if anon.Parent() != fn {
 			s.errorf("AnonFuncs[%d]=%s but %s.Parent()=%s", i, anon, anon, anon.Parent())

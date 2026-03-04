@@ -364,6 +364,7 @@ type Function struct {
 	SPMDLoops          []*SPMDLoopInfo      // SPMD go-for loop metadata; nil if no SPMD loops
 	SPMDSwitchChains   []*SPMDSwitchChain   // varying switch chain metadata; nil if none
 	SPMDBooleanChains  []*SPMDBooleanChain  // compound boolean chain metadata; nil if none
+	SPMDMask           *Parameter           // implicit execution mask for SPMD function bodies; nil if not SPMD
 	referrers          []Instruction        // referring instructions (iff Parent() != nil)
 	anonIdx   int32         // position of a nested function in parent's AnonFuncs. fn.Parent()!=nil => fn.Parent().AnonFunc[fn.anonIdx] == fn.
 
@@ -1602,10 +1603,11 @@ type anInstruction struct {
 // For all calls to variadic functions (Signature().Variadic()),
 // the last element of Args is a slice.
 type CallCommon struct {
-	Value  Value       // receiver (invoke mode) or func value (call mode)
-	Method *types.Func // interface method (invoke mode)
-	Args   []Value     // actual parameters (in static method call, includes receiver)
-	pos    token.Pos   // position of CallExpr.Lparen, iff explicit in source
+	Value    Value       // receiver (invoke mode) or func value (call mode)
+	Method   *types.Func // interface method (invoke mode)
+	Args     []Value     // actual parameters (in static method call, includes receiver)
+	SPMDMask Value       // execution mask for SPMD function calls; nil if not SPMD
+	pos      token.Pos   // position of CallExpr.Lparen, iff explicit in source
 }
 
 // IsInvoke returns true if this call has "invoke" (not "call") mode.
@@ -1854,6 +1856,9 @@ func (c *CallCommon) Operands(rands []*Value) []*Value {
 	rands = append(rands, &c.Value)
 	for i := range c.Args {
 		rands = append(rands, &c.Args[i])
+	}
+	if c.SPMDMask != nil {
+		rands = append(rands, &c.SPMDMask)
 	}
 	return rands
 }
