@@ -1421,10 +1421,12 @@ type SPMDSelect struct {
 //	t3 = spmd_load<16> t1 mask t2
 type SPMDLoad struct {
 	register
-	Addr  Value     // pointer to load from
-	Mask  Value     // Varying[mask] — which lanes execute the load
-	Lanes int       // lane count from enclosing SPMD loop
-	pos   token.Pos // optional source position
+	Addr       Value     // pointer to load from
+	Mask       Value     // Varying[mask] — which lanes execute the load
+	Lanes      int       // lane count from enclosing SPMD loop
+	Contiguous bool      // true if Addr comes from contiguous IndexAddr (iter-based)
+	Source     Value     // IndexAddr.X when Contiguous; nil otherwise (for cap/alloca checking)
+	pos        token.Pos // optional source position
 }
 
 // SPMDStore stores Val to Addr only for lanes where Mask is active.
@@ -1438,11 +1440,13 @@ type SPMDLoad struct {
 //	spmd_store<16> t1 t2 mask t3
 type SPMDStore struct {
 	anInstruction
-	Addr  Value     // pointer to store to
-	Val   Value     // value to store
-	Mask  Value     // Varying[mask] — which lanes execute the store
-	Lanes int       // lane count from enclosing SPMD loop
-	pos   token.Pos // optional source position
+	Addr       Value     // pointer to store to
+	Val        Value     // value to store
+	Mask       Value     // Varying[mask] — which lanes execute the store
+	Lanes      int       // lane count from enclosing SPMD loop
+	Contiguous bool      // true if Addr comes from contiguous IndexAddr (iter-based)
+	Source     Value     // IndexAddr.X when Contiguous; nil otherwise (for cap/alloca checking)
+	pos        token.Pos // optional source position
 }
 
 // SPMDIndex produces consecutive lane indices [0, 1, ..., Lanes-1]
@@ -2031,11 +2035,19 @@ func (v *SPMDSelect) Operands(rands []*Value) []*Value {
 }
 
 func (v *SPMDLoad) Operands(rands []*Value) []*Value {
-	return append(rands, &v.Addr, &v.Mask)
+	rands = append(rands, &v.Addr, &v.Mask)
+	if v.Source != nil {
+		rands = append(rands, &v.Source)
+	}
+	return rands
 }
 
 func (s *SPMDStore) Operands(rands []*Value) []*Value {
-	return append(rands, &s.Addr, &s.Val, &s.Mask)
+	rands = append(rands, &s.Addr, &s.Val, &s.Mask)
+	if s.Source != nil {
+		rands = append(rands, &s.Source)
+	}
+	return rands
 }
 
 func (v *SPMDIndex) Operands(rands []*Value) []*Value {

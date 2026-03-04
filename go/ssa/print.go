@@ -413,13 +413,21 @@ func (v *SPMDSelect) String() string {
 }
 
 func (v *SPMDLoad) String() string {
-	return fmt.Sprintf("spmd_load<%d> %s mask %s",
-		v.Lanes, spmdRelName(v.Addr, v), spmdRelName(v.Mask, v))
+	suffix := ""
+	if v.Contiguous {
+		suffix = " [contiguous]"
+	}
+	return fmt.Sprintf("spmd_load<%d> %s mask %s%s",
+		v.Lanes, spmdRelName(v.Addr, v), spmdRelName(v.Mask, v), suffix)
 }
 
 func (s *SPMDStore) String() string {
-	return fmt.Sprintf("spmd_store<%d> %s %s mask %s",
-		s.Lanes, spmdRelName(s.Addr, s), spmdRelName(s.Val, s), spmdRelName(s.Mask, s))
+	suffix := ""
+	if s.Contiguous {
+		suffix = " [contiguous]"
+	}
+	return fmt.Sprintf("spmd_store<%d> %s %s mask %s%s",
+		s.Lanes, spmdRelName(s.Addr, s), spmdRelName(s.Val, s), spmdRelName(s.Mask, s), suffix)
 }
 
 func (v *SPMDIndex) String() string {

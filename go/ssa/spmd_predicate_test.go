@@ -2689,3 +2689,388 @@ func main() {}
 		t.Errorf("expected mask AND instructions referencing SPMDMask parameter:\n%s", buf.String())
 	}
 }
+
+// TestPredicateSPMD_LoadContiguity verifies that SPMDLoad.Contiguous is set
+// when arr[i] is accessed inside a varying if in a go-for loop.
+func TestPredicateSPMD_LoadContiguity(t *testing.T) {
+	src := `package main
+
+func f(arr []int) {
+	for i := range len(arr) {
+		if arr[i] > 0 {
+			arr[i] = arr[i] + 1
+		}
+	}
+}
+
+func main() { f(make([]int, 16)) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	var contiguousLoads, nonContiguousLoads int
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if load, ok := instr.(*ssa.SPMDLoad); ok {
+				if load.Contiguous {
+					contiguousLoads++
+					if load.Source == nil {
+						t.Error("SPMDLoad.Contiguous is true but Source is nil")
+					}
+				} else {
+					nonContiguousLoads++
+				}
+			}
+		}
+	}
+	if contiguousLoads == 0 {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Errorf("expected at least one contiguous SPMDLoad, got 0:\n%s", buf.String())
+	}
+}
+
+// TestPredicateSPMD_StoreContiguity verifies that SPMDStore.Contiguous is set
+// when arr[i] is stored inside a varying if in a go-for loop.
+func TestPredicateSPMD_StoreContiguity(t *testing.T) {
+	src := `package main
+
+func f(arr []int) {
+	for i := range len(arr) {
+		if arr[i] > 0 {
+			arr[i] = 42
+		}
+	}
+}
+
+func main() { f(make([]int, 16)) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	var contiguousStores int
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if store, ok := instr.(*ssa.SPMDStore); ok {
+				if store.Contiguous {
+					contiguousStores++
+					if store.Source == nil {
+						t.Error("SPMDStore.Contiguous is true but Source is nil")
+					}
+				}
+			}
+		}
+	}
+	if contiguousStores == 0 {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Errorf("expected at least one contiguous SPMDStore, got 0:\n%s", buf.String())
+	}
+}
+
+// TestPredicateSPMD_NonContiguousLoad verifies that SPMDLoad.Contiguous=false
+// when the index is not the loop iterator.
+func TestPredicateSPMD_NonContiguousLoad(t *testing.T) {
+	src := `package main
+
+func f(arr []int, j int) {
+	for i := range len(arr) {
+		if i > 0 {
+			arr[i] = arr[j]
+		}
+	}
+}
+
+func main() { f(make([]int, 16), 3) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if load, ok := instr.(*ssa.SPMDLoad); ok {
+				if load.Contiguous {
+					t.Errorf("SPMDLoad should NOT be contiguous for arr[j], got Contiguous=true")
+				}
+			}
+		}
+	}
+}
+
+// TestPredicateSPMD_ContiguousString verifies that String() appends [contiguous].
+func TestPredicateSPMD_ContiguousString(t *testing.T) {
+	src := `package main
+
+func f(arr []int) {
+	for i := range len(arr) {
+		if arr[i] > 0 {
+			arr[i] = 42
+		}
+	}
+}
+
+func main() { f(make([]int, 16)) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	foundContiguousString := false
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			s := instr.String()
+			if strings.Contains(s, "[contiguous]") {
+				foundContiguousString = true
+			}
+		}
+	}
+	if !foundContiguousString {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Errorf("expected [contiguous] suffix in SPMDLoad/SPMDStore String():\n%s", buf.String())
+	}
+}
+
+// TestPredicateSPMD_ContiguousSanity verifies the sanity checker passes with
+// contiguous SPMDLoad/SPMDStore instructions.
+func TestPredicateSPMD_ContiguousSanity(t *testing.T) {
+	src := `package main
+
+func f(arr []int) {
+	for i := range len(arr) {
+		if arr[i] > 0 {
+			arr[i] = arr[i] + 1
+		}
+	}
+}
+
+func main() { f(make([]int, 16)) }
+`
+	// buildSSAWithSPMD uses SanityCheckFunctions mode, so this implicitly
+	// validates that the sanity checker accepts contiguous SPMDLoad/SPMDStore.
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+}
+
+// TestSPMDLoad_OperandsWithSource verifies Operands() includes Source when
+// Contiguous is true (3 operands instead of 2).
+func TestSPMDLoad_OperandsWithSource(t *testing.T) {
+	addr := ssa.Value(ptrConst())
+	mask := ssa.Value(intConst(0))
+	source := ssa.Value(ptrConst())
+
+	load := &ssa.SPMDLoad{
+		Addr:       addr,
+		Mask:       mask,
+		Lanes:      4,
+		Contiguous: true,
+		Source:     source,
+	}
+
+	rands := load.Operands(nil)
+	if len(rands) != 3 {
+		t.Fatalf("SPMDLoad.Operands() with Source returned %d operands, want 3", len(rands))
+	}
+	if *rands[2] != source {
+		t.Errorf("SPMDLoad.Operands()[2] should be Source")
+	}
+}
+
+// TestSPMDStore_OperandsWithSource verifies Operands() includes Source when
+// Contiguous is true (4 operands instead of 3).
+func TestSPMDStore_OperandsWithSource(t *testing.T) {
+	addr := ssa.Value(ptrConst())
+	val := ssa.Value(intConst(42))
+	mask := ssa.Value(intConst(0))
+	source := ssa.Value(ptrConst())
+
+	store := &ssa.SPMDStore{
+		Addr:       addr,
+		Val:        val,
+		Mask:       mask,
+		Lanes:      4,
+		Contiguous: true,
+		Source:     source,
+	}
+
+	rands := store.Operands(nil)
+	if len(rands) != 4 {
+		t.Fatalf("SPMDStore.Operands() with Source returned %d operands, want 4", len(rands))
+	}
+	if *rands[3] != source {
+		t.Errorf("SPMDStore.Operands()[3] should be Source")
+	}
+}
+
+// TestPredicateSPMD_ConvertAllMemOps_FuncBody verifies that straight-line
+// loads/stores in an SPMD function body are converted to SPMDLoad/SPMDStore
+// by spmdConvertAllMemOps.
+func TestPredicateSPMD_ConvertAllMemOps_FuncBody(t *testing.T) {
+	src := `package main
+import "lanes"
+func f(v lanes.Varying[int], dst *int) lanes.Varying[int] {
+	*dst = 42
+	result := *dst
+	_ = result
+	return v
+}
+func main() {}
+`
+	pkg := buildSPMDFuncBody(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+
+	// After spmdConvertAllMemOps, there should be no plain *UnOp{MUL} or *Store
+	// in the function — all should be converted to SPMDLoad/SPMDStore.
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			switch instr := instr.(type) {
+			case *ssa.UnOp:
+				if instr.Op == token.MUL {
+					t.Errorf("unconverted UnOp{MUL} remains in func body:\n%s", output)
+				}
+			case *ssa.Store:
+				t.Errorf("unconverted Store remains in func body:\n%s", output)
+			}
+		}
+	}
+
+	// At least one SPMDStore should exist (from *dst = 42).
+	foundStore := false
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if _, ok := instr.(*ssa.SPMDStore); ok {
+				foundStore = true
+			}
+		}
+	}
+	if !foundStore {
+		t.Errorf("expected at least one SPMDStore in func body:\n%s", output)
+	}
+}
+
+// TestPredicateSPMD_ConvertAllMemOps_SkipsConverted verifies that
+// spmdConvertAllMemOps does not double-convert instructions that were
+// already converted by predicateSPMDScope (inside varying branches).
+func TestPredicateSPMD_ConvertAllMemOps_SkipsConverted(t *testing.T) {
+	src := `package main
+import "lanes"
+func f(v lanes.Varying[int], dst *int) {
+	vi := lanes.Varying[int](10)
+	if v > vi {
+		*dst = 42
+	}
+	*dst = 99
+}
+func main() {}
+`
+	pkg := buildSPMDFuncBody(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	// Count SPMDStore instructions.
+	spmdStoreCount := 0
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if _, ok := instr.(*ssa.SPMDStore); ok {
+				spmdStoreCount++
+			}
+		}
+	}
+	// Two stores: one inside varying if (converted by predicateSPMDScope),
+	// one outside (converted by spmdConvertAllMemOps).
+	if spmdStoreCount < 2 {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Errorf("expected at least 2 SPMDStore instructions, got %d:\n%s", spmdStoreCount, buf.String())
+	}
+
+	// No plain Store should remain.
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if _, ok := instr.(*ssa.Store); ok {
+				var buf bytes.Buffer
+				ssa.WriteFunction(&buf, fn)
+				t.Errorf("unconverted Store remains after both passes:\n%s", buf.String())
+			}
+		}
+	}
+}
+
+// TestPredicateSPMD_ConvertAllMemOps_NoEffectOnGoFor verifies that
+// spmdConvertAllMemOps is NOT called for go-for loop functions (it's only
+// called from predicateSPMDFuncBody, which only runs on func bodies).
+func TestPredicateSPMD_ConvertAllMemOps_NoEffectOnGoFor(t *testing.T) {
+	src := `package main
+
+func f(arr []int) {
+	for i := range len(arr) {
+		arr[i] = arr[i] + 1
+	}
+}
+
+func main() { f(make([]int, 16)) }
+`
+	// Build without SanityCheckFunctions to avoid a pre-existing referrer
+	// issue with loop peeling (not related to spmdConvertAllMemOps).
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setSPMDOnRange(file)
+	pkg, _, err := ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{file}, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	// Go-for loop functions have SPMDLoops but no SPMD params, so
+	// predicateSPMDFuncBody is not called. Loads/stores in straight-line
+	// body code remain as regular UnOp/Store (they are handled by TinyGo's
+	// contiguous detection during compilation).
+	hasRegularMemOp := false
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			switch instr := instr.(type) {
+			case *ssa.UnOp:
+				if instr.Op == token.MUL {
+					hasRegularMemOp = true
+				}
+			case *ssa.Store:
+				hasRegularMemOp = true
+			}
+		}
+	}
+	if !hasRegularMemOp {
+		t.Error("go-for loop function should retain regular UnOp/Store (not converted by spmdConvertAllMemOps)")
+	}
+}

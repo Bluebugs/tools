@@ -224,6 +224,12 @@ func (s *sanity) checkInstr(idx int, instr Instruction) {
 			s.errorf("SPMDLoad: result type %s does not match Addr element type %s",
 				instr.Type(), ptrType.Elem())
 		}
+		if instr.Contiguous && instr.Source == nil {
+			s.errorf("SPMDLoad: Contiguous is true but Source is nil")
+		}
+		if !instr.Contiguous && instr.Source != nil {
+			s.errorf("SPMDLoad: Contiguous is false but Source is non-nil")
+		}
 
 	case *SPMDStore:
 		if instr.Lanes <= 0 {
@@ -237,6 +243,12 @@ func (s *sanity) checkInstr(idx int, instr Instruction) {
 		} else if !types.Identical(instr.Val.Type(), ptrType.Elem()) {
 			s.errorf("SPMDStore: Val type %s does not match Addr element type %s",
 				instr.Val.Type(), ptrType.Elem())
+		}
+		if instr.Contiguous && instr.Source == nil {
+			s.errorf("SPMDStore: Contiguous is true but Source is nil")
+		}
+		if !instr.Contiguous && instr.Source != nil {
+			s.errorf("SPMDStore: Contiguous is false but Source is non-nil")
 		}
 
 	case *SPMDIndex:

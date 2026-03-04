@@ -224,6 +224,12 @@ func predicateSPMDFuncBody(fn *Function) {
 		predicateVaryingBreaks(fn, fl, vbreaks, lanes, activeMask)
 	}
 
+	// Step 2.5: Convert remaining straight-line loads/stores to SPMDLoad/SPMDStore.
+	// After Step 1 (which converted loads/stores inside varying branches),
+	// there may still be plain UnOp{MUL}/Store instructions in straight-line
+	// code. Convert them so TinyGo has a uniform instruction set to handle.
+	spmdConvertAllMemOps(fn, activeMask, lanes)
+
 	// Step 3: Set mask on remaining SPMD function calls that weren't inside
 	// a varying if/else/switch (which already got narrowed masks).
 	spmdMaskCallOps(fn, activeMask)
@@ -1881,6 +1887,155 @@ func spmdReplaceSwitchPhisWithChainedSelect(
 	// rewired away from doneBlock. No further cleanup is needed here.
 }
 
+// spmdConvertAllMemOps converts remaining UnOp{MUL}/Store in fn to
+// SPMDLoad/SPMDStore with the given mask. Called AFTER predicateSPMDScope
+// (which already converted loads/stores inside varying branches).
+// Instructions already converted (SPMDLoad/SPMDStore) are skipped by the type switch.
+// Only converts loads/stores of SPMD-compatible element types (basic types,
+// SPMDType). Struct/interface/map/slice stores (e.g., from fmt.Printf)
+// are left as regular instructions since TinyGo can't vectorize them.
+//
+// No contiguity detection is performed here. spmdIsContiguousIndex checks
+// against SPMDLoop IterPhis, and function bodies have no SPMDLoops.
+// Contiguous access in function bodies is detected by TinyGo's
+// spmdContiguousPtr map during IndexAddr compilation.
+func spmdConvertAllMemOps(fn *Function, mask Value, lanes int) {
+	for _, block := range fn.Blocks {
+		for i := 0; i < len(block.Instrs); i++ {
+			instr := block.Instrs[i]
+
+			switch instr := instr.(type) {
+			case *UnOp:
+				if instr.Op != token.MUL {
+					continue
+				}
+				// Only convert loads of SPMD-compatible element types.
+				if !spmdIsVectorizableElemType(instr.Type()) {
+					continue
+				}
+				// Replace pointer load with SPMDLoad.
+				load := &SPMDLoad{
+					Addr:  instr.X,
+					Mask:  mask,
+					Lanes: lanes,
+					pos:   instr.Pos(),
+				}
+				load.setType(instr.Type())
+				load.setBlock(block)
+
+				// Update referrers.
+				spmdAddReferrer(instr.X, load)
+				spmdAddReferrer(mask, load)
+
+				block.Instrs[i] = load
+
+				// Replace all uses of the old UnOp with SPMDLoad.
+				replaceAll(instr, load)
+
+				// Remove old UnOp's operand referrers.
+				if refs := instr.X.Referrers(); refs != nil {
+					*refs = removeInstr(*refs, instr)
+				}
+				instr.block = nil
+
+			case *Store:
+				// Only convert stores of SPMD-compatible element types.
+				if !spmdIsVectorizableElemType(instr.Val.Type()) {
+					continue
+				}
+				// Replace store with SPMDStore.
+				store := &SPMDStore{
+					Addr:  instr.Addr,
+					Val:   instr.Val,
+					Mask:  mask,
+					Lanes: lanes,
+					pos:   instr.Pos(),
+				}
+				store.setBlock(block)
+
+				// Update referrers.
+				spmdAddReferrer(instr.Addr, store)
+				spmdAddReferrer(instr.Val, store)
+				spmdAddReferrer(mask, store)
+
+				block.Instrs[i] = store
+
+				// Remove old Store's operand referrers.
+				if refs := instr.Addr.Referrers(); refs != nil {
+					*refs = removeInstr(*refs, instr)
+				}
+				if refs := instr.Val.Referrers(); refs != nil {
+					*refs = removeInstr(*refs, instr)
+				}
+				instr.block = nil
+			}
+		}
+	}
+}
+
+// spmdIsVectorizableElemType reports whether t is a type that TinyGo can
+// vectorize via LLVM masked load/store intrinsics. Only basic numeric/bool
+// types and SPMDType are supported. Struct, interface, slice, map, array,
+// and other complex types are not vectorizable.
+func spmdIsVectorizableElemType(t types.Type) bool {
+	switch t := t.Underlying().(type) {
+	case *types.Basic:
+		switch t.Kind() {
+		case types.Bool,
+			types.Int8, types.Uint8,
+			types.Int16, types.Uint16,
+			types.Int32, types.Uint32, types.Float32,
+			types.Int64, types.Uint64, types.Float64,
+			types.Int, types.Uint, types.Uintptr:
+			return true
+		}
+	case *types.Pointer:
+		return true
+	}
+	// SPMDType is always vectorizable.
+	if _, ok := t.(*types.SPMDType); ok {
+		return true
+	}
+	return false
+}
+
+// spmdIsContiguousIndex reports whether index traces back to an SPMD loop's
+// IterPhi (or scalar+IterPhi BinOp), indicating contiguous lane addresses.
+// Unwraps ChangeType/Convert chains since the type checker wraps the
+// iter phi in changetype Varying[int] <- int.
+// Runs during predication (before peeling), so IterPhi is valid.
+// For function bodies (no SPMDLoops), always returns false.
+func spmdIsContiguousIndex(fn *Function, index Value) bool {
+	// Unwrap ChangeType/Convert chains to find underlying value.
+	unwrap := func(v Value) Value {
+		for {
+			switch u := v.(type) {
+			case *ChangeType:
+				v = u.X
+			case *Convert:
+				v = u.X
+			default:
+				return v
+			}
+		}
+	}
+	index = unwrap(index)
+	for _, loop := range fn.SPMDLoops {
+		if loop.IterPhi == nil {
+			continue
+		}
+		if index == loop.IterPhi {
+			return true
+		}
+		if binop, ok := index.(*BinOp); ok && binop.Op == token.ADD {
+			if unwrap(binop.X) == loop.IterPhi || unwrap(binop.Y) == loop.IterPhi {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // spmdMaskMemOps walks block b and replaces:
 //   - UnOp{Op: token.MUL} (pointer load) with SPMDLoad(addr, mask, lanes)
 //   - Store{} with SPMDStore(addr, val, mask, lanes)
@@ -1900,12 +2055,22 @@ func spmdMaskMemOps(b *BasicBlock, mask Value, lanes int) {
 				Lanes: lanes,
 				pos:   instr.Pos(),
 			}
+			// Detect contiguous access via IndexAddr with iter-based index.
+			if indexAddr, ok := instr.X.(*IndexAddr); ok {
+				if spmdIsContiguousIndex(b.parent, indexAddr.Index) {
+					load.Contiguous = true
+					load.Source = indexAddr.X
+				}
+			}
 			load.setType(instr.Type())
 			load.setBlock(b)
 
 			// Update referrers.
 			spmdAddReferrer(instr.X, load)
 			spmdAddReferrer(mask, load)
+			if load.Source != nil {
+				spmdAddReferrer(load.Source, load)
+			}
 
 			b.Instrs[i] = load
 
@@ -1927,12 +2092,22 @@ func spmdMaskMemOps(b *BasicBlock, mask Value, lanes int) {
 				Lanes: lanes,
 				pos:   instr.Pos(),
 			}
+			// Detect contiguous access via IndexAddr with iter-based index.
+			if indexAddr, ok := instr.Addr.(*IndexAddr); ok {
+				if spmdIsContiguousIndex(b.parent, indexAddr.Index) {
+					store.Contiguous = true
+					store.Source = indexAddr.X
+				}
+			}
 			store.setBlock(b)
 
 			// Update referrers.
 			spmdAddReferrer(instr.Addr, store)
 			spmdAddReferrer(instr.Val, store)
 			spmdAddReferrer(mask, store)
+			if store.Source != nil {
+				spmdAddReferrer(store.Source, store)
+			}
 
 			b.Instrs[i] = store
 
