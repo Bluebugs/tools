@@ -2125,6 +2125,63 @@ func main() {}
 	}
 }
 
+// TestPredicateSPMD_FuncBodyVaryingIfElse verifies that a varying if/else
+// inside a function body (no loop, no break) is linearized by
+// predicateSPMDFuncBody: the varying If is replaced by Jumps and the merge
+// phi is rewritten to an SPMDSelect.
+func TestPredicateSPMD_FuncBodyVaryingIfElse(t *testing.T) {
+	src := `package main
+import "lanes"
+func f(v lanes.Varying[int]) lanes.Varying[int] {
+	var result lanes.Varying[int]
+	vi := lanes.Varying[int](10)
+	if v > vi {
+		result = v
+	} else {
+		result = vi
+	}
+	return result
+}
+func main() {}
+`
+	pkg := buildSPMDFuncBody(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+
+	// The varying If must have been linearized — no "if varying" should remain.
+	if strings.Contains(output, "if varying") {
+		t.Errorf("varying If was not linearized by predicateSPMDFuncBody:\n%s", output)
+	}
+
+	// predicateSPMDFuncBody rewrites the merge phi to an SPMDSelect.
+	if !strings.Contains(output, "spmd_select") {
+		t.Errorf("expected spmd_select for if/else merge:\n%s", output)
+	}
+
+	// Mask computation instructions must be present.
+	if !strings.Contains(output, "lanes.Varying[mask]") {
+		t.Errorf("expected mask computation instructions from predicateSPMDFuncBody:\n%s", output)
+	}
+
+	// Confirm via struct inspection that no varying If instructions survive.
+	for _, block := range fn.Blocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		if ifInstr, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok {
+			if ifInstr.IsVarying {
+				t.Errorf("block %d still has a varying If after predicateSPMDFuncBody", block.Index)
+			}
+		}
+	}
+}
+
 // TestPredicateSPMD_VaryingBreakNoLoop verifies that an SPMD function body
 // without a for-loop is not affected by predicateSPMDFuncBody.
 func TestPredicateSPMD_VaryingBreakNoLoop(t *testing.T) {
