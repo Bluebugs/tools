@@ -112,6 +112,14 @@ func predicateSPMDScope(fn *Function, scopeBlocks map[*BasicBlock]bool, lanes in
 	// We iterate fn.Blocks in program order, which is sufficient for
 	// non-nested varying Ifs. For nested mask threading (Phase 8),
 	// dominator-tree order will be needed.
+	//
+	// Loop-header merge trampolines (spmdInsertMergeTrampoline) are only
+	// inserted in SPMD function body context (spmdLoopBlock == nil), not
+	// in go-for SPMD loop context (spmdLoopBlock != nil). In go-for loops,
+	// TinyGo's own mask transitions (pushThen/swapElse/pop) handle this
+	// pattern. Applying SSA-level predication would conflict with TinyGo's
+	// byte-widening codegen for WASM targets.
+	allowLoopHeaderMerge := spmdLoopBlock == nil
 	for _, block := range fn.Blocks {
 		if !scopeBlocks[block] {
 			continue
@@ -124,7 +132,7 @@ func predicateSPMDScope(fn *Function, scopeBlocks map[*BasicBlock]bool, lanes in
 			continue // skip boolean-chain and switch-chain Ifs
 		}
 		// linearize this varying If.
-		predicateVaryingIf(fn, lanes, block, vif)
+		predicateVaryingIf(fn, lanes, block, vif, allowLoopHeaderMerge)
 	}
 
 	// Linearize each varying switch chain whose DoneBlock is in scope.
@@ -865,7 +873,7 @@ func spmdLoopScopeBlocks(loop *SPMDLoopInfo) map[*BasicBlock]bool {
 //	T: ... [SPMDLoad/SPMDStore with then_mask] ... jump E
 //	E: ... [SPMDLoad/SPMDStore with else_mask] ... jump M
 //	M: SPMDSelect(then_mask, v1, v2) replaces phi [T: v1, E: v2] ...
-func predicateVaryingIf(fn *Function, lanes int, ifBlock *BasicBlock, vif *If) {
+func predicateVaryingIf(fn *Function, lanes int, ifBlock *BasicBlock, vif *If, allowLoopHeaderMerge bool) {
 	thenBlock := ifBlock.Succs[0] // If.Cond true → Succs[0]
 	elseBlock := ifBlock.Succs[1] // If.Cond false → Succs[1]
 
@@ -873,9 +881,20 @@ func predicateVaryingIf(fn *Function, lanes int, ifBlock *BasicBlock, vif *If) {
 	// Returns nil for complex patterns (compound booleans, multi-block chains).
 	mergeBlock := findMergeBlock(thenBlock, elseBlock)
 	if mergeBlock == nil {
-		// Cannot safely linearize this varying If (complex CFG structure).
-		// Leave it as-is; the TinyGo backend will handle it with its own masking.
-		return
+		// Check for loop-header merge pattern: both branches converge
+		// to the same block but it has >2 predecessors (loop header).
+		// Insert a trampoline merge block to create a proper diamond.
+		// Only allowed in SPMD function body context, not go-for loops
+		// (where TinyGo's mask transitions handle this pattern).
+		if allowLoopHeaderMerge &&
+			len(thenBlock.Succs) == 1 && len(elseBlock.Succs) == 1 &&
+			thenBlock.Succs[0] == elseBlock.Succs[0] {
+			loopHeader := thenBlock.Succs[0]
+			mergeBlock = spmdInsertMergeTrampoline(fn, thenBlock, elseBlock, loopHeader)
+		}
+		if mergeBlock == nil {
+			return // genuinely complex pattern, skip
+		}
 	}
 
 	// Compute the active mask. For now we use the all-ones constant mask
@@ -968,6 +987,160 @@ func findMergeBlock(thenBlock, elseBlock *BasicBlock) *BasicBlock {
 	return nil
 }
 
+// spmdInsertMergeTrampoline creates a new block between thenBlock/elseBlock and
+// their shared successor (the loop header). It redirects both branches to the
+// new merge block, which then jumps to the original successor. Phis at the
+// successor that referenced thenBlock/elseBlock are updated to reference the
+// merge block, with new phis in the merge block if the then/else values differ.
+//
+// This handles the "loop-header merge" pattern where a varying if/else inside a
+// loop has both branches jumping back to the loop header. The loop header has
+// 3+ predecessors (entry + then + else), so findMergeBlock rejects it. By
+// inserting a trampoline, we create a proper 2-predecessor merge block that
+// findMergeBlock's caller can predicate normally.
+func spmdInsertMergeTrampoline(fn *Function, thenBlock, elseBlock, loopBlock *BasicBlock) *BasicBlock {
+	// Step 1: Create new merge block.
+	mergeBlock := fn.newBasicBlock("spmd.merge")
+
+	// Step 2: Add Jump instruction in merge block → loopBlock.
+	jmp := &Jump{}
+	jmp.setBlock(mergeBlock)
+	mergeBlock.Instrs = append(mergeBlock.Instrs, jmp)
+
+	// Step 3: Rewire thenBlock and elseBlock successors from loopBlock → mergeBlock.
+	thenBlock.replaceSucc(loopBlock, mergeBlock)
+	elseBlock.replaceSucc(loopBlock, mergeBlock)
+
+	// Step 4: Set up mergeBlock's predecessor/successor edges.
+	mergeBlock.Preds = []*BasicBlock{thenBlock, elseBlock}
+	addEdge(mergeBlock, loopBlock)
+	// addEdge appends mergeBlock to loopBlock.Preds, but we still need to
+	// remove thenBlock and elseBlock from loopBlock.Preds and fix phis.
+	// We handle this below.
+
+	// Step 5: Update loopBlock's phis and predecessor list.
+	// For each phi in loopBlock, find the edges from thenBlock and elseBlock.
+	// Replace both with a single edge from mergeBlock. If the values differ,
+	// create a phi in mergeBlock.
+	for _, instr := range loopBlock.Instrs {
+		phi, ok := instr.(*Phi)
+		if !ok {
+			break // phis are always first
+		}
+		var thenVal, elseVal Value
+		var thenIdx, elseIdx int = -1, -1
+		for j, pred := range loopBlock.Preds {
+			if pred == thenBlock {
+				thenVal = phi.Edges[j]
+				thenIdx = j
+			} else if pred == elseBlock {
+				elseVal = phi.Edges[j]
+				elseIdx = j
+			}
+		}
+		if thenIdx == -1 || elseIdx == -1 {
+			// Phi doesn't reference both then/else — should not happen
+			// in the expected pattern, but be defensive. Still grow
+			// Edges to match the Preds growth from addEdge (Step 4).
+			// Use the first edge value as a placeholder; Step 6's
+			// spmdRemovePredAt will shrink it back to the correct length.
+			phi.Edges = append(phi.Edges, phi.Edges[0])
+			continue
+		}
+
+		// Determine the value for the mergeBlock edge.
+		var mergeVal Value
+		if thenVal == elseVal {
+			// Both edges carry the same value — no new phi needed.
+			// Remove one referrer entry: two edges (then+else) collapse
+			// to one (merge), so net count should decrease by 1.
+			mergeVal = thenVal
+			if refs := mergeVal.Referrers(); refs != nil {
+				*refs = removeInstr(*refs, phi)
+			}
+		} else {
+			// Different values: create a phi in mergeBlock.
+			mergePhi := &Phi{Comment: "spmd.merge"}
+			mergePhi.setType(phi.Type())
+			// mergeBlock.Preds = [thenBlock, elseBlock]
+			mergePhi.Edges = []Value{thenVal, elseVal}
+			spmdInsertPhiAtFront(mergeBlock, mergePhi)
+			spmdAddReferrer(thenVal, mergePhi)
+			spmdAddReferrer(elseVal, mergePhi)
+			mergeVal = mergePhi
+		}
+
+		// The mergeBlock edge was added by addEdge at the end of loopBlock.Preds.
+		// Set its phi edge value.
+		mergeEdgeIdx := len(loopBlock.Preds) - 1
+		phi.Edges = append(phi.Edges, nil) // grow to match Preds length
+		phi.Edges[mergeEdgeIdx] = mergeVal
+		spmdAddReferrer(mergeVal, phi)
+
+		// Remove referrers for old then/else edge values that are no longer
+		// referenced by this phi. When mergeVal is the same as thenVal/elseVal,
+		// the phi still references that value through the merge edge, so we
+		// must NOT remove its referrer entry (removeInstr removes ALL occurrences).
+		if thenVal != mergeVal {
+			if refs := thenVal.Referrers(); refs != nil {
+				*refs = removeInstr(*refs, phi)
+			}
+		}
+		if elseVal != mergeVal && elseVal != thenVal {
+			if refs := elseVal.Referrers(); refs != nil {
+				*refs = removeInstr(*refs, phi)
+			}
+		}
+	}
+
+	// Step 6: Remove thenBlock and elseBlock from loopBlock.Preds.
+	// We must remove them carefully to preserve edge ordering for other phis.
+	// Remove the higher index first to avoid shifting issues.
+	// Find their indices in the current Preds list.
+	var thenPredIdx, elsePredIdx int = -1, -1
+	for i, pred := range loopBlock.Preds {
+		if pred == thenBlock && thenPredIdx == -1 {
+			thenPredIdx = i
+		} else if pred == elseBlock && elsePredIdx == -1 {
+			elsePredIdx = i
+		}
+	}
+
+	if thenPredIdx == -1 || elsePredIdx == -1 {
+		// Should never happen: the trampoline condition guarantees both
+		// are predecessors of loopBlock.
+		return mergeBlock
+	}
+
+	// Remove higher index first.
+	if thenPredIdx > elsePredIdx {
+		spmdRemovePredAt(loopBlock, thenPredIdx)
+		spmdRemovePredAt(loopBlock, elsePredIdx)
+	} else {
+		spmdRemovePredAt(loopBlock, elsePredIdx)
+		spmdRemovePredAt(loopBlock, thenPredIdx)
+	}
+
+	return mergeBlock
+}
+
+// spmdRemovePredAt removes the predecessor at index idx from block b,
+// along with the corresponding phi edges. Does not use removePred because
+// we need index-based removal to handle the case where we're removing
+// two specific predecessors and need to preserve ordering.
+func spmdRemovePredAt(b *BasicBlock, idx int) {
+	// Remove from Preds.
+	b.Preds = append(b.Preds[:idx], b.Preds[idx+1:]...)
+
+	// Remove corresponding phi edges.
+	for _, instr := range b.Instrs {
+		phi, ok := instr.(*Phi)
+		if !ok {
+			break
+		}
+		phi.Edges = append(phi.Edges[:idx], phi.Edges[idx+1:]...)
+	}
+}
 
 // spmdAllOnesMask returns a Const of type Varying[mask] representing all lanes active.
 // This is the outermost active mask (no enclosing varying if).

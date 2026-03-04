@@ -1305,12 +1305,11 @@ func main() {
 
 // TestPredicateSPMD_LoopBackNotLinearized verifies that a varying if/else
 // whose both branches jump back to the loop header is NOT linearized by
-// predicateSPMD. In this pattern the "merge block" is the loop header, which
-// has extra predecessors (the loop entry) and loop-carried Phis — not if/else
-// merge Phis. Replacing those Phis with SPMDSelect would violate SSA dominance
-// (the mask is computed inside the loop body but referenced in the loop header,
-// which precedes the body in DomPreorder). findMergeBlock now rejects such
-// merge blocks by requiring exactly two predecessors.
+// predicateSPMD in go-for SPMD loop context. In this pattern the "merge block"
+// is the loop header, which has extra predecessors (the loop entry) and
+// loop-carried Phis — not if/else merge Phis. The loop-header merge trampoline
+// is only inserted in SPMD function body context (no go-for loop), so in
+// go-for context the pattern is left for TinyGo's mask transitions.
 func TestPredicateSPMD_LoopBackNotLinearized(t *testing.T) {
 	// This pattern models a rangeindex loop (range over slice) where the
 	// if/else branches both jump back to the loop header. The loop header
@@ -1365,6 +1364,21 @@ func main() { encode(make([]byte, 4), make([]byte, 2)) }
 				t.Errorf("rangeindex.loop has SPMDSelect: loop-back if/else was incorrectly linearized")
 			}
 		}
+	}
+
+	// The varying If must still exist — it was NOT linearized in go-for context.
+	var foundVaryingIf bool
+	for _, block := range encodeFn.Blocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		if vif, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok && vif.IsVarying {
+			foundVaryingIf = true
+			break
+		}
+	}
+	if !foundVaryingIf {
+		t.Error("expected varying If to persist in go-for context (trampoline not applied)")
 	}
 }
 
@@ -2331,5 +2345,106 @@ func main() {}
 	}
 	if strings.Contains(output, "spmd_select") {
 		t.Errorf("unexpected spmd_select in SPMD function without loop:\n%s", output)
+	}
+}
+
+// TestPredicateSPMD_LoopHeaderMerge verifies that a varying if/else inside a
+// loop in an SPMD function body (not go-for) where both branches jump back to
+// the loop header is predicated by inserting an spmd.merge trampoline block.
+// The varying If is linearized and memory ops are masked. Loop-carried phis
+// at the loop header are NOT replaced.
+func TestPredicateSPMD_LoopHeaderMerge(t *testing.T) {
+	// SPMD function body context: function has lanes.Varying[int] parameter.
+	// The for-loop inside is a regular loop (not go-for), so
+	// allowLoopHeaderMerge = true and the trampoline is inserted.
+	src := `package main
+import "lanes"
+func f(v lanes.Varying[int], data []int) {
+	for i := 0; i < len(data); i++ {
+		if v > lanes.Varying[int](5) {
+			data[i] = 10
+		} else {
+			data[i] = 20
+		}
+	}
+}
+func main() {}
+`
+	pkg := buildSPMDFuncBody(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+
+	// 1. No varying Ifs should remain (all linearized).
+	if strings.Contains(output, "if varying") {
+		t.Errorf("varying If was not linearized:\n%s", output)
+	}
+
+	// 2. Mask computation instructions must be present.
+	if !strings.Contains(output, "lanes.Varying[mask]") {
+		t.Errorf("expected mask computation instructions:\n%s", output)
+	}
+
+	// 3. Loop header blocks must NOT have SPMDSelect — loop-carried phis are preserved.
+	for _, block := range fn.Blocks {
+		if !strings.Contains(block.Comment, "for.loop") {
+			continue
+		}
+		for _, instr := range block.Instrs {
+			if _, ok := instr.(*ssa.SPMDSelect); ok {
+				t.Errorf("loop header block %q has SPMDSelect — loop-carried phi was incorrectly replaced", block.Comment)
+			}
+		}
+	}
+
+	// 4. Confirm via struct inspection that no varying If instructions survive.
+	for _, block := range fn.Blocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		if ifInstr, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok {
+			if ifInstr.IsVarying {
+				t.Errorf("block %d still has a varying If after predication", block.Index)
+			}
+		}
+	}
+}
+
+// TestPredicateSPMD_LoopHeaderMergeSanity verifies that the SSA sanity checker
+// passes after loop-header merge trampoline insertion in SPMD function body context.
+func TestPredicateSPMD_LoopHeaderMergeSanity(t *testing.T) {
+	src := `package main
+import "lanes"
+func f(v lanes.Varying[int], data []int) {
+	for i := 0; i < len(data); i++ {
+		if v > lanes.Varying[int](5) {
+			data[i] = 10
+		} else {
+			data[i] = 20
+		}
+	}
+}
+func main() {}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No setSPMDOnRange — this is SPMD function body context (varying params).
+
+	// SanityCheckFunctions panics if dominance is violated.
+	_, _, err = ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{f},
+		ssa.SanityCheckFunctions,
+	)
+	if err != nil {
+		t.Fatalf("BuildPackage failed (sanity check): %v", err)
 	}
 }
