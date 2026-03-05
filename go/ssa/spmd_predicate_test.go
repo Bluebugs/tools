@@ -3480,3 +3480,163 @@ func main() { f(make([]int, 16)) }
 		t.Fatalf("SanityCheck failed: %v", err)
 	}
 }
+
+// TestPredicateSPMD_GoForLoopIndexMask verifies that IndexAddr instructions
+// with varying (SPMDType) indices inside a go-for loop scope get SPMDMask set
+// to the all-ones mask by spmdMaskScopedIndexOps.
+func TestPredicateSPMD_GoForLoopIndexMask(t *testing.T) {
+	src := `package main
+import "lanes"
+
+func f(data []int, n int) {
+	for i := range n {
+		vi := lanes.Varying[int](i)
+		_ = data[vi]
+	}
+}
+
+func main() { f(make([]int, 16), 16) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	// Find IndexAddr instructions in the function.
+	var indexAddrs []*ssa.IndexAddr
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			if ia, ok := instr.(*ssa.IndexAddr); ok {
+				indexAddrs = append(indexAddrs, ia)
+			}
+		}
+	}
+
+	if len(indexAddrs) == 0 {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Fatalf("expected at least one IndexAddr instruction:\n%s", buf.String())
+	}
+
+	// At least one IndexAddr should have SPMDMask set (the one with varying index).
+	found := false
+	for _, ia := range indexAddrs {
+		if _, ok := ia.Index.Type().(*types.SPMDType); ok {
+			if ia.SPMDMask == nil {
+				var buf bytes.Buffer
+				ssa.WriteFunction(&buf, fn)
+				t.Errorf("IndexAddr with SPMDType index has nil SPMDMask:\n%s", buf.String())
+			} else {
+				found = true
+			}
+		}
+	}
+	if !found {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Errorf("no IndexAddr with SPMDType index found:\n%s", buf.String())
+	}
+}
+
+// TestPredicateSPMD_GoForLoopTailMask verifies that a peeled SPMD loop gets
+// a TailMask virtual parameter set by predicateSPMDLoop / spmdConvertLoopOps.
+func TestPredicateSPMD_GoForLoopTailMask(t *testing.T) {
+	src := `package main
+
+func f(data []int, n int) {
+	for i := range n {
+		_ = data[i]
+	}
+}
+
+func main() { f(make([]int, 16), 16) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	if len(fn.SPMDLoops) == 0 {
+		t.Fatal("expected at least one SPMDLoop")
+	}
+
+	loop := fn.SPMDLoops[0]
+	if !loop.IsPeeled {
+		t.Skip("loop not peeled; TailMask only created for peeled loops")
+	}
+
+	if loop.TailMask == nil {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Errorf("peeled loop should have TailMask set:\n%s", buf.String())
+	} else {
+		param, ok := loop.TailMask.(*ssa.Parameter)
+		if !ok {
+			t.Errorf("TailMask should be *ssa.Parameter, got %T", loop.TailMask)
+		} else if param.Name() != "spmd.tail.mask" {
+			t.Errorf("TailMask name = %q, want %q", param.Name(), "spmd.tail.mask")
+		}
+	}
+}
+
+// TestPredicateSPMD_IndexMaskInVaryingIf verifies that an IndexAddr with a
+// varying index inside a varying-if block gets a narrowed mask — not the
+// all-ones loop-scope mask — because spmdMaskMemOps sets a sub-mask on the
+// then/else blocks before spmdMaskScopedIndexOps runs.
+func TestPredicateSPMD_IndexMaskInVaryingIf(t *testing.T) {
+	src := `package main
+import "lanes"
+
+func f(data []int, n int) {
+	for i := range n {
+		vi := lanes.Varying[int](i)
+		if vi > 0 {
+			_ = data[vi]
+		}
+	}
+}
+
+func main() { f(make([]int, 16), 16) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	// Collect IndexAddr instructions that have SPMDMask set.
+	var maskedIndexAddrs []*ssa.IndexAddr
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			if ia, ok := instr.(*ssa.IndexAddr); ok {
+				if ia.SPMDMask != nil {
+					maskedIndexAddrs = append(maskedIndexAddrs, ia)
+				}
+			}
+		}
+	}
+
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+
+	if len(maskedIndexAddrs) == 0 {
+		t.Fatalf("expected at least one IndexAddr with SPMDMask:\n%s", output)
+	}
+
+	// The mask on the IndexAddr inside the varying-if should NOT be the
+	// all-ones constant: it should be a narrowed mask derived from the condition.
+	// An all-ones constant would be a *ssa.Const with bool value true.
+	for _, ia := range maskedIndexAddrs {
+		c, ok := ia.SPMDMask.(*ssa.Const)
+		if !ok {
+			// Non-constant mask — this is the narrowed mask we expect.
+			continue
+		}
+		if c.Value != nil && c.Value.Kind() == constant.Bool && constant.BoolVal(c.Value) {
+			t.Errorf("IndexAddr inside varying-if has all-ones constant mask; expected narrowed mask:\n%s", output)
+		}
+	}
+}

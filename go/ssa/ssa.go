@@ -420,6 +420,7 @@ type SPMDLoopInfo struct {
 	TailBodyBlock   *BasicBlock // tail loop body (masked, at most once)
 	TrampolineBlock *BasicBlock // accumulator merge block before DoneBlock (nil if no accumulators)
 	AlignedBound    Value       // bound & ~(laneCount-1)
+	TailMask        Value       // virtual parameter representing the tail mask; TinyGo materializes it
 	MainIterPhi     *Phi        // iter phi in MainBodyBlock
 	TailIterPhi     *Phi        // iter phi in TailCheckBlock
 
@@ -1026,8 +1027,9 @@ type Field struct {
 //	t2 = &t0[t1]
 type IndexAddr struct {
 	register
-	X     Value // *array, slice or type parameter with types array, *array, or slice.
-	Index Value // numeric index
+	X        Value // *array, slice or type parameter with types array, *array, or slice.
+	Index    Value // numeric index
+	SPMDMask Value // nil = no masking; set for varying indices in SPMD scope
 }
 
 // The Index instruction yields element Index of collection X, an array,
@@ -1042,8 +1044,9 @@ type IndexAddr struct {
 //	t2 = t0[t1]
 type Index struct {
 	register
-	X     Value // array, string or type parameter with types array, *array, slice, or string.
-	Index Value // integer index
+	X        Value // array, string or type parameter with types array, *array, slice, or string.
+	Index    Value // integer index
+	SPMDMask Value // nil = no masking; set for varying indices in SPMD scope
 }
 
 // The Lookup instruction yields element Index of collection map X.
@@ -1920,11 +1923,19 @@ func (s *If) Operands(rands []*Value) []*Value {
 }
 
 func (v *Index) Operands(rands []*Value) []*Value {
-	return append(rands, &v.X, &v.Index)
+	rands = append(rands, &v.X, &v.Index)
+	if v.SPMDMask != nil {
+		rands = append(rands, &v.SPMDMask)
+	}
+	return rands
 }
 
 func (v *IndexAddr) Operands(rands []*Value) []*Value {
-	return append(rands, &v.X, &v.Index)
+	rands = append(rands, &v.X, &v.Index)
+	if v.SPMDMask != nil {
+		rands = append(rands, &v.SPMDMask)
+	}
+	return rands
 }
 
 func (*Jump) Operands(rands []*Value) []*Value {

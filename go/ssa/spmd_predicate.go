@@ -129,7 +129,7 @@ func spmdConvertLoopOps(fn *Function) {
 	if len(fn.SPMDLoops) == 0 {
 		return
 	}
-	activeMask := spmdAllOnesMask()
+	allOnesMask := spmdAllOnesMask()
 	for _, loop := range fn.SPMDLoops {
 		// Recompute scope blocks post-peeling: BFS over live blocks.
 		// spmdLoopScopeBlocks uses loop.BodyBlock and loop.LoopBlock as roots;
@@ -186,8 +186,34 @@ func spmdConvertLoopOps(fn *Function) {
 		if len(liveScopeBlocks) == 0 {
 			continue
 		}
-		spmdConvertScopedMemOps(fn, liveScopeBlocks, activeMask, loop.LaneCount)
-		spmdMaskScopedCallOps(fn, liveScopeBlocks, activeMask)
+
+		// Create tail mask virtual parameter for this loop if peeled.
+		if loop.IsPeeled && loop.TailMask == nil {
+			loop.TailMask = &Parameter{name: "spmd.tail.mask", typ: spmdpkg.NewVaryingMask(), parent: fn}
+		}
+
+		// Separate main vs tail blocks so each phase gets the appropriate mask.
+		tailBlocks := spmdTailScopeBlocks(loop, liveScopeBlocks)
+		mainBlocks := make(map[*BasicBlock]bool)
+		for b := range liveScopeBlocks {
+			if !tailBlocks[b] {
+				mainBlocks[b] = true
+			}
+		}
+
+		// Convert main blocks with all-ones mask (every lane is active).
+		spmdConvertScopedMemOps(fn, mainBlocks, allOnesMask, loop.LaneCount)
+		spmdMaskScopedCallOps(fn, mainBlocks, allOnesMask)
+		spmdMaskScopedIndexOps(fn, mainBlocks, allOnesMask)
+
+		// Convert tail blocks with the tail mask (partial last iteration).
+		tailMask := Value(allOnesMask)
+		if loop.TailMask != nil {
+			tailMask = loop.TailMask
+		}
+		spmdConvertScopedMemOps(fn, tailBlocks, tailMask, loop.LaneCount)
+		spmdMaskScopedCallOps(fn, tailBlocks, tailMask)
+		spmdMaskScopedIndexOps(fn, tailBlocks, tailMask)
 	}
 }
 
@@ -354,6 +380,10 @@ func predicateSPMDFuncBody(fn *Function) {
 	// there may still be plain UnOp{MUL}/Store instructions in straight-line
 	// code. Convert them so TinyGo has a uniform instruction set to handle.
 	spmdConvertAllMemOps(fn, activeMask, lanes)
+
+	// Step 2.6: Set mask on IndexAddr/Index instructions with varying indices.
+	// This enables TinyGo to clamp inactive-lane indices to 0 at compile time.
+	spmdMaskAllIndexOps(fn, activeMask)
 
 	// Step 3: Set mask on remaining SPMD function calls that weren't inside
 	// a varying if/else/switch (which already got narrowed masks).
@@ -1001,6 +1031,46 @@ func spmdLoopScopeBlocks(loop *SPMDLoopInfo) map[*BasicBlock]bool {
 	return scope
 }
 
+// spmdTailScopeBlocks returns the subset of liveScopeBlocks that belong to the
+// tail phase of a peeled SPMD loop. For non-peeled loops, returns an empty map.
+// Identifies tail blocks by BFS from TailBodyBlock bounded by DoneBlock and
+// TrampolineBlock to avoid crossing into the main phase or post-loop blocks.
+func spmdTailScopeBlocks(loop *SPMDLoopInfo, liveScopeBlocks map[*BasicBlock]bool) map[*BasicBlock]bool {
+	tail := make(map[*BasicBlock]bool)
+	if !loop.IsPeeled || loop.TailBodyBlock == nil {
+		return tail
+	}
+	if !liveScopeBlocks[loop.TailBodyBlock] {
+		return tail
+	}
+	queue := []*BasicBlock{loop.TailBodyBlock}
+	tail[loop.TailBodyBlock] = true
+	// Include TailCheckBlock if it is in scope.
+	if loop.TailCheckBlock != nil && liveScopeBlocks[loop.TailCheckBlock] {
+		tail[loop.TailCheckBlock] = true
+		queue = append(queue, loop.TailCheckBlock)
+	}
+	for len(queue) > 0 {
+		b := queue[0]
+		queue = queue[1:]
+		for _, succ := range b.Succs {
+			if tail[succ] || !liveScopeBlocks[succ] {
+				continue
+			}
+			// Stop at phase and post-loop boundaries.
+			if succ == loop.DoneBlock || succ == loop.TrampolineBlock {
+				continue
+			}
+			if succ == loop.MainBodyBlock {
+				continue
+			}
+			tail[succ] = true
+			queue = append(queue, succ)
+		}
+	}
+	return tail
+}
+
 // predicateVaryingIf linearizes a single varying If instruction.
 //
 // Standard pattern (simple diamond or if-without-else):
@@ -1414,6 +1484,38 @@ func spmdMaskScopedCallOps(fn *Function, scopeBlocks map[*BasicBlock]bool, defau
 			}
 			call.Call.SPMDMask = defaultMask
 			spmdAddReferrer(defaultMask, call)
+		}
+	}
+}
+
+// spmdMaskScopedIndexOps sets SPMDMask on IndexAddr/Index instructions with
+// varying (SPMDType) indices in scopeBlocks. Skips instructions that already
+// have SPMDMask set (e.g., by spmdMaskMemOps for varying-if blocks, which
+// narrowed the mask to the then/else sub-mask).
+func spmdMaskScopedIndexOps(fn *Function, scopeBlocks map[*BasicBlock]bool, mask Value) {
+	for _, block := range fn.Blocks {
+		if !scopeBlocks[block] {
+			continue
+		}
+		for _, instr := range block.Instrs {
+			switch v := instr.(type) {
+			case *IndexAddr:
+				if v.SPMDMask != nil {
+					continue
+				}
+				if _, ok := v.Index.Type().(*types.SPMDType); ok {
+					v.SPMDMask = mask
+					spmdAddReferrer(mask, v)
+				}
+			case *Index:
+				if v.SPMDMask != nil {
+					continue
+				}
+				if _, ok := v.Index.Type().(*types.SPMDType); ok {
+					v.SPMDMask = mask
+					spmdAddReferrer(mask, v)
+				}
+			}
 		}
 	}
 }
@@ -2482,6 +2584,35 @@ func spmdConvertAllMemOps(fn *Function, mask Value, lanes int) {
 	}
 }
 
+// spmdMaskAllIndexOps sets SPMDMask on all IndexAddr/Index instructions in fn
+// that have a varying (SPMDType) index and don't already have a mask assigned.
+// Called from predicateSPMDFuncBody for function body scope after
+// spmdConvertAllMemOps has processed loads and stores.
+func spmdMaskAllIndexOps(fn *Function, mask Value) {
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			switch v := instr.(type) {
+			case *IndexAddr:
+				if v.SPMDMask != nil {
+					continue
+				}
+				if _, ok := v.Index.Type().(*types.SPMDType); ok {
+					v.SPMDMask = mask
+					spmdAddReferrer(mask, v)
+				}
+			case *Index:
+				if v.SPMDMask != nil {
+					continue
+				}
+				if _, ok := v.Index.Type().(*types.SPMDType); ok {
+					v.SPMDMask = mask
+					spmdAddReferrer(mask, v)
+				}
+			}
+		}
+	}
+}
+
 // spmdIsVectorizableElemType reports whether t is a type that TinyGo can
 // vectorize via LLVM masked load/store intrinsics. Only basic numeric/bool
 // types and SPMDType are supported. Struct, interface, slice, map, array,
@@ -2634,6 +2765,24 @@ func spmdMaskMemOps(b *BasicBlock, mask Value, lanes int) {
 			callee := instr.Call.StaticCallee()
 			if callee != nil && hasSPMDParams(callee) {
 				instr.Call.SPMDMask = mask
+				spmdAddReferrer(mask, instr)
+			}
+
+		case *IndexAddr:
+			if instr.SPMDMask != nil {
+				continue
+			}
+			if _, ok := instr.Index.Type().(*types.SPMDType); ok {
+				instr.SPMDMask = mask
+				spmdAddReferrer(mask, instr)
+			}
+
+		case *Index:
+			if instr.SPMDMask != nil {
+				continue
+			}
+			if _, ok := instr.Index.Type().(*types.SPMDType); ok {
+				instr.SPMDMask = mask
 				spmdAddReferrer(mask, instr)
 			}
 		}
