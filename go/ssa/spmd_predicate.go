@@ -679,6 +679,10 @@ func predicateVaryingBreaks(fn *Function, fl *spmdRegularForLoop, breaks []*spmd
 	spmdInsertPhiAtFront(loopBlock, breakMaskPhi)
 	spmdAddReferrer(zeroMask, breakMaskPhi) // entry edge
 
+	// SPMDRegularBreaks is populated AFTER Step D (break linearization), because the
+	// key must be the block containing the loop counter If AFTER CFG rewiring.
+	// We update the map at the end of the function after lastElseBlock is known.
+
 	// Step C: Snapshot result phis at doneBlock before any CFG rewiring.
 	// We need the edge values (from then-blocks) before removePred compacts them.
 	type resultPhiInfo struct {
@@ -766,10 +770,15 @@ func predicateVaryingBreaks(fn *Function, fl *spmdRegularForLoop, breaks []*spmd
 		}
 	}
 
+	// Track the last elseBlock — after all breaks are linearized, this is the block
+	// containing the loop counter If (the block TinyGo's *ssa.If handler will visit).
+	var lastElseBlock *BasicBlock
+
 	for _, vb := range breaks {
 		ifBlock := vb.ifBlock
 		thenBlock := vb.thenBlock
 		elseBlock := vb.elseBlock
+		lastElseBlock = elseBlock
 
 		// Relocate FIRST: move thenBlock's non-terminator instructions into
 		// ifBlock before inserting mask ops and SPMDSelect. This ensures values
@@ -894,6 +903,18 @@ func predicateVaryingBreaks(fn *Function, fl *spmdRegularForLoop, breaks []*spmd
 				spmdAddReferrer(runningAccum[i], rpi.phi)
 			}
 		}
+	}
+
+	// Step G: Register the break mask phi in the function so TinyGo can emit an
+	// early-exit check (all-lanes-broken → skip remaining iterations) at the
+	// loop counter If. After CFG linearization in Step D, the loop counter If
+	// lives in lastElseBlock (the continuation after all breaks). Use lastElseBlock
+	// as the key so the TinyGo *ssa.If handler can find it via instr.Block().Index.
+	if lastElseBlock != nil {
+		if fn.SPMDRegularBreaks == nil {
+			fn.SPMDRegularBreaks = make(map[*BasicBlock]*Phi)
+		}
+		fn.SPMDRegularBreaks[lastElseBlock] = breakMaskPhi
 	}
 }
 

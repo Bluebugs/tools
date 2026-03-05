@@ -365,6 +365,14 @@ type Function struct {
 	SPMDSwitchChains   []*SPMDSwitchChain   // varying switch chain metadata; nil if none
 	SPMDBooleanChains  []*SPMDBooleanChain  // compound boolean chain metadata; nil if none
 	SPMDMask           *Parameter           // implicit execution mask for SPMD function bodies; nil if not SPMD
+	// SPMDRegularBreaks maps the loop-counter block (lastElseBlock after CFG
+	// linearization of varying breaks) to the break mask phi inserted by
+	// predicateVaryingBreaks. After linearization, each break's ifBlock jumps to
+	// its elseBlock, forming a chain: ifBlock[0]→elseBlock[0]==ifBlock[1]→...→lastElseBlock.
+	// The lastElseBlock contains the loop-counter If instruction. TinyGo uses this
+	// to emit an early-exit check (all-lanes-broken → skip remaining iterations).
+	// Nil if no regular for-loops with varying breaks exist in this function.
+	SPMDRegularBreaks  map[*BasicBlock]*Phi // lastElseBlock → break mask phi; nil if no varying breaks
 	referrers          []Instruction        // referring instructions (iff Parent() != nil)
 	anonIdx   int32         // position of a nested function in parent's AnonFuncs. fn.Parent()!=nil => fn.Parent().AnonFunc[fn.anonIdx] == fn.
 
