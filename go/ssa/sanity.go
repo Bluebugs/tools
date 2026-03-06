@@ -261,6 +261,11 @@ func (s *sanity) checkInstr(idx int, instr Instruction) {
 			s.errorf("SPMDIndex: ElemType must be a basic type, got %s", instr.ElemType)
 		}
 
+	case *SPMDExtractMask:
+		if instr.Lanes <= 0 {
+			s.errorf("SPMDExtractMask: Lanes must be > 0, got %d", instr.Lanes)
+		}
+
 	default:
 		panic(fmt.Sprintf("Unknown instruction type: %T", instr))
 	}

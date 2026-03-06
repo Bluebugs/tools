@@ -435,6 +435,10 @@ func (v *SPMDIndex) String() string {
 	return fmt.Sprintf("spmd_index<%d, %s>", v.Lanes, relType(v.ElemType, from))
 }
 
+func (v *SPMDExtractMask) String() string {
+	return fmt.Sprintf("spmd_extract_mask<%d> %s", v.Lanes, spmdRelName(v.X, v))
+}
+
 func (s *MapUpdate) String() string {
 	return fmt.Sprintf("%s[%s] = %s", relName(s.Map, s), relName(s.Key, s), relName(s.Value, s))
 }

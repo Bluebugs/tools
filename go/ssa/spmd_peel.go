@@ -136,6 +136,16 @@ func spmdCloneBlock(fn *Function, srcBlock *BasicBlock, dstBlock *BasicBlock,
 			valueMap[v] = newInstr
 			// SPMDIndex has no operand references to register.
 
+		case *SPMDExtractMask:
+			clone := &SPMDExtractMask{
+				X:     spmdTranslateValue(v.X, valueMap),
+				Lanes: v.Lanes,
+			}
+			clone.setBlock(dstBlock)
+			dstBlock.Instrs = append(dstBlock.Instrs, clone)
+			valueMap[v] = clone
+			spmdAddReferrer(clone.X, clone)
+
 		case *IndexAddr:
 			newInstr := &IndexAddr{}
 			newInstr.X = spmdTranslateValue(v.X, valueMap)
@@ -679,7 +689,7 @@ func spmdBodyIsCloneable(block *BasicBlock) bool {
 		case *DebugRef, *Phi, *Jump, *If, *Return, *Panic:
 			// Skipped by spmdCloneBlock; always OK.
 		case *BinOp, *UnOp, *Store, *SPMDStore, *SPMDLoad, *SPMDSelect, *SPMDIndex,
-			*IndexAddr, *FieldAddr, *Convert, *ChangeType, *Call, *Alloc:
+			*SPMDExtractMask, *IndexAddr, *FieldAddr, *Convert, *ChangeType, *Call, *Alloc:
 			// Handled by spmdCloneBlock; OK.
 		default:
 			return false

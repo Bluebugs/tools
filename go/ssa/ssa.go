@@ -15,6 +15,7 @@ import (
 	"go/types"
 	"sync"
 
+	spmdpkg "golang.org/x/tools/go/types/spmd"
 	"golang.org/x/tools/go/types/typeutil"
 	"golang.org/x/tools/internal/typeparams"
 )
@@ -872,7 +873,9 @@ type SliceToArrayPointer struct {
 //	t2 = make Stringer <- t0
 type MakeInterface struct {
 	register
-	X Value
+	X         Value
+	SPMDMask  Value // nil = no masking; set for varying values boxed in masked context
+	SPMDLanes int   // lane count; 0 when SPMDMask is nil
 }
 
 // The MakeClosure instruction yields a closure value whose code is
@@ -1475,6 +1478,22 @@ type SPMDIndex struct {
 	ElemType types.Type // loop's natural element type (byte, int16, int32, etc.)
 }
 
+// SPMDExtractMask extracts the embedded lane mask from an interface value
+// that holds a boxed Varying[T]. The mask records which lanes were active
+// when the value was boxed via MakeInterface with SPMDMask.
+// X must be an interface value.
+// Lanes is the expected lane count.
+// The result type is Varying[mask].
+//
+// Example printed form:
+//
+//	t2 = spmd_extract_mask<4> t0
+type SPMDExtractMask struct {
+	register
+	X     Value // interface value to extract mask from
+	Lanes int   // expected lane count
+}
+
 // The MapUpdate instruction updates the association of Map[Key] to
 // Value.
 //
@@ -1967,7 +1986,11 @@ func (v *MakeClosure) Operands(rands []*Value) []*Value {
 }
 
 func (v *MakeInterface) Operands(rands []*Value) []*Value {
-	return append(rands, &v.X)
+	rands = append(rands, &v.X)
+	if v.SPMDMask != nil {
+		rands = append(rands, &v.SPMDMask)
+	}
+	return rands
 }
 
 func (v *MakeMap) Operands(rands []*Value) []*Value {
@@ -2073,17 +2096,27 @@ func (v *SPMDIndex) Operands(rands []*Value) []*Value {
 	return rands // no value operands; Lanes and ElemType are not Values
 }
 
+func (v *SPMDExtractMask) Operands(rands []*Value) []*Value {
+	return append(rands, &v.X)
+}
+
 // Pos methods for SPMD predicated instructions.
 // SPMDSelect and SPMDIndex return NoPos because they are synthetic nodes
 // with no single source location (analogous to Phi).
 
-func (v *SPMDSelect) Pos() token.Pos { return token.NoPos }
-func (v *SPMDLoad) Pos() token.Pos   { return v.pos }
-func (s *SPMDStore) Pos() token.Pos  { return s.pos }
-func (v *SPMDIndex) Pos() token.Pos  { return token.NoPos }
+func (v *SPMDSelect) Pos() token.Pos     { return token.NoPos }
+func (v *SPMDLoad) Pos() token.Pos       { return v.pos }
+func (s *SPMDStore) Pos() token.Pos      { return s.pos }
+func (v *SPMDIndex) Pos() token.Pos      { return token.NoPos }
+func (v *SPMDExtractMask) Pos() token.Pos { return token.NoPos }
 
 // Type returns Varying[ElemType]. Computed dynamically so SPMDIndex works
 // correctly whether constructed via emitSPMDIndex or directly.
 func (v *SPMDIndex) Type() types.Type {
 	return types.NewVarying(v.ElemType)
+}
+
+// Type returns Varying[mask]. The result is always a mask type.
+func (v *SPMDExtractMask) Type() types.Type {
+	return spmdpkg.NewVaryingMask()
 }
