@@ -205,6 +205,7 @@ func spmdConvertLoopOps(fn *Function) {
 		spmdConvertScopedMemOps(fn, mainBlocks, allOnesMask, loop.LaneCount)
 		spmdMaskScopedCallOps(fn, mainBlocks, allOnesMask)
 		spmdMaskScopedIndexOps(fn, mainBlocks, allOnesMask)
+		spmdMaskScopedMakeInterfaceOps(fn, mainBlocks, allOnesMask, loop.LaneCount)
 
 		// Convert tail blocks with the tail mask (partial last iteration).
 		tailMask := Value(allOnesMask)
@@ -214,6 +215,12 @@ func spmdConvertLoopOps(fn *Function) {
 		spmdConvertScopedMemOps(fn, tailBlocks, tailMask, loop.LaneCount)
 		spmdMaskScopedCallOps(fn, tailBlocks, tailMask)
 		spmdMaskScopedIndexOps(fn, tailBlocks, tailMask)
+		spmdMaskScopedMakeInterfaceOps(fn, tailBlocks, tailMask, loop.LaneCount)
+
+		// Narrow mask at TypeAssert sites in both main and tail blocks.
+		// Use the appropriate base mask for each phase.
+		spmdNarrowMaskAtTypeAsserts(fn, mainBlocks, allOnesMask, loop.LaneCount)
+		spmdNarrowMaskAtTypeAsserts(fn, tailBlocks, tailMask, loop.LaneCount)
 	}
 }
 
@@ -388,6 +395,16 @@ func predicateSPMDFuncBody(fn *Function) {
 	// Step 3: Set mask on remaining SPMD function calls that weren't inside
 	// a varying if/else/switch (which already got narrowed masks).
 	spmdMaskCallOps(fn, activeMask)
+
+	// Step 4: Set mask on MakeInterface instructions that box varying values.
+	spmdMaskAllMakeInterfaceOps(fn, activeMask, lanes)
+
+	// Step 5: Narrow mask at TypeAssert sites that unbox varying interfaces.
+	allBlocks := make(map[*BasicBlock]bool, len(fn.Blocks))
+	for _, b := range fn.Blocks {
+		allBlocks[b] = true
+	}
+	spmdNarrowMaskAtTypeAsserts(fn, allBlocks, activeMask, lanes)
 }
 
 // spmdFuncBodyLaneCount returns the lane count for an SPMD function body by
@@ -1480,6 +1497,16 @@ func spmdConvertScopedMemOps(fn *Function, scopeBlocks map[*BasicBlock]bool, mas
 					*refs = removeInstr(*refs, instr)
 				}
 				instr.block = nil
+
+			case *MakeInterface:
+				if instr.SPMDMask != nil {
+					continue
+				}
+				if _, ok := instr.X.Type().(*types.SPMDType); ok {
+					instr.SPMDMask = mask
+					instr.SPMDLanes = lanes
+					spmdAddReferrer(mask, instr)
+				}
 			}
 		}
 	}
@@ -1537,6 +1564,48 @@ func spmdMaskScopedIndexOps(fn *Function, scopeBlocks map[*BasicBlock]bool, mask
 					spmdAddReferrer(mask, v)
 				}
 			}
+		}
+	}
+}
+
+// spmdMaskScopedMakeInterfaceOps sets SPMDMask on MakeInterface instructions
+// that box SPMDType values in scopeBlocks. Skips instructions that already
+// have SPMDMask set (e.g., by spmdMaskMemOps for varying-if blocks).
+func spmdMaskScopedMakeInterfaceOps(fn *Function, scopeBlocks map[*BasicBlock]bool, defaultMask Value, lanes int) {
+	for _, block := range fn.Blocks {
+		if !scopeBlocks[block] {
+			continue
+		}
+		for _, instr := range block.Instrs {
+			mi, ok := instr.(*MakeInterface)
+			if !ok || mi.SPMDMask != nil {
+				continue
+			}
+			if _, ok := mi.X.Type().(*types.SPMDType); !ok {
+				continue
+			}
+			mi.SPMDMask = defaultMask
+			mi.SPMDLanes = lanes
+			spmdAddReferrer(defaultMask, mi)
+		}
+	}
+}
+
+// spmdMaskAllMakeInterfaceOps sets SPMDMask on MakeInterface instructions
+// that box SPMDType values anywhere in fn. Used for SPMD function bodies.
+func spmdMaskAllMakeInterfaceOps(fn *Function, mask Value, lanes int) {
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			mi, ok := instr.(*MakeInterface)
+			if !ok || mi.SPMDMask != nil {
+				continue
+			}
+			if _, ok := mi.X.Type().(*types.SPMDType); !ok {
+				continue
+			}
+			mi.SPMDMask = mask
+			mi.SPMDLanes = lanes
+			spmdAddReferrer(mask, mi)
 		}
 	}
 }
@@ -2600,6 +2669,16 @@ func spmdConvertAllMemOps(fn *Function, mask Value, lanes int) {
 					*refs = removeInstr(*refs, instr)
 				}
 				instr.block = nil
+
+			case *MakeInterface:
+				if instr.SPMDMask != nil {
+					continue
+				}
+				if _, ok := instr.X.Type().(*types.SPMDType); ok {
+					instr.SPMDMask = mask
+					instr.SPMDLanes = lanes
+					spmdAddReferrer(mask, instr)
+				}
 			}
 		}
 	}
@@ -2806,6 +2885,16 @@ func spmdMaskMemOps(b *BasicBlock, mask Value, lanes int) {
 				instr.SPMDMask = mask
 				spmdAddReferrer(mask, instr)
 			}
+
+		case *MakeInterface:
+			if instr.SPMDMask != nil {
+				continue
+			}
+			if _, ok := instr.X.Type().(*types.SPMDType); ok {
+				instr.SPMDMask = mask
+				instr.SPMDLanes = lanes
+				spmdAddReferrer(mask, instr)
+			}
 		}
 	}
 }
@@ -2827,6 +2916,115 @@ func spmdMaskCallOps(fn *Function, defaultMask Value) {
 			}
 			call.Call.SPMDMask = defaultMask
 			spmdAddReferrer(defaultMask, call)
+		}
+	}
+}
+
+// spmdNarrowMaskAtTypeAsserts scans scopeBlocks for TypeAssert instructions on
+// SPMDType. For each, it inserts an SPMDExtractMask to extract the embedded
+// mask from the interface, ANDs it with the current activeMask, and updates
+// all subsequent masked instructions in the same block to use the narrowed mask.
+// Multiple TypeAsserts in one block compose: the second AND uses the first
+// narrowed mask as its input, so the masks accumulate.
+func spmdNarrowMaskAtTypeAsserts(fn *Function, scopeBlocks map[*BasicBlock]bool, activeMask Value, lanes int) {
+	for _, block := range fn.Blocks {
+		if !scopeBlocks[block] {
+			continue
+		}
+		// currentMask starts as activeMask and advances after each TypeAssert.
+		currentMask := activeMask
+		// We iterate by index because we insert instructions during the loop.
+		for i := 0; i < len(block.Instrs); i++ {
+			instr := block.Instrs[i]
+
+			// Check for TypeAssert on SPMDType.
+			ta, ok := instr.(*TypeAssert)
+			if ok {
+				if _, isSPMD := ta.AssertedType.(*types.SPMDType); isSPMD {
+					// Insert SPMDExtractMask after the TypeAssert.
+					extract := &SPMDExtractMask{X: ta.X, Lanes: lanes}
+					extract.setBlock(block)
+					spmdAddReferrer(ta.X, extract)
+
+					// AND with the latest mask so multiple TypeAsserts compose.
+					andOp := &BinOp{Op: token.AND, X: currentMask, Y: extract}
+					andOp.setType(spmdpkg.NewVaryingMask())
+					andOp.setBlock(block)
+					spmdAddReferrer(currentMask, andOp)
+					spmdAddReferrer(extract, andOp)
+
+					// Insert both instructions after the TypeAssert.
+					// Make room: shift everything after i by 2 positions.
+					block.Instrs = append(block.Instrs, nil, nil)
+					copy(block.Instrs[i+3:], block.Instrs[i+1:])
+					block.Instrs[i+1] = extract
+					block.Instrs[i+2] = andOp
+					i += 2 // skip over the two new instructions
+
+					currentMask = andOp
+					continue
+				}
+			}
+
+			// If no narrowing has happened yet in this block, nothing to update.
+			if currentMask == activeMask {
+				continue
+			}
+			// Update subsequent masked instructions to use the latest narrowed
+			// mask. The unconditional replacement (guarded only by != currentMask
+			// to skip already-updated instructions) is correct: before the first
+			// TypeAssert the loop continues early above; after it, every masked
+			// instruction in this block should use the narrowed mask.
+			switch v := instr.(type) {
+			case *SPMDStore:
+				if v.Mask != currentMask {
+					if refs := v.Mask.Referrers(); refs != nil {
+						*refs = removeInstr(*refs, v)
+					}
+					v.Mask = currentMask
+					spmdAddReferrer(currentMask, v)
+				}
+			case *SPMDLoad:
+				if v.Mask != currentMask {
+					if refs := v.Mask.Referrers(); refs != nil {
+						*refs = removeInstr(*refs, v)
+					}
+					v.Mask = currentMask
+					spmdAddReferrer(currentMask, v)
+				}
+			case *Call:
+				if v.Call.SPMDMask != currentMask {
+					if refs := v.Call.SPMDMask.Referrers(); refs != nil {
+						*refs = removeInstr(*refs, v)
+					}
+					v.Call.SPMDMask = currentMask
+					spmdAddReferrer(currentMask, v)
+				}
+			case *IndexAddr:
+				if v.SPMDMask != currentMask {
+					if refs := v.SPMDMask.Referrers(); refs != nil {
+						*refs = removeInstr(*refs, v)
+					}
+					v.SPMDMask = currentMask
+					spmdAddReferrer(currentMask, v)
+				}
+			case *Index:
+				if v.SPMDMask != currentMask {
+					if refs := v.SPMDMask.Referrers(); refs != nil {
+						*refs = removeInstr(*refs, v)
+					}
+					v.SPMDMask = currentMask
+					spmdAddReferrer(currentMask, v)
+				}
+			case *MakeInterface:
+				if v.SPMDMask != currentMask {
+					if refs := v.SPMDMask.Referrers(); refs != nil {
+						*refs = removeInstr(*refs, v)
+					}
+					v.SPMDMask = currentMask
+					spmdAddReferrer(currentMask, v)
+				}
+			}
 		}
 	}
 }
