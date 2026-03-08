@@ -2867,6 +2867,12 @@ func spmdConvertFallthroughPhis(target, fallthroughPred *BasicBlock, caseMask Va
 		if fallthroughVal == nil || otherVal == nil {
 			continue
 		}
+		// Well-formed switch fallthrough phis have exactly 2 predecessors
+		// (the fallthrough body and the comparison block). More would be
+		// ambiguous since we only track one otherVal.
+		if len(target.Preds) > 2 {
+			panic("spmdConvertFallthroughPhis: target block has >2 predecessors, expected exactly 2")
+		}
 
 		// Replace phi with SPMDSelect.
 		sel := &SPMDSelect{
