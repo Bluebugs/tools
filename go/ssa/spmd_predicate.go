@@ -1136,7 +1136,7 @@ func predicateVaryingIf(fn *Function, lanes int, ifBlock *BasicBlock, vif *If, a
 
 	// Find the merge (done) block — the block both paths converge to.
 	// Returns nil for complex patterns (compound booleans, multi-block chains).
-	mergeBlock := findMergeBlock(thenBlock, elseBlock)
+	mergeBlock := findMergeBlock(fn, thenBlock, elseBlock)
 	if mergeBlock == nil {
 		// LOR short-circuit pattern: elseBlock's sole successor is thenBlock.
 		// This is logicalBinop(LOR) with a varying condition:
@@ -1628,6 +1628,20 @@ func spmdMaskAllMakeInterfaceOps(fn *Function, mask Value, lanes int) {
 	}
 }
 
+// isLoopHeader returns true if b is a loop entry point (BodyBlock or LoopBlock)
+// for any SPMD loop in fn. These blocks have loop-carried Phis and additional
+// predecessors (the loop back-edge) that make them unsafe merge targets for
+// SPMDSelect: the mask computed inside the loop body does not dominate the
+// loop header, violating SSA dominance.
+func isLoopHeader(fn *Function, b *BasicBlock) bool {
+	for _, info := range fn.SPMDLoops {
+		if b == info.BodyBlock || b == info.LoopBlock {
+			return true
+		}
+	}
+	return false
+}
+
 // findMergeBlock returns the block where the then-path and else-path converge,
 // or nil if the pattern is not a simple if/else or if-without-else diamond.
 //
@@ -1639,14 +1653,13 @@ func spmdMaskAllMakeInterfaceOps(fn *Function, mask Value, lanes int) {
 //     (i.e., the "else" is a fall-through and elseBlock IS the merge).
 //
 // Any more complex pattern (compound boolean, multi-block chains, or a merge
-// block that is also a loop header with extra predecessors) returns nil
-// and the varying If will be skipped by the caller to avoid incorrect CFG
-// rewiring. In particular, if both then/else jump back to a loop header, the
-// merge block would be the loop header — which has additional predecessors
-// (e.g., the loop entry) and whose Phis are loop-carried values, not if-else
-// merge values. Replacing those Phis with SPMDSelect would be incorrect
-// because the mask is defined inside the loop body (domination violation).
-func findMergeBlock(thenBlock, elseBlock *BasicBlock) *BasicBlock {
+// block that is also a loop header) returns nil and the varying If will be
+// skipped by the caller to avoid incorrect CFG rewiring. In particular, if both
+// then/else jump back to a loop header, the merge block would be the loop
+// header — whose Phis are loop-carried values, not if-else merge values.
+// Replacing those Phis with SPMDSelect would be incorrect because the mask is
+// defined inside the loop body (domination violation).
+func findMergeBlock(fn *Function, thenBlock, elseBlock *BasicBlock) *BasicBlock {
 	// Simple diamond: both branches have a single common successor.
 	if len(thenBlock.Succs) == 1 && len(elseBlock.Succs) == 1 {
 		merge := thenBlock.Succs[0]
@@ -1666,6 +1679,14 @@ func findMergeBlock(thenBlock, elseBlock *BasicBlock) *BasicBlock {
 
 	// If-without-else: then-block's sole successor is the else-block (fall-through).
 	if len(thenBlock.Succs) == 1 && thenBlock.Succs[0] == elseBlock {
+		// Guard: if elseBlock is a loop header, placing SPMDSelect there would
+		// reference a mask from a body block visited later in DomPreorder
+		// (domination violation). Use loop-membership rather than a raw pred
+		// count so that boolean chain merge blocks with 3+ short-circuit
+		// predecessors are still accepted as valid merge targets.
+		if isLoopHeader(fn, elseBlock) {
+			return nil
+		}
 		return elseBlock
 	}
 
@@ -1912,7 +1933,7 @@ func predicateBooleanChain(fn *Function, lanes int, chain *SPMDBooleanChain, act
 	// Step 0: Find the merge block and snapshot Phi edges BEFORE any CFG
 	// rewiring. spmdReplaceIfWithJump calls removePred which compacts
 	// Phi.Edges, losing the "else" values needed for SPMDSelect.
-	mergeBlock := findMergeBlock(thenBlock, elseBlock)
+	mergeBlock := findMergeBlock(fn, thenBlock, elseBlock)
 
 	// Detect loop-header merge: mergeBlock==nil when the shared successor has
 	// 3+ predecessors (loop header case). Snapshot its phis now while the
