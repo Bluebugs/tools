@@ -2700,10 +2700,12 @@ func predicateVaryingSwitch(fn *Function, lanes int, chain *SPMDSwitchChain, spm
 
 	// Phase 0: Snapshot Phi edge values at DoneBlock BEFORE any CFG rewiring.
 	//
-	// spmdRewireBodyToNext calls doneBlock.removePred(bodyBlock), which
-	// removes both the predecessor entry and the corresponding Phi edge from
-	// doneBlock's Phi instructions. We must capture the per-case Phi values
-	// before that happens, otherwise the values for rewired cases are lost.
+	// spmdRewireBodyToNext calls oldDest.removePred(bodyBlock) where oldDest
+	// is bodyBlock.Succs[0]. For non-fallthrough cases oldDest IS doneBlock,
+	// so the snapshot below protects those phi edges. Fallthrough bodies
+	// never had a doneBlock edge, so no snapshot entry is needed for them.
+	// We must capture the per-case Phi values before rewiring happens,
+	// otherwise the values for rewired cases are lost.
 	//
 	// phiEdges[bodyBlock] = map of phi → phi-edge-value-for-that-body.
 	//
@@ -2757,17 +2759,32 @@ func predicateVaryingSwitch(fn *Function, lanes int, chain *SPMDSwitchChain, spm
 		// Rewire: redirect the body's jump so control flows sequentially
 		// through all cases and the default before reaching done.
 		//
-		// NOTE: spmdRewireBodyToNext calls doneBlock.removePred(bodyBlock),
-		// which also compacts doneBlock's Phi.Edges. This is safe because we
+		// NOTE: spmdRewireBodyToNext calls oldDest.removePred(bodyBlock),
+		// which also compacts oldDest's Phi.Edges. This is safe because we
 		// already snapshotted all Phi edge values in Phase 0.
+		//
+		// IMPORTANT: Use bodyBlock.Succs[0] as oldDest, not the hardcoded
+		// doneBlock. For normal (non-fallthrough) cases, bodyBlock.Succs[0]
+		// IS doneBlock, so behaviour is unchanged. For fallthrough cases, the
+		// body already jumps directly to the next case body block (not doneBlock),
+		// so we must replace that actual successor. Using doneBlock as oldDest
+		// causes replaceSucc to silently no-op (no match), leaving the body
+		// pointing to the next body block and the comparison block (nextBlock)
+		// unreachable. The per-case mask instructions inserted into that
+		// unreachable block then become dangling references after
+		// deleteUnreachableBlocks, causing a TinyGo panic.
+		bodySucc := bodyBlock.Succs[0] // Jump has exactly one successor.
 		isLastCase := idx == len(chain.Cases)-1
 		if !isLastCase {
 			// Non-last case: rewire body → nextBlock (the next comparison block).
-			spmdRewireBodyToNext(bodyBlock, doneBlock, nextBlock)
+			// For fallthrough, bodySucc is the next case body; replace it with
+			// nextBlock so the comparison block stays reachable and its mask
+			// computations dominate the subsequent case body.
+			spmdRewireBodyToNext(bodyBlock, bodySucc, nextBlock)
 		} else if chain.DefaultBlock != nil {
 			// Last case with a default: rewire body → defaultBlock.
 			// nextBlock is the default block for the last case's If.
-			spmdRewireBodyToNext(bodyBlock, doneBlock, chain.DefaultBlock)
+			spmdRewireBodyToNext(bodyBlock, bodySucc, chain.DefaultBlock)
 		}
 		// Last case without default: body already jumps to doneBlock — leave it.
 

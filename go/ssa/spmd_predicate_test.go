@@ -1236,6 +1236,261 @@ func main() {
 	}
 }
 
+// TestPredicateSPMD_SwitchFallthrough verifies that fallthrough in switch
+// cases inside a go for loop is linearized correctly by predicateVaryingSwitch.
+// Specifically it checks that each case body receives a Varying[mask] mask
+// whose instruction lives in a reachable block.
+//
+// The bug: spmdRewireBodyToNext uses doneBlock as oldDest instead of the
+// body's actual successor (the next case body under fallthrough). This leaves
+// the comparison blocks unreachable after spmdReplaceIfWithJump disconnects
+// them. Case mask computations are inserted into those unreachable blocks.
+// After deleteUnreachableBlocks, the mask instructions are in deleted blocks.
+// TinyGo then panics: "SSA value not previously found in function".
+func TestPredicateSPMD_SwitchFallthrough(t *testing.T) {
+	// Use a program where each case body performs a direct slice store so that
+	// spmdMaskMemOps creates SPMDStore instructions with per-case masks. This
+	// exposes the bug when the per-case mask is in a deleted block.
+	src := `package main
+
+func f(dst []int) {
+	for i := range dst {
+		switch i % 3 {
+		case 2:
+			dst[i] = 200
+			fallthrough
+		case 1:
+			dst[i] = 100
+			fallthrough
+		case 0:
+			dst[i] = 0
+		}
+	}
+}
+
+func main() { f(make([]int, 16)) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	if len(fn.SPMDSwitchChains) == 0 {
+		t.Fatal("expected SPMDSwitchChains to be populated")
+	}
+
+	chain := fn.SPMDSwitchChains[0]
+	for i, caseIf := range chain.Cases {
+		if caseIf.Block() != nil {
+			t.Errorf("case %d: If still has Block(): should be linearized", i)
+		}
+	}
+
+	for _, block := range fn.Blocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		if vif, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok {
+			if vif.IsVarying {
+				t.Errorf("block %d: varying If not linearized", block.Index)
+			}
+		}
+	}
+
+	var buf bytes.Buffer
+	fn.WriteTo(&buf)
+	output := buf.String()
+	if !strings.Contains(output, "lanes.Varying[mask]") {
+		t.Error("expected Varying[mask] mask computation instructions")
+	}
+
+	// Every SPMDStore in a switch case body must have a Varying[mask]-typed
+	// mask in a live block. With the bug, cases 1 and 0 get masks from deleted
+	// comparison blocks.
+	liveBlocks := make(map[*ssa.BasicBlock]bool)
+	for _, b := range fn.Blocks {
+		liveBlocks[b] = true
+	}
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			st, ok := instr.(*ssa.SPMDStore)
+			if !ok {
+				continue
+			}
+			if !spmd.IsVaryingMask(st.Mask.Type()) {
+				t.Errorf("block %d: SPMDStore has non-Varying[mask] mask type %v (value: %v)",
+					block.Index, st.Mask.Type(), st.Mask)
+				continue
+			}
+			// The mask instruction must be in a live (reachable) block.
+			if maskInstr, ok := st.Mask.(ssa.Instruction); ok {
+				maskBlock := maskInstr.Block()
+				if maskBlock != nil && !liveBlocks[maskBlock] {
+					t.Errorf("block %d: SPMDStore mask %v is in deleted/unreachable block",
+						block.Index, st.Mask)
+				}
+			}
+		}
+	}
+}
+
+// TestPredicateSPMD_SwitchFallthroughMemOps verifies that stores in switch
+// cases with fallthrough are correctly masked via SPMDStore, and that each
+// per-case mask is a proper Varying[mask] (not a stale or wrong-type value).
+func TestPredicateSPMD_SwitchFallthroughMemOps(t *testing.T) {
+	src := `package main
+
+func f(dst []int) {
+	for i := range dst {
+		switch i % 3 {
+		case 2:
+			dst[i] = 300
+			fallthrough
+		case 1:
+			dst[i] = 200
+			fallthrough
+		case 0:
+			dst[i] = 100
+		}
+	}
+}
+
+func main() { f(make([]int, 16)) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	if len(fn.SPMDSwitchChains) == 0 {
+		t.Fatal("expected SPMDSwitchChains to be populated")
+	}
+
+	// Each case body store must have a Varying[mask]-typed mask, and that
+	// mask instruction must live in a reachable block. The fallthrough bug
+	// causes cases 1 and 0 to have their per-case mask computed in
+	// unreachable comparison blocks (switch.next). After
+	// deleteUnreachableBlocks those blocks are deleted, and the mask
+	// instructions become dangling references. TinyGo then panics when it
+	// looks up the LLVM value for those masks.
+	liveBlocks := make(map[*ssa.BasicBlock]bool)
+	for _, b := range fn.Blocks {
+		liveBlocks[b] = true
+	}
+
+	spmdStoreCount := 0
+	badMaskCount := 0
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			st, ok := instr.(*ssa.SPMDStore)
+			if !ok {
+				continue
+			}
+			spmdStoreCount++
+			if !spmd.IsVaryingMask(st.Mask.Type()) {
+				badMaskCount++
+				t.Errorf("SPMDStore in block %d has non-Varying[mask] mask: type=%v value=%v",
+					block.Index, st.Mask.Type(), st.Mask)
+				continue
+			}
+			// Mask instruction must be in a live block.
+			if maskInstr, ok := st.Mask.(ssa.Instruction); ok {
+				maskBlock := maskInstr.Block()
+				if maskBlock != nil && !liveBlocks[maskBlock] {
+					badMaskCount++
+					t.Errorf("SPMDStore in block %d: mask %v is in deleted/unreachable block %v",
+						block.Index, st.Mask, maskBlock)
+				}
+			}
+		}
+	}
+	if spmdStoreCount < 3 {
+		t.Errorf("expected at least 3 SPMDStore instructions, got %d", spmdStoreCount)
+	}
+	if badMaskCount > 0 {
+		t.Errorf("%d SPMDStore(s) had incorrect masks (wrong type or in deleted block)", badMaskCount)
+	}
+}
+
+// TestPredicateSPMD_SwitchFallthroughSanity verifies that the SSA sanity
+// checker passes after predicateSPMD linearizes a switch with fallthrough
+// and a default case, and that all SPMDStore masks are in live blocks.
+// The bug: spmdRewireBodyToNext uses doneBlock as oldDest instead of the
+// body's actual successor, leaving comparison blocks unreachable. Case masks
+// computed in those unreachable blocks become dangling references.
+func TestPredicateSPMD_SwitchFallthroughSanity(t *testing.T) {
+	src := `package main
+
+func g(dst []int) {
+	for i := range dst {
+		switch i % 4 {
+		case 3:
+			dst[i] = 3000
+			fallthrough
+		case 2:
+			dst[i] = 2000
+			fallthrough
+		case 1:
+			dst[i] = 1000
+		default:
+			dst[i] = -1
+		}
+	}
+}
+
+func main() { g(make([]int, 16)) }
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setSPMDOnRange(f)
+
+	// SanityCheckFunctions will panic if predicateSPMD leaves the SSA invalid.
+	_, _, err = ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{f},
+		ssa.SanityCheckFunctions,
+	)
+	if err != nil {
+		t.Fatalf("BuildPackage with SanityCheckFunctions failed: %v", err)
+	}
+
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("g")
+	if fn == nil {
+		t.Fatal("function g not found")
+	}
+
+	if len(fn.SPMDSwitchChains) == 0 {
+		t.Fatal("expected SPMDSwitchChains to be populated")
+	}
+
+	// All SPMDStore masks must be in live blocks (not deleted comparison blocks).
+	liveBlocks := make(map[*ssa.BasicBlock]bool)
+	for _, b := range fn.Blocks {
+		liveBlocks[b] = true
+	}
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			st, ok := instr.(*ssa.SPMDStore)
+			if !ok {
+				continue
+			}
+			if maskInstr, ok := st.Mask.(ssa.Instruction); ok {
+				maskBlock := maskInstr.Block()
+				if maskBlock != nil && !liveBlocks[maskBlock] {
+					t.Errorf("block %d: SPMDStore mask %v is in deleted/unreachable block",
+						block.Index, st.Mask)
+				}
+			}
+		}
+	}
+}
+
 // TestPredicateSPMD_SanityCheck verifies the sanity checker passes after
 // predicateSPMD runs on a function with a varying if-without-else.
 func TestPredicateSPMD_SanityCheck(t *testing.T) {
