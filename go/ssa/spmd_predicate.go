@@ -1134,6 +1134,28 @@ func predicateVaryingIf(fn *Function, lanes int, ifBlock *BasicBlock, vif *If, a
 	thenBlock := ifBlock.Succs[0] // If.Cond true → Succs[0]
 	elseBlock := ifBlock.Succs[1] // If.Cond false → Succs[1]
 
+	// Detect if/else-if pattern: elseBlock terminates with a varying If.
+	// This arises from `if A { ... } else if B { ... } else { ... }`.
+	// Because predicateSPMDScope iterates fn.Blocks in program order, the
+	// outer If (in ifBlock) is visited BEFORE the inner If (in elseBlock).
+	// At that point elseBlock has 2 successors so findMergeBlock returns nil
+	// and would skip the outer If. Instead: compute outer masks, replace the
+	// outer If with a Jump, recursively linearize the inner If with the
+	// narrowed else-mask, then follow the resulting single-successor chain to
+	// find the merge block.
+	if len(elseBlock.Instrs) > 0 {
+		innerVif, ok := elseBlock.Instrs[len(elseBlock.Instrs)-1].(*If)
+		if ok && innerVif.IsVarying {
+			// Make sure the inner If is not part of a switch chain or boolean
+			// chain (those are handled separately by predicateSPMDScope).
+			excludedIfs := spmdBuildExcludedIfs(fn)
+			if !excludedIfs[innerVif] {
+				spmdLinearizeElseIf(fn, lanes, ifBlock, vif, thenBlock, elseBlock, innerVif, allowLoopHeaderMerge, activeMask, deferred)
+				return
+			}
+		}
+	}
+
 	// Find the merge (done) block — the block both paths converge to.
 	// Returns nil for complex patterns (compound booleans, multi-block chains).
 	mergeBlock := findMergeBlock(fn, thenBlock, elseBlock)
@@ -1413,6 +1435,111 @@ func spmdLinearizeIfWithoutElseLoopHeader(fn *Function, ifBlock *BasicBlock, vif
 	}
 
 	// Step 5: Mask memory operations in thenBlock.
+	spmdMaskMemOps(thenBlock, thenMask, lanes)
+}
+
+// spmdLinearizeElseIf handles the if/else-if pattern where the outer varying
+// If's else-block contains another varying If:
+//
+//	  if A { ... } else if B { ... } else { ... }
+//
+// CFG before linearization:
+//
+//	ifBlock:  if varying(A)  → thenBlock, elseBlock
+//	elseBlock: if varying(B) → innerThen, innerElse
+//	innerThen: jump merge
+//	innerElse: jump merge
+//	merge: phi [thenBlock: v1, innerThen: v2, innerElse: v3]
+//
+// The outer If must be processed first (program-order iteration), but
+// findMergeBlock returns nil because elseBlock has 2 successors at that point.
+//
+// Strategy:
+//  1. Compute outer masks (thenMask = active & A, elseMask = active &^ A).
+//  2. Replace outer If with Jump to thenBlock.
+//  3. Recursively linearize inner If with elseMask as activeMask.
+//     After this, elseBlock and its successors form a single-successor chain.
+//  4. Call findMergeBlock; the extended diamond check follows the chain to merge.
+//  5. Snapshot merge phis (inner linearization may have already replaced some).
+//  6. Rewire thenBlock → elseBlock (B→T→else-chain→merge).
+//  7. Replace merge phis with SPMDSelect using thenMask/thenBlock and
+//     elseTerminal as the else-side predecessor.
+//  8. Mask mem ops in thenBlock (elseBlock chain already masked by recursion).
+func spmdLinearizeElseIf(fn *Function, lanes int, ifBlock *BasicBlock, vif *If, thenBlock, elseBlock *BasicBlock, innerVif *If, allowLoopHeaderMerge bool, activeMask Value, deferred *[]*spmdDeferredMerge) {
+	// Step 1: Compute outer masks.
+	maskCond := spmdInsertConvertToMask(ifBlock, vif.Cond)
+	thenMask := spmdInsertMaskAnd(ifBlock, activeMask, maskCond)
+	elseMask := spmdInsertMaskAndNot(ifBlock, activeMask, maskCond)
+
+	// Step 2: Replace outer If with Jump to thenBlock.
+	// This removes elseBlock as a direct successor of ifBlock and removes
+	// ifBlock from elseBlock.Preds — elseBlock will be reached via thenBlock
+	// after rewiring below.
+	spmdReplaceIfWithJump(ifBlock, thenBlock, elseBlock)
+
+	// Step 3: Recursively linearize inner varying If with narrowed elseMask.
+	// After this call, elseBlock (and any inner blocks) each have a single
+	// successor, forming a chain that terminates at the common merge block.
+	//
+	// Pass allowLoopHeaderMerge=true so the inner if uses the trampoline merge
+	// path (spmdInsertMergeTrampoline) rather than deferring. The inner if's
+	// merge block is NOT the go-for loop header — it is an ordinary if.done
+	// block — so a trampoline is safe. Deferring would create a conflict: the
+	// deferred entry and the outer phi replacement below both operate on the
+	// same merge block, causing double-replacement of the same Phi.
+	predicateVaryingIf(fn, lanes, elseBlock, innerVif, true /*allowLoopHeaderMerge*/, elseMask, deferred)
+
+	// Step 4: Find the merge block by following the single-successor chain
+	// from thenBlock and elseBlock. The extended diamond check in
+	// findMergeBlock handles this case.
+	mergeBlock := findMergeBlock(fn, thenBlock, elseBlock)
+	if mergeBlock == nil {
+		// Could not find a safe merge block after inner linearization.
+		// This can happen if the inner linearization produced a loop-header
+		// merge or other complex pattern. Skip phi conversion.
+		return
+	}
+
+	// Find elseTerminal: the last block in the else chain before merge.
+	elseTerminal := elseBlock
+	for len(elseTerminal.Succs) == 1 && elseTerminal.Succs[0] != mergeBlock {
+		elseTerminal = elseTerminal.Succs[0]
+	}
+
+	// Step 5: Snapshot merge phis before rewiring thenBlock.
+	// spmdRewireThenToElse removes thenBlock from mergeBlock.Preds and
+	// compacts Phi.Edges. We need thenBlock's phi edge values for SPMDSelect.
+	var phiSnaps []spmdPhiSnapshot
+	for _, instr := range mergeBlock.Instrs {
+		phi, ok := instr.(*Phi)
+		if !ok {
+			break // phis are always first
+		}
+		snap := spmdPhiSnapshot{phi: phi, edgeVal: make(map[*BasicBlock]Value, len(mergeBlock.Preds))}
+		for j, pred := range mergeBlock.Preds {
+			snap.edgeVal[pred] = phi.Edges[j]
+		}
+		phiSnaps = append(phiSnaps, snap)
+	}
+
+	// Step 6: Rewire thenBlock → elseBlock (chain → merge).
+	// After this: ifBlock→thenBlock→elseBlock→...→merge.
+	spmdRewireThenToElse(thenBlock, mergeBlock, elseBlock)
+
+	// Step 7: Replace merge phis with SPMDSelect.
+	// Use thenBlock and elseTerminal as the two predecessors.
+	// Build SPMDSelect using snapshotted values (needed because
+	// spmdRewireThenToElse compacts mergeBlock.Preds removing thenBlock).
+	spmdReplaceBooleanChainPhis(mergeBlock, thenBlock, elseTerminal, thenMask, lanes, phiSnaps)
+
+	// Remove thenBlock from mergeBlock.Preds. spmdRewireThenToElse intentionally
+	// leaves thenBlock in mergeBlock.Preds so the Phi edges can be read first.
+	// spmdReplaceBooleanChainPhis uses snapshotted values (not live Phi edges),
+	// so we must clean up the pred list here.
+	mergeBlock.removePred(thenBlock)
+
+	// Step 8: Mask mem ops in thenBlock only.
+	// The elseBlock chain was already masked during the recursive call.
 	spmdMaskMemOps(thenBlock, thenMask, lanes)
 }
 
@@ -1785,6 +1912,34 @@ func findMergeBlock(fn *Function, thenBlock, elseBlock *BasicBlock) *BasicBlock 
 			// point for SPMDSelect because loop-carried Phis would be
 			// incorrectly replaced, and the mask (computed in the loop body)
 			// would not dominate uses in the loop header.
+			if len(merge.Preds) != 2 {
+				return nil
+			}
+			return merge
+		}
+	}
+
+	// Extended diamond: thenBlock has 1 successor (merge) and elseBlock has a
+	// chain of single-successor blocks (produced by recursive else-if
+	// linearization) that eventually reaches the same merge block.
+	// After inner predication the else chain looks like:
+	//   elseBlock → elseBlock.innerThen → ... → merge
+	// Each hop has exactly one successor until we reach merge.
+	if len(thenBlock.Succs) == 1 {
+		merge := thenBlock.Succs[0]
+		b := elseBlock
+		visited := map[*BasicBlock]bool{b: true}
+		for len(b.Succs) == 1 && b.Succs[0] != merge {
+			next := b.Succs[0]
+			if visited[next] {
+				break // cycle guard
+			}
+			visited[next] = true
+			b = next
+		}
+		if len(b.Succs) == 1 && b.Succs[0] == merge {
+			// Require exactly 2 predecessors at merge: thenBlock and elseTerminal.
+			// More predecessors indicate a loop header or other complex structure.
 			if len(merge.Preds) != 2 {
 				return nil
 			}

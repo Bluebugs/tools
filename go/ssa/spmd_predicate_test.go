@@ -3640,3 +3640,104 @@ func main() { f(make([]int, 16), 16) }
 		}
 	}
 }
+
+// ----------------------------------------------------------------------------
+// Task 4: Else-if chain linearization tests
+//
+// These tests verify that if/else-if patterns inside go-for loops are fully
+// linearized, leaving no varying If instructions alive after predication.
+
+// TestPredicateSPMD_GoForElseIfLinearized verifies that a three-way
+// if/else-if/else pattern is fully predicated in a go-for loop.
+//
+// Pattern:  if A { ... } else if B { ... } else { ... }
+//
+// The outer If (A) has elseBlock with 2 successors at the time it is first
+// visited. spmdLinearizeElseIf must recurse into the inner If before
+// findMergeBlock can locate the merge point.
+func TestPredicateSPMD_GoForElseIfLinearized(t *testing.T) {
+	// Write clamp directly to dst[i] in each branch to avoid varying→uniform
+	// assignment (result=v would require lanes.Varying[int32]).
+	src := `package main
+
+func f(dst []int32, lo, hi int32) {
+	for i := range len(dst) {
+		v := dst[i]
+		if v < lo {
+			dst[i] = lo
+		} else if v > hi {
+			dst[i] = hi
+		} else {
+			dst[i] = v
+		}
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+
+	// No varying If should remain after predication.
+	for _, block := range fn.Blocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		if vif, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok && vif.IsVarying {
+			t.Errorf("varying If still present in block %s after predication", block)
+			t.Logf("SSA output:\n%s", output)
+		}
+	}
+
+	// All memory ops inside varying branches must have been masked.
+	// The direct-write pattern (no phi) uses masked stores rather than
+	// SPMDSelect. Verify at least one SPMDStore with a non-constant mask exists.
+	storeCount := strings.Count(output, "spmd_store")
+	if storeCount < 3 {
+		t.Errorf("expected at least 3 masked SPMDStore instructions (one per branch), got %d", storeCount)
+		t.Logf("SSA output:\n%s", output)
+	}
+}
+
+// TestPredicateSPMD_GoForElseIfSanity verifies that the sanity checker passes
+// after predication of an if/else-if/else chain in a go-for loop.
+func TestPredicateSPMD_GoForElseIfSanity(t *testing.T) {
+	src := `package main
+
+func main() {
+	dst := make([]int32, 16)
+	lo := int32(-10)
+	hi := int32(10)
+	for i := range len(dst) {
+		v := dst[i]
+		if v < lo {
+			dst[i] = lo
+		} else if v > hi {
+			dst[i] = hi
+		} else {
+			dst[i] = v
+		}
+	}
+}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setSPMDOnRange(f)
+
+	_, _, err = ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{f},
+		ssa.SanityCheckFunctions,
+	)
+	if err != nil {
+		t.Fatalf("SanityCheckFunctions failed on if/else-if chain: %v", err)
+	}
+}
