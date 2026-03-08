@@ -1491,6 +1491,51 @@ func main() { g(make([]int, 16)) }
 	}
 }
 
+// TestPredicateSPMD_SwitchFallthroughAfterIf verifies that a varying if-then
+// (if.done merge) followed by a varying switch with fallthrough does not
+// incorrectly trigger spmdLinearizeElseIf. The if.done block ends with the
+// first switch comparison If, which has multiple predecessors (not a true
+// else-if pattern).
+func TestPredicateSPMD_SwitchFallthroughAfterIf(t *testing.T) {
+	src := `package main
+
+func f(starts [4]int, ends [4]int, s string) {
+	for field, start := range starts {
+		end := ends[field]
+		if field > 0 {
+			start++
+		}
+		fieldLen := end - start
+		var value int
+		switch fieldLen {
+		case 3:
+			value = int(s[start+2]-'0')
+			fallthrough
+		case 2:
+			value = value*10 + int(s[start+1]-'0')
+			fallthrough
+		case 1:
+			value = value*10 + int(s[start]-'0')
+		}
+		_ = value
+	}
+}
+
+func main() { f([4]int{0, 4, 8, 12}, [4]int{3, 7, 11, 15}, "192.168.001.001") }
+`
+	// buildSSAWithSPMD uses SanityCheckFunctions mode — if predication
+	// incorrectly triggers spmdLinearizeElseIf, this will panic.
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	if len(fn.SPMDSwitchChains) == 0 {
+		t.Fatal("expected SPMDSwitchChains to be populated")
+	}
+}
+
 // TestPredicateSPMD_SanityCheck verifies the sanity checker passes after
 // predicateSPMD runs on a function with a varying if-without-else.
 func TestPredicateSPMD_SanityCheck(t *testing.T) {

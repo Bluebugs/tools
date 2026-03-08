@@ -1143,7 +1143,11 @@ func predicateVaryingIf(fn *Function, lanes int, ifBlock *BasicBlock, vif *If, a
 	// outer If with a Jump, recursively linearize the inner If with the
 	// narrowed else-mask, then follow the resulting single-successor chain to
 	// find the merge block.
-	if len(elseBlock.Instrs) > 0 {
+	// A true else-if has exactly one predecessor (ifBlock). If elseBlock
+	// has multiple predecessors, it is a merge block (e.g., if.done) that
+	// happens to end with a varying If (e.g., the first switch comparison
+	// after a preceding if-then merge). Do not treat it as else-if.
+	if len(elseBlock.Preds) == 1 && len(elseBlock.Instrs) > 0 {
 		innerVif, ok := elseBlock.Instrs[len(elseBlock.Instrs)-1].(*If)
 		if ok && innerVif.IsVarying {
 			// Make sure the inner If is not part of a switch chain or boolean
