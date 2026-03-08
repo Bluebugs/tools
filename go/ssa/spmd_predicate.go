@@ -2670,7 +2670,8 @@ func spmdReplacePhisWithSelect(mergeBlock, thenPred, elsePred *BasicBlock, thenM
 // switch case. Used internally by predicateVaryingSwitch.
 type spmdSwitchCaseInfo struct {
 	mask      Value       // per-case active mask (lanes matching this case)
-	bodyBlock *BasicBlock // case body block (then-branch of the original If)
+	bodyBlock *BasicBlock // first block of case body (used for mem ops masking)
+	exitBlock *BasicBlock // last block of case body (used for rewiring and phi edges)
 }
 
 // predicateVaryingSwitch linearizes a varying switch chain.
@@ -2754,43 +2755,64 @@ func predicateVaryingSwitch(fn *Function, lanes int, chain *SPMDSwitchChain, spm
 		// Narrow remaining: remaining = remaining &^ maskCond
 		newRemaining := spmdInsertMaskAndNot(compBlock, remaining, maskCond)
 
-		cases[idx] = spmdSwitchCaseInfo{mask: caseMask, bodyBlock: bodyBlock}
-
 		// Replace the If with a Jump to the body block.
 		// This removes compBlock from nextBlock's predecessors.
 		spmdReplaceIfWithJump(compBlock, bodyBlock, nextBlock)
 
-		// Rewire: redirect the body's jump so control flows sequentially
+		// Find the exit block of the body scope. For simple bodies (bodyBlock
+		// ends with Jump), exitBlock == bodyBlock. For complex bodies with
+		// inner control flow (bodyBlock ends with If), exitBlock is the last
+		// block in the body scope that Jumps to the expected target.
+		//
+		// Possible targets:
+		//   - doneBlock: non-fallthrough body jumps to switch.done
+		//   - next case body: fallthrough body jumps to next case's first block
+		isLastCase := idx == len(chain.Cases)-1
+		var nextCaseBody *BasicBlock
+		if !isLastCase {
+			nextCaseBody = chain.Cases[idx+1].Block().Succs[0]
+		}
+		exitBlock := spmdFindBodyExitBlock(bodyBlock, doneBlock, nextCaseBody)
+		if exitBlock == nil {
+			// Fallback: body block itself (shouldn't happen for well-formed switches).
+			exitBlock = bodyBlock
+		}
+
+		cases[idx] = spmdSwitchCaseInfo{mask: caseMask, bodyBlock: bodyBlock, exitBlock: exitBlock}
+
+		// Rewire: redirect the body's exit so control flows sequentially
 		// through all cases and the default before reaching done.
 		//
-		// NOTE: spmdRewireBodyToNext calls oldDest.removePred(bodyBlock),
+		// NOTE: spmdRewireBodyToNext calls oldDest.removePred(exitBlock),
 		// which also compacts oldDest's Phi.Edges. This is safe because we
 		// already snapshotted all Phi edge values in Phase 0.
 		//
-		// IMPORTANT: Use bodyBlock.Succs[0] as oldDest, not the hardcoded
-		// doneBlock. For normal (non-fallthrough) cases, bodyBlock.Succs[0]
-		// IS doneBlock, so behaviour is unchanged. For fallthrough cases, the
-		// body already jumps directly to the next case body block (not doneBlock),
-		// so we must replace that actual successor. Using doneBlock as oldDest
-		// causes replaceSucc to silently no-op (no match), leaving the body
-		// pointing to the next body block and the comparison block (nextBlock)
-		// unreachable. The per-case mask instructions inserted into that
-		// unreachable block then become dangling references after
-		// deleteUnreachableBlocks, causing a TinyGo panic.
-		bodySucc := bodyBlock.Succs[0] // Jump has exactly one successor.
-		isLastCase := idx == len(chain.Cases)-1
-		if !isLastCase {
-			// Non-last case: rewire body → nextBlock (the next comparison block).
-			// For fallthrough, bodySucc is the next case body; replace it with
-			// nextBlock so the comparison block stays reachable and its mask
-			// computations dominate the subsequent case body.
-			spmdRewireBodyToNext(bodyBlock, bodySucc, nextBlock)
-		} else if chain.DefaultBlock != nil {
-			// Last case with a default: rewire body → defaultBlock.
-			// nextBlock is the default block for the last case's If.
-			spmdRewireBodyToNext(bodyBlock, bodySucc, chain.DefaultBlock)
+		// FALLTHROUGH: When exitBlock jumps to the next case body (not
+		// doneBlock), the target has phis that merge the fallthrough value
+		// with the direct-entry value. Before rewiring (which removes exitBlock
+		// from the target's preds and collapses phis), convert those phis
+		// into SPMDSelect so accumulated values are preserved per-lane.
+		fallthroughTarget := exitBlock.Succs[0]
+		isFallthrough := fallthroughTarget != doneBlock && nextCaseBody != nil && fallthroughTarget == nextCaseBody
+		if isFallthrough {
+			// The mask for the fallthrough phi must be CUMULATIVE: it covers
+			// all lanes that entered at this case OR any previous case with
+			// fallthrough. This is activeMask &^ newRemaining (all lanes
+			// claimed by cases 0..idx). Using just caseMask would only cover
+			// lanes that entered at this specific case, missing lanes that
+			// fell through from earlier cases.
+			cumMask := spmdInsertMaskAndNot(compBlock, activeMask, newRemaining)
+			spmdConvertFallthroughPhis(fallthroughTarget, exitBlock, cumMask, lanes)
 		}
-		// Last case without default: body already jumps to doneBlock — leave it.
+
+		if !isLastCase {
+			// Non-last case: rewire exit → nextBlock (the next comparison block).
+			spmdRewireBodyToNext(exitBlock, exitBlock.Succs[0], nextBlock)
+		} else if chain.DefaultBlock != nil {
+			// Last case with a default: rewire exit → defaultBlock.
+			spmdRewireBodyToNext(exitBlock, exitBlock.Succs[0], chain.DefaultBlock)
+		}
+		// Last case without default: exit already jumps to doneBlock — leave it.
 
 		remaining = newRemaining
 	}
@@ -2815,6 +2837,100 @@ func predicateVaryingSwitch(fn *Function, lanes int, chain *SPMDSwitchChain, spm
 	if !doneIsLoopBlock {
 		spmdReplaceSwitchPhisWithChainedSelect(chain, cases, phiEdges, lanes)
 	}
+}
+
+// spmdConvertFallthroughPhis converts Phi instructions at a fallthrough target
+// block into SPMDSelect instructions. When a case body falls through to the
+// next case body, the target has phis that merge the fallthrough value (from
+// the previous case) with the direct-entry value (from the comparison block).
+// Before the fallthrough predecessor is rewired away, this function replaces
+// each phi with SPMDSelect(caseMask, fallthroughVal, directEntryVal).
+func spmdConvertFallthroughPhis(target, fallthroughPred *BasicBlock, caseMask Value, lanes int) {
+	for i := 0; i < len(target.Instrs); i++ {
+		phi, ok := target.Instrs[i].(*Phi)
+		if !ok {
+			break // phis are always first
+		}
+
+		// Find the edge values for the fallthrough predecessor and the other.
+		var fallthroughVal, otherVal Value
+		for j, pred := range target.Preds {
+			if j >= len(phi.Edges) {
+				break
+			}
+			if pred == fallthroughPred {
+				fallthroughVal = phi.Edges[j]
+			} else {
+				otherVal = phi.Edges[j]
+			}
+		}
+		if fallthroughVal == nil || otherVal == nil {
+			continue
+		}
+
+		// Replace phi with SPMDSelect.
+		sel := &SPMDSelect{
+			Mask:  caseMask,
+			X:     fallthroughVal,
+			Y:     otherVal,
+			Lanes: lanes,
+		}
+		sel.setType(phi.Type())
+		sel.setBlock(target)
+		spmdAddReferrer(caseMask, sel)
+		spmdAddReferrer(fallthroughVal, sel)
+		spmdAddReferrer(otherVal, sel)
+
+		target.Instrs[i] = sel
+		replaceAll(phi, sel)
+
+		// Clean up the phi's operands from referrer lists.
+		for _, edge := range phi.Edges {
+			if edge != nil {
+				if refs := edge.Referrers(); refs != nil {
+					*refs = removeInstr(*refs, phi)
+				}
+			}
+		}
+		phi.block = nil
+	}
+}
+
+// spmdFindBodyExitBlock walks the case body scope starting at bodyBlock
+// to find the block that Jumps to one of the given target blocks. For simple
+// bodies (bodyBlock ends with Jump), this returns bodyBlock itself. For complex
+// bodies (bodyBlock contains inner control flow like if-else), this follows
+// successors until it finds the exit block that reaches a target.
+func spmdFindBodyExitBlock(bodyBlock *BasicBlock, targets ...*BasicBlock) *BasicBlock {
+	targetSet := make(map[*BasicBlock]bool, len(targets))
+	for _, t := range targets {
+		if t != nil {
+			targetSet[t] = true
+		}
+	}
+
+	visited := make(map[*BasicBlock]bool)
+	queue := []*BasicBlock{bodyBlock}
+	for len(queue) > 0 {
+		b := queue[0]
+		queue = queue[1:]
+		if visited[b] {
+			continue
+		}
+		visited[b] = true
+
+		// A block that Jumps (1 successor) to a target is the exit block.
+		if len(b.Succs) == 1 && targetSet[b.Succs[0]] {
+			return b
+		}
+
+		for _, succ := range b.Succs {
+			if !visited[succ] && !targetSet[succ] {
+				queue = append(queue, succ)
+			}
+		}
+	}
+	return nil
 }
 
 // spmdRewireBodyToNext redirects the body block's terminator from oldDest to newDest.
@@ -2871,12 +2987,12 @@ func spmdReplaceSwitchPhisWithChainedSelect(
 	}
 
 	// The base "else" value comes from the default block (if present) or the
-	// last case body. Both still flow into doneBlock after linearization.
+	// last case body's exit block (the actual predecessor of doneBlock).
 	var baseBlock *BasicBlock
 	if chain.DefaultBlock != nil {
 		baseBlock = chain.DefaultBlock
 	} else {
-		baseBlock = cases[len(cases)-1].bodyBlock
+		baseBlock = cases[len(cases)-1].exitBlock
 	}
 
 	// Collect all new instructions to insert, per-phi. We process
@@ -2900,16 +3016,16 @@ func spmdReplaceSwitchPhisWithChainedSelect(
 		}
 
 		// Build chained selects from last case to first (bottom-up).
-		// Cases whose bodyBlock == baseBlock provide the starting value and
+		// Cases whose exitBlock == baseBlock provide the starting value and
 		// skip select emission (no-default: last case IS the base).
 		var chainInstrs []Instruction
 		sel := Value(baseVal)
 		for i := len(cases) - 1; i >= 0; i-- {
 			ci := cases[i]
-			if ci.bodyBlock == baseBlock {
+			if ci.exitBlock == baseBlock {
 				continue
 			}
-			caseEdges, ok := phiEdges[ci.bodyBlock]
+			caseEdges, ok := phiEdges[ci.exitBlock]
 			if !ok {
 				continue
 			}

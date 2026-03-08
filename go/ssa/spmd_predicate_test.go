@@ -1536,6 +1536,62 @@ func main() { f([4]int{0, 4, 8, 12}, [4]int{3, 7, 11, 15}, "192.168.001.001") }
 	}
 }
 
+// TestPredicateSPMD_SwitchFallthroughComplexBody verifies that a switch with
+// fallthrough where case bodies contain inner varying control flow (if-else)
+// is correctly predicated. The exit block of the body scope (not the first
+// block) must be rewired and used for phi edge lookup.
+func TestPredicateSPMD_SwitchFallthroughComplexBody(t *testing.T) {
+	src := `package main
+
+func f(dst []int, s string) {
+	for i, start := range dst {
+		fieldLen := dst[i]
+		var value int
+		var hasLeadingZero bool
+		switch fieldLen {
+		case 3:
+			value = int(s[start+2] - '0')
+			hasLeadingZero = (value == 0)
+			fallthrough
+		case 2:
+			d1 := int(s[start+1] - '0')
+			value = value*10 + d1
+			if fieldLen == 2 {
+				hasLeadingZero = (d1 == 0)
+			}
+			fallthrough
+		case 1:
+			value = value*10 + int(s[start] - '0')
+		}
+		_ = hasLeadingZero
+		dst[i] = value
+	}
+}
+
+func main() { f(make([]int, 4), "abcdefghijklmnop") }
+`
+	// This test exercises the ipv4-parser pattern: fallthrough with inner
+	// if-else inside case 2. Without the exit-block fix, the inner If's
+	// then-successor gets incorrectly rewired, orphaning values.
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	if len(fn.SPMDSwitchChains) == 0 {
+		t.Fatal("expected SPMDSwitchChains to be populated")
+	}
+
+	// All switch chain Ifs must have been linearized.
+	chain := fn.SPMDSwitchChains[0]
+	for i, caseIf := range chain.Cases {
+		if caseIf.Block() != nil {
+			t.Errorf("case %d: If still has Block(): should be linearized", i)
+		}
+	}
+}
+
 // TestPredicateSPMD_SanityCheck verifies the sanity checker passes after
 // predicateSPMD runs on a function with a varying if-without-else.
 func TestPredicateSPMD_SanityCheck(t *testing.T) {
