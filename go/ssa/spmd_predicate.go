@@ -1185,19 +1185,37 @@ func predicateVaryingIf(fn *Function, lanes int, ifBlock *BasicBlock, vif *If, a
 		elseMask = spmdInsertMaskAndNot(ifBlock, activeMask, maskCond)
 	}
 
+	// Snapshot phi edges at mergeBlock for if-without-else patterns.
+	// spmdReplaceIfWithJump below removes ifBlock from mergeBlock.Preds
+	// (because elseBlock == mergeBlock), compacting Phi.Edges and losing
+	// the ifBlock edge values needed for SPMDSelect. Snapshot them now
+	// while the CFG is still intact. (Same pattern as
+	// spmdLinearizeLORShortCircuit.)
+	var ifWithoutElsePhiSnaps []spmdPhiSnapshot
+	if ifWithoutElse {
+		for _, instr := range mergeBlock.Instrs {
+			phi, ok := instr.(*Phi)
+			if !ok {
+				break // phis are always first
+			}
+			snap := spmdPhiSnapshot{phi: phi, edgeVal: make(map[*BasicBlock]Value, len(mergeBlock.Preds))}
+			for j, pred := range mergeBlock.Preds {
+				snap.edgeVal[pred] = phi.Edges[j]
+			}
+			ifWithoutElsePhiSnaps = append(ifWithoutElsePhiSnaps, snap)
+		}
+	}
+
 	// Replace the If terminator with a Jump to thenBlock.
 	spmdReplaceIfWithJump(ifBlock, thenBlock, elseBlock)
 
 	if ifWithoutElse {
 		// if-without-else: B→T→M (E is M)
-		// The then-block already jumps to M. No CFG rewiring needed,
-		// but we must fix the Phi edges at M since B no longer flows to M directly.
-		// After linearization, M's predecessor is T only (B→T→M).
-		// But wait: with if-without-else, thenBlock jumps to elseBlock (==mergeBlock).
-		// The merge still has T as predecessor (via the original T→M jump), so no
-		// Phi edge changes are needed.
-		// Replace Phis at merge with SPMDSelect using thenMask.
-		spmdReplacePhisWithSelect(mergeBlock, thenBlock, ifBlock, thenMask, thenMask, lanes)
+		// Use snapshotted phi edges to build SPMDSelect:
+		//   SPMDSelect(thenMask, thenBlock_value, ifBlock_value)
+		// Active lanes (cond true) get the then-branch value;
+		// inactive lanes keep the original value from ifBlock.
+		spmdReplaceBooleanChainPhis(mergeBlock, thenBlock, ifBlock, thenMask, lanes, ifWithoutElsePhiSnaps)
 
 		// Replace loads/stores in then-block.
 		spmdMaskMemOps(thenBlock, thenMask, lanes)
@@ -1917,6 +1935,28 @@ func predicateBooleanChain(fn *Function, lanes int, chain *SPMDBooleanChain, act
 		}
 	}
 
+	// Detect "then-as-merge" pattern: mergeBlock==nil because thenBlock has
+	// 3+ predecessors (chain blocks + elseBlock), but elseBlock has thenBlock
+	// as its sole successor. This happens with 3+ operand LOR/LAND chains
+	// used as value expressions (e.g., a || b || c). Snapshot phi edges at
+	// thenBlock now while the CFG is intact; chain block rewiring below
+	// removes chain blocks from thenBlock.Preds, compacting phi edges.
+	var thenAsMergeSnaps []spmdPhiSnapshot
+	if mergeBlock == nil && len(loopHeaderSnaps) == 0 &&
+		elseBlock != nil && len(elseBlock.Succs) == 1 && elseBlock.Succs[0] == thenBlock {
+		for _, instr := range thenBlock.Instrs {
+			phi, ok := instr.(*Phi)
+			if !ok {
+				break
+			}
+			snap := spmdPhiSnapshot{phi: phi, edgeVal: make(map[*BasicBlock]Value, len(thenBlock.Preds))}
+			for j, pred := range thenBlock.Preds {
+				snap.edgeVal[pred] = phi.Edges[j]
+			}
+			thenAsMergeSnaps = append(thenAsMergeSnaps, snap)
+		}
+	}
+
 	// Snapshot Phi edge values at the merge block. For if-without-else
 	// (elseBlock == mergeBlock), chain blocks are predecessors of mergeBlock
 	// and will be removed during linearization.
@@ -1968,9 +2008,16 @@ func predicateBooleanChain(fn *Function, lanes int, chain *SPMDBooleanChain, act
 				removeTo = thenBlock
 			}
 		} else {
-			// Last block always jumps to ThenBlock.
-			jumpTo = thenBlock
-			removeTo = elseBlock
+			// Last block: for "then-as-merge" patterns (3+ operand chains
+			// used as value expressions), jump to ElseBlock so the else path
+			// executes for all lanes. Otherwise jump to ThenBlock.
+			if len(thenAsMergeSnaps) > 0 {
+				jumpTo = elseBlock
+				removeTo = thenBlock
+			} else {
+				jumpTo = thenBlock
+				removeTo = elseBlock
+			}
 		}
 		spmdReplaceIfWithJump(block, jumpTo, removeTo)
 	}
@@ -2004,6 +2051,54 @@ func predicateBooleanChain(fn *Function, lanes int, chain *SPMDBooleanChain, act
 					phiSnaps:   loopHeaderSnaps,
 				})
 			}
+		} else if len(thenAsMergeSnaps) > 0 {
+			// "Then-as-merge" pattern: elseBlock → thenBlock, and thenBlock
+			// is the merge point for both chain short-circuit edges and the
+			// else/rhs value. Chain blocks were removed from thenBlock.Preds
+			// by spmdReplaceIfWithJump; elseBlock is the sole remaining pred.
+			// Use snapshotted phi edges to build SPMDSelect at thenBlock:
+			//   SPMDSelect(combinedMask, short_circuit_val, else_val)
+			for i, snap := range thenAsMergeSnaps {
+				// short_val: from any chain block (they all carry the same
+				// short-circuit constant, e.g. true for LOR, false for LAND).
+				var shortVal Value
+				for _, cb := range chain.Blocks {
+					if v, ok := snap.edgeVal[cb]; ok {
+						shortVal = v
+						break
+					}
+				}
+				elseVal := snap.edgeVal[elseBlock]
+				if shortVal == nil || elseVal == nil {
+					continue
+				}
+
+				sel := &SPMDSelect{
+					Mask:  thenMask,
+					X:     shortVal,
+					Y:     elseVal,
+					Lanes: lanes,
+				}
+				sel.setType(snap.phi.Type())
+				sel.setBlock(thenBlock)
+
+				spmdAddReferrer(thenMask, sel)
+				spmdAddReferrer(shortVal, sel)
+				spmdAddReferrer(elseVal, sel)
+
+				thenBlock.Instrs[i] = sel
+				replaceAll(snap.phi, sel)
+
+				for _, edge := range snap.edgeVal {
+					if edge != nil {
+						if refs := edge.Referrers(); refs != nil {
+							*refs = removeInstr(*refs, snap.phi)
+						}
+					}
+				}
+				snap.phi.block = nil
+			}
+			spmdMaskMemOps(elseBlock, activeMask, lanes)
 		} else {
 			// Complex CFG with no recognizable pattern: best-effort mask of
 			// then block only. Else block may be unreachable.
@@ -2096,7 +2191,7 @@ func spmdInsertBeforeTerminator(b *BasicBlock, instr Instruction) {
 	// Append a slot then shift the terminator right.
 	b.Instrs = append(b.Instrs, nil)
 	b.Instrs[n] = b.Instrs[n-1] // move terminator to end
-	b.Instrs[n-1] = instr        // insert instr before terminator
+	b.Instrs[n-1] = instr       // insert instr before terminator
 }
 
 // spmdRelocateToBlock moves all non-terminator instructions from src into dst,
@@ -2275,7 +2370,6 @@ func spmdReplacePhisWithSelect(mergeBlock, thenPred, elsePred *BasicBlock, thenM
 		mergeBlock.removePred(thenPred)
 	}
 }
-
 
 // spmdSwitchCaseInfo holds the per-case mask and body block for a linearized
 // switch case. Used internally by predicateVaryingSwitch.
@@ -3028,4 +3122,3 @@ func spmdNarrowMaskAtTypeAsserts(fn *Function, scopeBlocks map[*BasicBlock]bool,
 		}
 	}
 }
-
