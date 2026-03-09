@@ -626,3 +626,54 @@ func main() {
 		}
 	}
 }
+
+// TestIsSideEffectFreeBoolExpr verifies that side-effect-free varying &&/||
+// expressions are flattened (no binop.rhs blocks) while expressions with
+// function call side effects retain their short-circuit blocks.
+func TestIsSideEffectFreeBoolExpr(t *testing.T) {
+	src := `package main
+import "lanes"
+
+func sideEffect(v lanes.Varying[int]) lanes.Varying[bool] { return v > 0 }
+
+func f(a [4]int, b [4]int) {
+	for i, x := range a {
+		y := b[i]
+		_ = lanes.Varying[int](x)
+
+		// Side-effect-free: comparisons, &&, ||, !, parens, idents.
+		v1 := x > 0 && y < 10
+		v2 := x == 1 || (y != 2 && x >= 3)
+		v3 := !(x <= 5)
+
+		// Has side effects: function call — must keep short-circuit branches.
+		v4 := x > 0 && sideEffect(x)
+
+		_, _, _, _ = v1, v2, v3, v4
+	}
+}
+
+func main() {}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+
+	// v4 has a function call side effect, so binop.rhs must remain.
+	if !strings.Contains(output, "binop.rhs") {
+		t.Errorf("expected binop.rhs block for side-effecting expression (v4):\n%s", output)
+	}
+	// v1 and v2 are side-effect-free: they should produce BinOp AND/OR.
+	if !strings.Contains(output, " & ") {
+		t.Errorf("expected BinOp AND (&) for side-effect-free v1:\n%s", output)
+	}
+	if !strings.Contains(output, " | ") {
+		t.Errorf("expected BinOp OR (|) for side-effect-free v2:\n%s", output)
+	}
+}
