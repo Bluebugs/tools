@@ -6,6 +6,7 @@ package ssa
 
 import (
 	"go/ast"
+	"go/token"
 	"go/types"
 )
 
@@ -44,6 +45,71 @@ func exprHasSPMDType(fn *Function, e ast.Expr) bool {
 		return exprHasSPMDType(fn, e.X) || exprHasSPMDType(fn, e.Index)
 	}
 	return false
+}
+
+// isSideEffectFreeBoolExpr reports whether the boolean expression e can be
+// evaluated unconditionally without side effects. Used to flatten varying
+// &&/|| to bitwise AND/OR instead of short-circuit branches.
+//
+// Safe expressions: comparisons (with safe operands), boolean literals,
+// variable references, field selectors, unary !, parenthesized expressions,
+// and nested &&/||.
+// Unsafe: function calls, index expressions, channel ops, etc.
+func isSideEffectFreeBoolExpr(fn *Function, e ast.Expr) bool {
+	switch e := e.(type) {
+	case *ast.BinaryExpr:
+		switch e.Op {
+		case token.LAND, token.LOR:
+			return isSideEffectFreeBoolExpr(fn, e.X) && isSideEffectFreeBoolExpr(fn, e.Y)
+		case token.EQL, token.NEQ, token.LSS, token.LEQ, token.GTR, token.GEQ:
+			// Comparisons are side-effect-free only if their operands are too.
+			return isSideEffectFreeExpr(e.X) && isSideEffectFreeExpr(e.Y)
+		default:
+			return false
+		}
+	case *ast.UnaryExpr:
+		if e.Op == token.NOT {
+			return isSideEffectFreeBoolExpr(fn, e.X)
+		}
+		return false
+	case *ast.ParenExpr:
+		return isSideEffectFreeBoolExpr(fn, e.X)
+	case *ast.Ident:
+		return true
+	case *ast.BasicLit:
+		return true
+	default:
+		return false
+	}
+}
+
+// isSideEffectFreeExpr reports whether a general expression (not necessarily
+// boolean) can be evaluated without side effects. Used to check comparison
+// operands in isSideEffectFreeBoolExpr.
+func isSideEffectFreeExpr(e ast.Expr) bool {
+	switch e := e.(type) {
+	case *ast.Ident:
+		return true
+	case *ast.BasicLit:
+		return true
+	case *ast.SelectorExpr:
+		return isSideEffectFreeExpr(e.X)
+	case *ast.ParenExpr:
+		return isSideEffectFreeExpr(e.X)
+	case *ast.UnaryExpr:
+		return isSideEffectFreeExpr(e.X)
+	case *ast.BinaryExpr:
+		// Arithmetic ops (+, -, *, etc.) are side-effect-free.
+		return isSideEffectFreeExpr(e.X) && isSideEffectFreeExpr(e.Y)
+	case *ast.CallExpr:
+		// Function calls may have side effects.
+		return false
+	case *ast.IndexExpr:
+		// Index expressions can panic on out-of-bounds.
+		return false
+	default:
+		return false
+	}
 }
 
 // resolveSPMDSwitchChains updates SPMDSwitchChain block pointers after
