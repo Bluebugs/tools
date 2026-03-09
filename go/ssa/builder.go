@@ -293,13 +293,40 @@ func (b *builder) cond(fn *Function, e ast.Expr, t, f *BasicBlock) {
 // ||-expression whose reified boolean value is wanted.
 // The value is returned.
 func (b *builder) logicalBinop(fn *Function, e *ast.BinaryExpr) Value {
-	rhs := fn.newBasicBlock("binop.rhs")
-	done := fn.newBasicBlock("binop.done")
-
 	// T(e) = T(e.X) = T(e.Y) after untyped constants have been
 	// eliminated.
 	// TODO(adonovan): not true; MyBool==MyBool yields UntypedBool.
 	t := fn.typeOf(e)
+
+	// Varying boolean with side-effect-free operands: flatten to BinOp AND/OR.
+	// Both sides are evaluated unconditionally (no short-circuit branches).
+	// This avoids creating binop.rhs/binop.done blocks that the predicate
+	// pass cannot handle for nested mixed &&/|| chains (e.g., deeply nested
+	// a && (b || (c && d)) produces `br <N x i1>` which is invalid LLVM IR).
+	// Recursive logicalBinop calls for sub-expressions naturally flatten the
+	// entire tree.
+	if _, ok := t.(*types.SPMDType); ok {
+		if isSideEffectFreeBoolExpr(fn, e.X) && isSideEffectFreeBoolExpr(fn, e.Y) {
+			x := b.expr(fn, e.X)
+			y := b.expr(fn, e.Y)
+			var op token.Token
+			switch e.Op {
+			case token.LAND:
+				op = token.AND
+			case token.LOR:
+				op = token.OR
+			default:
+				panic("logicalBinop: unexpected op " + e.Op.String())
+			}
+			v := &BinOp{Op: op, X: x, Y: y}
+			v.pos = e.OpPos
+			v.typ = t
+			return fn.emit(v)
+		}
+	}
+
+	rhs := fn.newBasicBlock("binop.rhs")
+	done := fn.newBasicBlock("binop.done")
 
 	var short Value // value of the short-circuit path
 	switch e.Op {
