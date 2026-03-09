@@ -3756,8 +3756,10 @@ func main() {}
 	var buf bytes.Buffer
 	ssa.WriteFunction(&buf, fn)
 	output := buf.String()
-	if !strings.Contains(output, "spmd_select") {
-		t.Errorf("expected spmd_select (phi→select conversion) after LOR linearization:\n%s", output)
+	// After flattening, fieldLen < 1 || fieldLen > 3 is a side-effect-free varying
+	// expression, so it is flattened to BinOp OR instead of phi→spmd_select.
+	if !strings.Contains(output, " | ") && !strings.Contains(output, "spmd_select") {
+		t.Errorf("expected BinOp OR (|) or spmd_select after LOR handling:\n%s", output)
 	}
 }
 
@@ -3797,6 +3799,159 @@ func main() {}
 	)
 	if err != nil {
 		t.Fatalf("SanityCheck failed: %v", err)
+	}
+}
+
+// TestPredicateSPMD_VaryingLogicalBinopFlattened verifies that a simple &&
+// expression with side-effect-free varying operands is flattened to a BinOp
+// AND instruction rather than creating binop.rhs/binop.done short-circuit
+// blocks.
+func TestPredicateSPMD_VaryingLogicalBinopFlattened(t *testing.T) {
+	src := `package main
+import "lanes"
+
+func f(a [4]int, b [4]int) {
+	for i, x := range a {
+		y := b[i]
+		_ = lanes.Varying[int](x)
+		result := x > 0 && y < 10
+		_ = result
+	}
+}
+
+func main() {}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+
+	if strings.Contains(output, "binop.rhs") {
+		t.Errorf("expected no binop.rhs block (logicalBinop should be flattened):\n%s", output)
+	}
+	if strings.Contains(output, "binop.done") {
+		t.Errorf("expected no binop.done block (logicalBinop should be flattened):\n%s", output)
+	}
+	if !strings.Contains(output, " & ") {
+		t.Errorf("expected BinOp AND (&) in flattened output:\n%s", output)
+	}
+}
+
+// TestPredicateSPMD_VaryingLogicalBinopNestedMixed verifies that deeply nested
+// &&/|| chains (the ipv4-parser pattern) are fully flattened to BinOp AND/OR
+// with no binop.rhs/binop.done short-circuit blocks remaining.
+func TestPredicateSPMD_VaryingLogicalBinopNestedMixed(t *testing.T) {
+	src := `package main
+import "lanes"
+
+func f(a [4]int, b [4]int, c [4]int, d [4]int) {
+	for i, fieldLen := range a {
+		b0 := b[i]
+		b1 := c[i]
+		b2 := d[i]
+		_ = lanes.Varying[int](fieldLen)
+		hasOverflow := fieldLen == 3 && (b0 > 2 || (b0 == 2 && (b1 > 5 || (b1 == 5 && b2 > 5))))
+		_ = hasOverflow
+	}
+}
+
+func main() {}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+
+	if strings.Contains(output, "binop.rhs") {
+		t.Errorf("expected no binop.rhs blocks for nested &&/||:\n%s", output)
+	}
+	if !strings.Contains(output, " & ") {
+		t.Errorf("expected BinOp AND (&):\n%s", output)
+	}
+	if !strings.Contains(output, " | ") {
+		t.Errorf("expected BinOp OR (|):\n%s", output)
+	}
+}
+
+// TestPredicateSPMD_VaryingLogicalBinopNestedMixedSanity verifies that the SSA
+// sanity checker passes after flattening a deeply nested &&/|| expression.
+func TestPredicateSPMD_VaryingLogicalBinopNestedMixedSanity(t *testing.T) {
+	src := `package main
+import "lanes"
+
+func f(a [4]int, b [4]int, c [4]int, d [4]int) {
+	for i, fieldLen := range a {
+		b0 := b[i]
+		b1 := c[i]
+		b2 := d[i]
+		_ = lanes.Varying[int](fieldLen)
+		hasOverflow := fieldLen == 3 && (b0 > 2 || (b0 == 2 && (b1 > 5 || (b1 == 5 && b2 > 5))))
+		_ = hasOverflow
+	}
+}
+
+func main() {}
+`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setSPMDOnRange(file)
+
+	_, _, err = ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{file},
+		ssa.SanityCheckFunctions,
+	)
+	if err != nil {
+		t.Fatalf("SanityCheck failed: %v", err)
+	}
+}
+
+// TestPredicateSPMD_VaryingLogicalBinopSideEffectsPreserved verifies that &&
+// expressions with side-effecting operands (function calls) are NOT flattened
+// and retain the binop.rhs/binop.done short-circuit blocks.
+func TestPredicateSPMD_VaryingLogicalBinopSideEffectsPreserved(t *testing.T) {
+	src := `package main
+import "lanes"
+
+func sideEffect(v lanes.Varying[int]) lanes.Varying[bool] { return v > 0 }
+
+func f(a [4]int) {
+	for _, x := range a {
+		_ = lanes.Varying[int](x)
+		// Function call has side effects — must keep short-circuit branches.
+		result := x > 0 && sideEffect(x)
+		_ = result
+	}
+}
+
+func main() {}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+
+	// Short-circuit blocks must remain for side-effecting expressions.
+	if !strings.Contains(output, "binop.rhs") {
+		t.Errorf("expected binop.rhs block preserved for side-effecting expression:\n%s", output)
 	}
 }
 
