@@ -1078,12 +1078,28 @@ func spmdLoopScopeBlocks(loop *SPMDLoopInfo) map[*BasicBlock]bool {
 			if succ == loop.EntryBlock {
 				continue
 			}
+			// Stop at blocks containing a Return instruction. These are
+			// uniform early-return paths (return under varying conditions
+			// is forbidden in go-for), and should not be masked.
+			if spmdBlockHasReturn(succ) {
+				continue
+			}
 			scope[succ] = true
 			queue = append(queue, succ)
 		}
 	}
 
 	return scope
+}
+
+// spmdBlockHasReturn reports whether block b contains a Return instruction.
+func spmdBlockHasReturn(b *BasicBlock) bool {
+	for _, instr := range b.Instrs {
+		if _, ok := instr.(*Return); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // spmdTailScopeBlocks returns the subset of liveScopeBlocks that belong to the
