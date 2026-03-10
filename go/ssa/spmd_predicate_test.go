@@ -3280,7 +3280,7 @@ func TestSPMDStore_OperandsWithSource(t *testing.T) {
 
 // TestPredicateSPMD_ConvertAllMemOps_FuncBody verifies that straight-line
 // loads/stores in an SPMD function body are converted to SPMDLoad/SPMDStore
-// by spmdConvertAllMemOps.
+// by spmdMaskMemOps (called inline from predicateSPMDScope).
 func TestPredicateSPMD_ConvertAllMemOps_FuncBody(t *testing.T) {
 	src := `package main
 import "lanes"
@@ -3302,7 +3302,7 @@ func main() {}
 	ssa.WriteFunction(&buf, fn)
 	output := buf.String()
 
-	// After spmdConvertAllMemOps, there should be no plain *UnOp{MUL} or *Store
+	// After predication, there should be no plain *UnOp{MUL} or *Store
 	// in the function — all should be converted to SPMDLoad/SPMDStore.
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
@@ -3332,8 +3332,8 @@ func main() {}
 }
 
 // TestPredicateSPMD_ConvertAllMemOps_SkipsConverted verifies that
-// spmdConvertAllMemOps does not double-convert instructions that were
-// already converted by predicateSPMDScope (inside varying branches).
+// spmdMaskMemOps does not double-convert instructions that were
+// already converted inside varying branches.
 func TestPredicateSPMD_ConvertAllMemOps_SkipsConverted(t *testing.T) {
 	src := `package main
 import "lanes"
@@ -3362,7 +3362,7 @@ func main() {}
 		}
 	}
 	// Two stores: one inside varying if (converted by predicateSPMDScope),
-	// one outside (converted by spmdConvertAllMemOps).
+	// one outside (converted by spmdMaskMemOps in straight-line scope).
 	if spmdStoreCount < 2 {
 		var buf bytes.Buffer
 		ssa.WriteFunction(&buf, fn)
@@ -4250,5 +4250,112 @@ func main() {
 	)
 	if err != nil {
 		t.Fatalf("SanityCheckFunctions failed on if/else-if chain: %v", err)
+	}
+}
+
+// TestPredicateSPMD_GoForContinueMaskNarrowing verifies that a continue inside
+// a varying if narrows the mask for subsequent memory ops in the same iteration.
+// Before this fix, the store after the if used a flat mask (all-ones or TailMask)
+// instead of activeMask & ~cond.
+func TestPredicateSPMD_GoForContinueMaskNarrowing(t *testing.T) {
+	src := `package main
+
+func f(data []int, out []int) {
+	for i, v := range data {
+		if v == 0 {
+			continue
+		}
+		out[i] = v * 2
+	}
+}
+
+func main() { f(make([]int, 8), make([]int, 8)) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+	// Find the SPMDStore for `out[i] = v * 2`.
+	// Its mask must NOT be a flat all-ones or TailMask parameter.
+	// It must be a BinOp (AND or ANDNOT) that narrows the mask based on the
+	// varying condition `v == 0`.
+	var storeCount int
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			store, ok := instr.(*ssa.SPMDStore)
+			if !ok {
+				continue
+			}
+			storeCount++
+			// The mask should be derived from the condition, not a flat mask.
+			// A flat mask would be a Const (all-ones) or a Parameter (TailMask).
+			switch store.Mask.(type) {
+			case *ssa.Const:
+				t.Errorf("SPMDStore mask is a Const (flat mask); expected narrowed mask after continue:\n%s", output)
+			case *ssa.Parameter:
+				t.Errorf("SPMDStore mask is a Parameter (flat TailMask); expected narrowed mask after continue:\n%s", output)
+			}
+		}
+	}
+	if storeCount == 0 {
+		t.Errorf("expected at least one SPMDStore for `out[i] = v * 2`:\n%s", output)
+	}
+}
+
+// TestPredicateSPMD_GoForNestedContinueMask verifies that continue inside a
+// nested varying if composes masks correctly: the store between inner and outer
+// if uses the inner-narrowed mask, and the store after the outer if uses the
+// fully-narrowed mask.
+func TestPredicateSPMD_GoForNestedContinueMask(t *testing.T) {
+	src := `package main
+
+func f(data []int, out []int) {
+	for i, v := range data {
+		if v > 0 {
+			if v > 10 {
+				continue
+			}
+			out[i] = v
+		}
+		out[i] = v * 3
+	}
+}
+
+func main() { f(make([]int, 8), make([]int, 8)) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+
+	// There should be SPMDStore instructions and none should have a flat mask.
+	var storeCount int
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			store, ok := instr.(*ssa.SPMDStore)
+			if !ok {
+				continue
+			}
+			storeCount++
+			switch store.Mask.(type) {
+			case *ssa.Const:
+				t.Errorf("SPMDStore mask is a Const (flat mask); expected narrowed mask in nested continue:\n%s", output)
+			case *ssa.Parameter:
+				t.Errorf("SPMDStore mask is a Parameter (flat TailMask); expected narrowed mask in nested continue:\n%s", output)
+			}
+		}
+	}
+	if storeCount == 0 {
+		t.Errorf("expected SPMDStore instructions:\n%s", output)
 	}
 }
