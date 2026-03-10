@@ -430,7 +430,6 @@ type SPMDLoopInfo struct {
 	TrampolineBlock *BasicBlock // accumulator merge block before DoneBlock (nil if no accumulators)
 	AlignedBound    Value       // bound & ~(laneCount-1)
 	TailMask        Value       // virtual parameter representing the tail mask; TinyGo materializes it
-	ContinueMask    Value       // narrowed mask from varying continue (nil if no continue); used post-peeling
 	MainIterPhi     *Phi        // iter phi in MainBodyBlock
 	TailIterPhi     *Phi        // iter phi in TailCheckBlock
 
