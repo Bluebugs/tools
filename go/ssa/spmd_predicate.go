@@ -187,40 +187,57 @@ func spmdConvertLoopOps(fn *Function) {
 			continue
 		}
 
-		// Create tail mask virtual parameter for this loop if peeled.
-		if loop.IsPeeled && loop.TailMask == nil {
-			loop.TailMask = &Parameter{name: "spmd.tail.mask", typ: spmdpkg.NewVaryingMask(), parent: fn}
-		}
-
-		// Separate main vs tail blocks so each phase gets the appropriate mask.
-		tailBlocks := spmdTailScopeBlocks(loop, liveScopeBlocks)
-		mainBlocks := make(map[*BasicBlock]bool)
-		for b := range liveScopeBlocks {
-			if !tailBlocks[b] {
-				mainBlocks[b] = true
+		if loop.IsPeeled {
+			// Create tail mask virtual parameter for the tail phase.
+			if loop.TailMask == nil {
+				loop.TailMask = &Parameter{name: "spmd.tail.mask", typ: spmdpkg.NewVaryingMask(), parent: fn}
 			}
+
+			// Peeled: separate main (all-ones) vs tail (partial) blocks.
+			tailBlocks := spmdTailScopeBlocks(loop, liveScopeBlocks)
+			mainBlocks := make(map[*BasicBlock]bool)
+			for b := range liveScopeBlocks {
+				if !tailBlocks[b] {
+					mainBlocks[b] = true
+				}
+			}
+
+			// Convert main blocks with all-ones mask (every lane is active).
+			spmdConvertScopedMemOps(fn, mainBlocks, allOnesMask, loop.LaneCount)
+			spmdMaskScopedCallOps(fn, mainBlocks, allOnesMask)
+			spmdMaskScopedIndexOps(fn, mainBlocks, allOnesMask)
+			spmdMaskScopedMakeInterfaceOps(fn, mainBlocks, allOnesMask, loop.LaneCount)
+
+			// Convert tail blocks with the tail mask (partial last iteration).
+			spmdConvertScopedMemOps(fn, tailBlocks, loop.TailMask, loop.LaneCount)
+			spmdMaskScopedCallOps(fn, tailBlocks, loop.TailMask)
+			spmdMaskScopedIndexOps(fn, tailBlocks, loop.TailMask)
+			spmdMaskScopedMakeInterfaceOps(fn, tailBlocks, loop.TailMask, loop.LaneCount)
+
+			// Narrow mask at TypeAssert sites in both main and tail blocks.
+			spmdNarrowMaskAtTypeAsserts(fn, mainBlocks, allOnesMask, loop.LaneCount)
+			spmdNarrowMaskAtTypeAsserts(fn, tailBlocks, loop.TailMask, loop.LaneCount)
+		} else if loop.IsRangeIndex {
+			// Non-peeled rangeindex: array length may not be a multiple of
+			// laneCount, so every iteration may be partial. Use tail mask
+			// for all scope blocks to prevent OOB loads on inactive lanes.
+			if loop.TailMask == nil {
+				loop.TailMask = &Parameter{name: "spmd.tail.mask", typ: spmdpkg.NewVaryingMask(), parent: fn}
+			}
+			spmdConvertScopedMemOps(fn, liveScopeBlocks, loop.TailMask, loop.LaneCount)
+			spmdMaskScopedCallOps(fn, liveScopeBlocks, loop.TailMask)
+			spmdMaskScopedIndexOps(fn, liveScopeBlocks, loop.TailMask)
+			spmdMaskScopedMakeInterfaceOps(fn, liveScopeBlocks, loop.TailMask, loop.LaneCount)
+			spmdNarrowMaskAtTypeAsserts(fn, liveScopeBlocks, loop.TailMask, loop.LaneCount)
+		} else {
+			// Non-peeled rangeint: inactive lanes in the last iteration
+			// don't cause OOB (no array indexing), so all-ones mask is safe.
+			spmdConvertScopedMemOps(fn, liveScopeBlocks, allOnesMask, loop.LaneCount)
+			spmdMaskScopedCallOps(fn, liveScopeBlocks, allOnesMask)
+			spmdMaskScopedIndexOps(fn, liveScopeBlocks, allOnesMask)
+			spmdMaskScopedMakeInterfaceOps(fn, liveScopeBlocks, allOnesMask, loop.LaneCount)
+			spmdNarrowMaskAtTypeAsserts(fn, liveScopeBlocks, allOnesMask, loop.LaneCount)
 		}
-
-		// Convert main blocks with all-ones mask (every lane is active).
-		spmdConvertScopedMemOps(fn, mainBlocks, allOnesMask, loop.LaneCount)
-		spmdMaskScopedCallOps(fn, mainBlocks, allOnesMask)
-		spmdMaskScopedIndexOps(fn, mainBlocks, allOnesMask)
-		spmdMaskScopedMakeInterfaceOps(fn, mainBlocks, allOnesMask, loop.LaneCount)
-
-		// Convert tail blocks with the tail mask (partial last iteration).
-		tailMask := Value(allOnesMask)
-		if loop.TailMask != nil {
-			tailMask = loop.TailMask
-		}
-		spmdConvertScopedMemOps(fn, tailBlocks, tailMask, loop.LaneCount)
-		spmdMaskScopedCallOps(fn, tailBlocks, tailMask)
-		spmdMaskScopedIndexOps(fn, tailBlocks, tailMask)
-		spmdMaskScopedMakeInterfaceOps(fn, tailBlocks, tailMask, loop.LaneCount)
-
-		// Narrow mask at TypeAssert sites in both main and tail blocks.
-		// Use the appropriate base mask for each phase.
-		spmdNarrowMaskAtTypeAsserts(fn, mainBlocks, allOnesMask, loop.LaneCount)
-		spmdNarrowMaskAtTypeAsserts(fn, tailBlocks, tailMask, loop.LaneCount)
 	}
 }
 
