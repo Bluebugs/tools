@@ -152,6 +152,10 @@ func spmdCloneBlock(fn *Function, srcBlock *BasicBlock, dstBlock *BasicBlock,
 			newInstr.Index = spmdTranslateValue(v.Index, valueMap)
 			newInstr.setType(v.Type())
 			newInstr.setBlock(dstBlock)
+			// Preserve gather group annotation so TinyGo can use the same cache key
+			// across both the main and tail peeled blocks.
+			newInstr.SPMDGatherGroup = v.SPMDGatherGroup
+			newInstr.SPMDGatherPos = v.SPMDGatherPos
 			dstBlock.Instrs = append(dstBlock.Instrs, newInstr)
 			valueMap[v] = newInstr
 			spmdAddReferrer(newInstr.X, newInstr)

@@ -113,6 +113,163 @@ func predicateSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 
 	// Pass 2: convert deferred loop-header phi→SPMDSelect.
 	spmdConvertDeferredMerges(fn, deferred)
+
+	// Pass 3: detect gather coalescing opportunities for small byte arrays.
+	spmdDetectGatherGroups(fn, loop, scopeBlocks)
+}
+
+// spmdDetectGatherGroups scans scopeBlocks for Index instructions on the same
+// small [N]byte array (N ≤ 16) with varying indices that share a common base and
+// differ only by constant offsets. Groups with ≥ 2 such members are annotated with
+// an SPMDGatherGroup so TinyGo can coalesce them into a single i8x16.swizzle.
+//
+// Detection criteria for a candidate Index instruction:
+//   - The array element type is byte or uint8.
+//   - The array length is ≤ 16.
+//   - The index value has *types.SPMDType (i.e., it is a varying value).
+//
+// Base/offset decomposition for the index:
+//   - Direct varying value v → base=v, offset=0.
+//   - BinOp{ADD, v, k} where k is a *Const integer → base=v, offset=k.
+//   - BinOp{ADD, k, v} where k is a *Const integer → base=v, offset=k.
+//
+// Stride is 16 / laneCount (e.g., 4 for 4 i32 lanes). This reflects the merged
+// swizzle result layout: [m0_l0, m1_l0, …, pad, m0_l1, m1_l1, …, pad, …].
+func spmdDetectGatherGroups(fn *Function, loop *SPMDLoopInfo, scopeBlocks map[*BasicBlock]bool) {
+	// gatherKey identifies a group: same source value and same base varying index.
+	// For *Index, source is the array value; for *IndexAddr, source is the pointer value.
+	type gatherKey struct {
+		source Value
+		base   Value
+	}
+
+	// candidate wraps either an *Index or *IndexAddr instruction.
+	type candidate struct {
+		index    *Index     // non-nil if this is a direct index
+		indexAddr *IndexAddr // non-nil if this is an address-of-element
+		indexVal  Value      // the varying index value
+		offset    int
+	}
+
+	// Collect candidates keyed by (source, base).
+	groups := make(map[gatherKey][]candidate)
+
+	// spmdAddCandidate checks whether a source value + index combination qualifies
+	// as a gather candidate and, if so, adds it to the groups map.
+	//
+	// arrType is the *types.Array that the operation targets.
+	// source is the SSA value identifying the array (array value for *Index,
+	// pointer value for *IndexAddr — the same pointer is reused for all accesses to
+	// a local array).
+	// idxVal is the varying index expression.
+	spmdAddCandidate := func(arrType *types.Array, source, idxVal Value, idx *Index, idxAddr *IndexAddr) {
+		if arrType.Len() > 16 {
+			return
+		}
+		elem, ok := arrType.Elem().Underlying().(*types.Basic)
+		if !ok {
+			return
+		}
+		if elem.Kind() != types.Byte && elem.Kind() != types.Uint8 {
+			return
+		}
+
+		// The index must be a varying value.
+		if _, isSPMD := idxVal.Type().(*types.SPMDType); !isSPMD {
+			return
+		}
+
+		// Decompose index into base + constant offset.
+		base := idxVal
+		offset := 0
+		if binop, ok := idxVal.(*BinOp); ok && binop.Op == token.ADD {
+			if c, ok := binop.X.(*Const); ok {
+				if v, ok := constant.Int64Val(c.Value); ok {
+					base = binop.Y
+					offset = int(v)
+				}
+			} else if c, ok := binop.Y.(*Const); ok {
+				if v, ok := constant.Int64Val(c.Value); ok {
+					base = binop.X
+					offset = int(v)
+				}
+			}
+		}
+
+		key := gatherKey{source: source, base: base}
+		groups[key] = append(groups[key], candidate{
+			index:     idx,
+			indexAddr: idxAddr,
+			indexVal:  idxVal,
+			offset:    offset,
+		})
+	}
+
+	for b := range scopeBlocks {
+		for _, instr := range b.Instrs {
+			switch v := instr.(type) {
+			case *Index:
+				// Direct array index — source is the array value.
+				// X.Type() is the array type directly.
+				arrType, ok := v.X.Type().Underlying().(*types.Array)
+				if ok {
+					spmdAddCandidate(arrType, v.X, v.Index, v, nil)
+				}
+
+			case *IndexAddr:
+				// Address-of array element — X is a pointer (*[N]byte) or array/slice.
+				// For a local [N]byte alloca, X is the same *[N]byte pointer for all
+				// accesses, giving us a shared source key.
+				ptrType, ok := v.X.Type().Underlying().(*types.Pointer)
+				if !ok {
+					continue
+				}
+				arrType, ok := ptrType.Elem().Underlying().(*types.Array)
+				if ok {
+					spmdAddCandidate(arrType, v.X, v.Index, nil, v)
+				}
+			}
+		}
+	}
+
+	// stride = 16 / laneCount (bytes per lane in the merged swizzle result).
+	stride := 16 / loop.LaneCount
+
+	// Annotate groups with ≥ 2 members.
+	for key, candidates := range groups {
+		if len(candidates) < 2 {
+			continue
+		}
+
+		// Sort members by offset for deterministic Pos assignment.
+		slices.SortFunc(candidates, func(a, b candidate) int {
+			return a.offset - b.offset
+		})
+
+		group := &SPMDGatherGroup{
+			Source:  key.source,
+			Base:    key.base,
+			Stride:  stride,
+			Members: make([]*SPMDGatherMember, len(candidates)),
+		}
+
+		for i, c := range candidates {
+			member := &SPMDGatherMember{
+				Offset: c.offset,
+				Pos:    c.offset, // position within stride group = offset
+			}
+			if c.index != nil {
+				member.Instr = c.index
+				c.index.SPMDGatherGroup = group
+				c.index.SPMDGatherPos = c.offset
+			} else {
+				member.InstrAddr = c.indexAddr
+				c.indexAddr.SPMDGatherGroup = group
+				c.indexAddr.SPMDGatherPos = c.offset
+			}
+			group.Members[i] = member
+		}
+	}
 }
 
 // spmdConvertLoopOps converts straight-line mem ops and masks SPMD function calls

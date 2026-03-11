@@ -4252,3 +4252,285 @@ func main() {
 		t.Fatalf("SanityCheckFunctions failed on if/else-if chain: %v", err)
 	}
 }
+
+// TestPredicateSPMD_GatherGroup_ThreeOffsets verifies that three IndexAddr
+// instructions on the same [16]byte array parameter with varying indices that
+// differ by constant offsets (0, 1, 2) are annotated with the same
+// SPMDGatherGroup and distinct SPMDGatherPos values matching their offsets.
+//
+// Array parameters are addressable in Go SSA (stored to a local alloca), so
+// indexing them emits *ssa.IndexAddr rather than *ssa.Index. The shared alloca
+// pointer gives spmdDetectGatherGroups a common source key for all three accesses.
+func TestPredicateSPMD_GatherGroup_ThreeOffsets(t *testing.T) {
+	src := `package main
+import "lanes"
+
+func f(input [16]byte, n int) {
+	for i := range n {
+		c := lanes.Varying[int](i)
+		d0 := input[c]
+		d1 := input[c+1]
+		d2 := input[c+2]
+		_, _, _ = d0, d1, d2
+	}
+}
+
+func main() { var arr [16]byte; f(arr, 4) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	// Collect all IndexAddr instructions that belong to a gather group.
+	// After loop peeling, instructions are duplicated across the main and tail
+	// phases, so we expect 6 annotated IndexAddr instructions (3 per phase) all
+	// pointing to the same SPMDGatherGroup (the group was detected on the original
+	// body block and the pointer is preserved through cloning).
+	var grouped []*ssa.IndexAddr
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			if idx, ok := instr.(*ssa.IndexAddr); ok && idx.SPMDGatherGroup != nil {
+				grouped = append(grouped, idx)
+			}
+		}
+	}
+
+	if len(grouped) == 0 {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Fatalf("expected grouped IndexAddr instructions, got none:\n%s", buf.String())
+	}
+
+	// All must share the same group pointer (both main and tail phases use the
+	// original group annotation).
+	group := grouped[0].SPMDGatherGroup
+	for i, idx := range grouped {
+		if idx.SPMDGatherGroup != group {
+			t.Errorf("grouped[%d] has different SPMDGatherGroup pointer", i)
+		}
+	}
+
+	// Collect the set of SPMDGatherPos values — must be {0, 1, 2}.
+	posSet := make(map[int]bool)
+	for _, idx := range grouped {
+		posSet[idx.SPMDGatherPos] = true
+	}
+	for _, want := range []int{0, 1, 2} {
+		if !posSet[want] {
+			t.Errorf("expected SPMDGatherPos %d in group, got set %v", want, posSet)
+		}
+	}
+
+	// Group must have 3 members (the members record the original body block's
+	// IndexAddr instructions, not the cloned copies).
+	if len(group.Members) != 3 {
+		t.Errorf("group.Members has %d entries, want 3", len(group.Members))
+	}
+}
+
+// TestPredicateSPMD_GatherGroup_TwoOffsets verifies that two IndexAddr
+// instructions on the same [16]byte array parameter with varying indices
+// differing by a constant offset of 1 are grouped together with
+// SPMDGatherPos 0 and 1.
+func TestPredicateSPMD_GatherGroup_TwoOffsets(t *testing.T) {
+	src := `package main
+import "lanes"
+
+func f(input [16]byte, n int) {
+	for i := range n {
+		c := lanes.Varying[int](i)
+		d0 := input[c]
+		d1 := input[c+1]
+		_, _ = d0, d1
+	}
+}
+
+func main() { var arr [16]byte; f(arr, 4) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	// After loop peeling, instructions are duplicated across main and tail phases,
+	// so there will be 4 annotated IndexAddr instructions (2 per phase) all sharing
+	// the same SPMDGatherGroup.
+	var grouped []*ssa.IndexAddr
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			if idx, ok := instr.(*ssa.IndexAddr); ok && idx.SPMDGatherGroup != nil {
+				grouped = append(grouped, idx)
+			}
+		}
+	}
+
+	if len(grouped) == 0 {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Fatalf("expected grouped IndexAddr instructions, got none:\n%s", buf.String())
+	}
+
+	// All must share the same group pointer.
+	group := grouped[0].SPMDGatherGroup
+	for i, idx := range grouped {
+		if idx.SPMDGatherGroup != group {
+			t.Errorf("grouped[%d] has different SPMDGatherGroup pointer", i)
+		}
+	}
+
+	posSet := make(map[int]bool)
+	for _, idx := range grouped {
+		posSet[idx.SPMDGatherPos] = true
+	}
+	if !posSet[0] || !posSet[1] {
+		t.Errorf("expected SPMDGatherPos 0 and 1, got %v", posSet)
+	}
+
+	if len(group.Members) != 2 {
+		t.Errorf("group.Members has %d entries, want 2", len(group.Members))
+	}
+}
+
+// TestPredicateSPMD_GatherGroup_DifferentSources verifies that Index instructions
+// on different arrays do not form a group: each source has only one member so the
+// minimum-2-member threshold is not reached.
+func TestPredicateSPMD_GatherGroup_DifferentSources(t *testing.T) {
+	src := `package main
+import "lanes"
+
+func f(arrA, arrB [16]byte, n int) {
+	for i := range n {
+		c := lanes.Varying[int](i)
+		d0 := arrA[c]
+		d1 := arrB[c+1]
+		_, _ = d0, d1
+	}
+}
+
+func main() { var a, b [16]byte; f(a, b, 4) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	// Neither single-member group should be annotated — check both Index and
+	// IndexAddr since array parameters produce IndexAddr in Go SSA.
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			switch v := instr.(type) {
+			case *ssa.Index:
+				if v.SPMDGatherGroup != nil {
+					var buf bytes.Buffer
+					ssa.WriteFunction(&buf, fn)
+					t.Fatalf("unexpected SPMDGatherGroup on Index (different source arrays should not group):\n%s", buf.String())
+				}
+			case *ssa.IndexAddr:
+				if v.SPMDGatherGroup != nil {
+					var buf bytes.Buffer
+					ssa.WriteFunction(&buf, fn)
+					t.Fatalf("unexpected SPMDGatherGroup on IndexAddr (different source arrays should not group):\n%s", buf.String())
+				}
+			}
+		}
+	}
+}
+
+// TestPredicateSPMD_GatherGroup_NonConstantOffset verifies that two Index
+// instructions on the same [16]byte array where the second index is base+varying
+// (not base+constant) do not form a group, because the offset is not a compile-time
+// constant.
+func TestPredicateSPMD_GatherGroup_NonConstantOffset(t *testing.T) {
+	src := `package main
+import "lanes"
+
+func f(input [16]byte, n int) {
+	for i := range n {
+		c := lanes.Varying[int](i)
+		v := lanes.Varying[int](n) // another varying value
+		d0 := input[c]
+		d1 := input[c+v]
+		_, _ = d0, d1
+	}
+}
+
+func main() { var arr [16]byte; f(arr, 4) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	// No group should be formed: the offset between c and c+v is not constant.
+	// d0 has base=c, offset=0; d1 has base=c (after decomposition fails because
+	// v is not *Const) → base=c+v, offset=0. Different bases → different keys.
+	// Check both Index and IndexAddr since array parameters produce IndexAddr.
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			switch v := instr.(type) {
+			case *ssa.Index:
+				if v.SPMDGatherGroup != nil {
+					var buf bytes.Buffer
+					ssa.WriteFunction(&buf, fn)
+					t.Fatalf("unexpected SPMDGatherGroup: non-constant offset should not form a group:\n%s", buf.String())
+				}
+			case *ssa.IndexAddr:
+				if v.SPMDGatherGroup != nil {
+					var buf bytes.Buffer
+					ssa.WriteFunction(&buf, fn)
+					t.Fatalf("unexpected SPMDGatherGroup: non-constant offset should not form a group:\n%s", buf.String())
+				}
+			}
+		}
+	}
+}
+
+// TestPredicateSPMD_GatherGroup_SingleAccess verifies that a single Index
+// instruction on a [16]byte array with a varying index is not annotated with
+// an SPMDGatherGroup because groups require at least 2 members.
+func TestPredicateSPMD_GatherGroup_SingleAccess(t *testing.T) {
+	src := `package main
+import "lanes"
+
+func f(input [16]byte, n int) {
+	for i := range n {
+		c := lanes.Varying[int](i)
+		d0 := input[c]
+		_ = d0
+	}
+}
+
+func main() { var arr [16]byte; f(arr, 4) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	// Check both Index and IndexAddr: single access should not be grouped
+	// regardless of the addressing mode.
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			switch v := instr.(type) {
+			case *ssa.Index:
+				if v.SPMDGatherGroup != nil {
+					var buf bytes.Buffer
+					ssa.WriteFunction(&buf, fn)
+					t.Fatalf("unexpected SPMDGatherGroup: single access should not form a group:\n%s", buf.String())
+				}
+			case *ssa.IndexAddr:
+				if v.SPMDGatherGroup != nil {
+					var buf bytes.Buffer
+					ssa.WriteFunction(&buf, fn)
+					t.Fatalf("unexpected SPMDGatherGroup: single access should not form a group:\n%s", buf.String())
+				}
+			}
+		}
+	}
+}

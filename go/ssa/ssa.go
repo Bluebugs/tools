@@ -466,6 +466,26 @@ type SPMDBooleanChain struct {
 	IsVarying bool          // true when any condition in chain involves *types.SPMDType
 }
 
+// SPMDGatherGroup records a group of Index instructions on the same
+// small byte array (≤16 bytes) that can be coalesced into a single
+// i8x16.swizzle operation. The group members share a common base
+// varying index and differ only by constant offsets.
+type SPMDGatherGroup struct {
+	Source  Value               // the array value being indexed
+	Base    Value               // the base varying index (shared across members)
+	Stride  int                 // bytes per lane in merged result (members + padding)
+	Members []*SPMDGatherMember
+}
+
+// SPMDGatherMember records one index instruction within a gather group.
+// Exactly one of Instr (for *Index) or InstrAddr (for *IndexAddr) is non-nil.
+type SPMDGatherMember struct {
+	Instr     *Index     // the Index instruction (non-addressable array indexing)
+	InstrAddr *IndexAddr // the IndexAddr instruction (addressable array indexing)
+	Offset    int        // constant offset from the group's Base index
+	Pos       int        // byte position within each stride group in the merged result
+}
+
 // booleanChainCtx is a temporary accumulator used during cond() recursion
 // to collect blocks forming a boolean chain. Not exported.
 type booleanChainCtx struct {
@@ -1038,9 +1058,11 @@ type Field struct {
 //	t2 = &t0[t1]
 type IndexAddr struct {
 	register
-	X        Value // *array, slice or type parameter with types array, *array, or slice.
-	Index    Value // numeric index
-	SPMDMask Value // nil = no masking; set for varying indices in SPMD scope
+	X               Value              // *array, slice or type parameter with types array, *array, or slice.
+	Index           Value              // numeric index
+	SPMDMask        Value              // nil = no masking; set for varying indices in SPMD scope
+	SPMDGatherGroup *SPMDGatherGroup   // non-nil if part of a coalesced gather group
+	SPMDGatherPos   int                // byte position within merged swizzle result
 }
 
 // The Index instruction yields element Index of collection X, an array,
@@ -1055,9 +1077,11 @@ type IndexAddr struct {
 //	t2 = t0[t1]
 type Index struct {
 	register
-	X        Value // array, string or type parameter with types array, *array, slice, or string.
-	Index    Value // integer index
-	SPMDMask Value // nil = no masking; set for varying indices in SPMD scope
+	X               Value              // array, string or type parameter with types array, *array, slice, or string.
+	Index           Value              // integer index
+	SPMDMask        Value              // nil = no masking; set for varying indices in SPMD scope
+	SPMDGatherGroup *SPMDGatherGroup   // non-nil if part of a coalesced gather group
+	SPMDGatherPos   int                // byte position within merged swizzle result
 }
 
 // The Lookup instruction yields element Index of collection map X.
