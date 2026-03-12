@@ -401,6 +401,11 @@ func (f *Function) finishBody() {
 		resolveSPMDLoops(f)
 	}
 	if len(f.SPMDLoops) > 0 {
+		// Promote eligible small array allocations to varying SSA values.
+		// Runs after loop resolution (IterPhi available) and before predication
+		// (stores are still plain *Store instructions, not yet converted to
+		// SPMDStore by spmdConvertLoopOps).
+		promoteSPMDArrays(f)
 		// Transform varying control flow into predicated form with explicit
 		// mask-gated operations. Runs after loop resolution so LaneCount is
 		// available, and before numberRegisters so new instructions get numbered.

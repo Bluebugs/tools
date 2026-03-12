@@ -16,12 +16,16 @@ package ssa_test
 //  7. Interface compliance (compile-time checks)
 
 import (
+	"go/ast"
+	"go/importer"
+	"go/parser"
 	"go/token"
 	"go/types"
 	"strings"
 	"testing"
 
 	"golang.org/x/tools/go/ssa"
+	"golang.org/x/tools/go/ssa/ssautil"
 )
 
 // Compile-time interface compliance checks.
@@ -147,5 +151,161 @@ func TestSPMDVectorFromMemory_Referrers(t *testing.T) {
 
 	if v.Referrers() == nil {
 		t.Error("Referrers() returned nil, want non-nil slice pointer")
+	}
+}
+
+// buildSPMDProgram builds a package with SPMD loops at the given lane count.
+// All RangeStmts in the source are marked as SPMD with laneCount.
+func buildSPMDProgram(t *testing.T, src string, laneCount int) *ssa.Package {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "input.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ast.Inspect(f, func(n ast.Node) bool {
+		if rs, ok := n.(*ast.RangeStmt); ok {
+			rs.IsSpmd = true
+			rs.LaneCount = int64(laneCount)
+		}
+		return true
+	})
+	pkg, _, err := ssautil.BuildPackage(
+		&types.Config{Importer: importer.Default()},
+		fset, types.NewPackage("main", ""), []*ast.File{f}, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pkg
+}
+
+// TestPromoteSPMDArrays_ByteArray verifies a [16]byte array inside a
+// 16-lane go for loop is promoted (Alloc removed).
+func TestPromoteSPMDArrays_ByteArray(t *testing.T) {
+	src := `package main
+
+func main() {
+	var arr [16]byte
+	for i := range 16 {
+		arr[i] = byte(i)
+	}
+}
+`
+	pkg := buildSPMDProgram(t, src, 16)
+	fn := pkg.Func("main")
+	if fn == nil {
+		t.Fatal("main not found")
+	}
+
+	// After promotion, there should be no Alloc for [16]byte in the function.
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			if alloc, ok := instr.(*ssa.Alloc); ok {
+				if at, ok := alloc.Type().Underlying().(*types.Pointer); ok {
+					if _, ok := at.Elem().Underlying().(*types.Array); ok {
+						t.Errorf("found unpromoted array Alloc: %s", alloc)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestPromoteSPMDArrays_Ineligible_Escape verifies arrays passed to calls
+// are NOT promoted.
+func TestPromoteSPMDArrays_Ineligible_Escape(t *testing.T) {
+	src := `package main
+
+func use(p *[16]byte) {}
+
+func main() {
+	var arr [16]byte
+	for i := range 16 {
+		arr[i] = byte(i)
+	}
+	use(&arr)
+}
+`
+	pkg := buildSPMDProgram(t, src, 16)
+	fn := pkg.Func("main")
+	if fn == nil {
+		t.Fatal("main not found")
+	}
+
+	found := false
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			if _, ok := instr.(*ssa.Alloc); ok {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Error("expected Alloc to remain (ineligible for promotion)")
+	}
+}
+
+// TestPromoteSPMDArrays_Ineligible_LaneMismatch verifies [8]byte in a
+// 16-lane loop is NOT promoted.
+func TestPromoteSPMDArrays_Ineligible_LaneMismatch(t *testing.T) {
+	src := `package main
+
+func main() {
+	var arr [8]byte
+	for i := range 16 {
+		if i < 8 {
+			arr[i] = byte(i)
+		}
+	}
+}
+`
+	pkg := buildSPMDProgram(t, src, 16)
+	fn := pkg.Func("main")
+	if fn == nil {
+		t.Fatal("main not found")
+	}
+
+	found := false
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			if _, ok := instr.(*ssa.Alloc); ok {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Error("expected Alloc to remain (lane count mismatch)")
+	}
+}
+
+// TestPromoteSPMDArrays_Ineligible_UniformIndex verifies arrays accessed
+// with a uniform (non-IterPhi) index are NOT promoted.
+func TestPromoteSPMDArrays_Ineligible_UniformIndex(t *testing.T) {
+	src := `package main
+
+func main() {
+	var arr [16]byte
+	for i := range 16 {
+		arr[0] = byte(i) // uniform index 0, not IterPhi
+	}
+}
+`
+	pkg := buildSPMDProgram(t, src, 16)
+	fn := pkg.Func("main")
+	if fn == nil {
+		t.Fatal("main not found")
+	}
+
+	found := false
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			if _, ok := instr.(*ssa.Alloc); ok {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Error("expected Alloc to remain (uniform index)")
 	}
 }
