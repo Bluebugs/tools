@@ -687,3 +687,19 @@ func emitSPMDIndex(f *Function, lanes int, elemType types.Type) *SPMDIndex {
 	f.emit(v)
 	return v
 }
+
+// emitSPMDVectorFromMemory emits an SPMDVectorFromMemory instruction that
+// loads lanes elements from ptr into a Varying[elemType] SIMD vector.
+// length is the number of valid elements (may be < lanes at the tail).
+// The result type is Varying[elemType].
+func emitSPMDVectorFromMemory(f *Function, ptr, length Value, lanes int, elemType types.Type, pos token.Pos) *SPMDVectorFromMemory {
+	v := &SPMDVectorFromMemory{
+		Ptr:      ptr,
+		Len:      length,
+		ElemType: elemType,
+		Lanes:    lanes,
+	}
+	v.pos = pos
+	f.emit(v)
+	return v
+}

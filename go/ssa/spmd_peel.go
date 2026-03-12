@@ -213,6 +213,21 @@ func spmdCloneBlock(fn *Function, srcBlock *BasicBlock, dstBlock *BasicBlock,
 			valueMap[v] = newInstr
 			// Alloc has no input operands to register referrers for.
 
+		case *SPMDVectorFromMemory:
+			clone := &SPMDVectorFromMemory{
+				Ptr:      spmdTranslateValue(v.Ptr, valueMap),
+				Len:      spmdTranslateValue(v.Len, valueMap),
+				ElemType: v.ElemType,
+				Lanes:    v.Lanes,
+			}
+			clone.pos = v.pos
+			clone.setType(v.Type())
+			clone.setBlock(dstBlock)
+			dstBlock.Instrs = append(dstBlock.Instrs, clone)
+			valueMap[v] = clone
+			spmdAddReferrer(clone.Ptr, clone)
+			spmdAddReferrer(clone.Len, clone)
+
 		default:
 			panic(fmt.Sprintf("spmdCloneBlock: unhandled instruction type %T", instr))
 		}

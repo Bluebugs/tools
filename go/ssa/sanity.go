@@ -266,6 +266,20 @@ func (s *sanity) checkInstr(idx int, instr Instruction) {
 			s.errorf("SPMDExtractMask: Lanes must be > 0, got %d", instr.Lanes)
 		}
 
+	case *SPMDVectorFromMemory:
+		if instr.Lanes <= 0 {
+			s.errorf("SPMDVectorFromMemory has non-positive Lanes: %d", instr.Lanes)
+		}
+		if instr.ElemType == nil {
+			s.errorf("SPMDVectorFromMemory has nil ElemType")
+		}
+		if instr.Ptr == nil {
+			s.errorf("SPMDVectorFromMemory has nil Ptr")
+		}
+		if instr.Len == nil {
+			s.errorf("SPMDVectorFromMemory has nil Len")
+		}
+
 	default:
 		panic(fmt.Sprintf("Unknown instruction type: %T", instr))
 	}

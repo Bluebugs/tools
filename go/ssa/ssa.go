@@ -1518,6 +1518,25 @@ type SPMDExtractMask struct {
 	Lanes int   // expected lane count
 }
 
+// SPMDVectorFromMemory loads N elements from a pointer into a Varying[T]
+// SIMD vector value. Ptr is a pointer to the element type. Len is the
+// number of valid elements (may be less than Lanes at the tail). ElemType
+// is the element type (byte, int32, etc.). Lanes is the lane count from
+// the enclosing SPMD loop.
+//
+// The result type is Varying[ElemType].
+//
+// Example printed form:
+//
+//	t1 = spmd_vector_from_memory<4, int32> t0 t2
+type SPMDVectorFromMemory struct {
+	register
+	Ptr      Value      // pointer to element type
+	Len      Value      // number of valid elements
+	ElemType types.Type // element type (byte, int32, etc.)
+	Lanes    int        // lane count from enclosing SPMD loop
+}
+
 // The MapUpdate instruction updates the association of Map[Key] to
 // Value.
 //
@@ -2124,15 +2143,20 @@ func (v *SPMDExtractMask) Operands(rands []*Value) []*Value {
 	return append(rands, &v.X)
 }
 
+func (v *SPMDVectorFromMemory) Operands(rands []*Value) []*Value {
+	return append(rands, &v.Ptr, &v.Len)
+}
+
 // Pos methods for SPMD predicated instructions.
 // SPMDSelect and SPMDIndex return NoPos because they are synthetic nodes
 // with no single source location (analogous to Phi).
 
-func (v *SPMDSelect) Pos() token.Pos     { return token.NoPos }
-func (v *SPMDLoad) Pos() token.Pos       { return v.pos }
-func (s *SPMDStore) Pos() token.Pos      { return s.pos }
-func (v *SPMDIndex) Pos() token.Pos      { return token.NoPos }
-func (v *SPMDExtractMask) Pos() token.Pos { return token.NoPos }
+func (v *SPMDSelect) Pos() token.Pos          { return token.NoPos }
+func (v *SPMDLoad) Pos() token.Pos            { return v.pos }
+func (s *SPMDStore) Pos() token.Pos           { return s.pos }
+func (v *SPMDIndex) Pos() token.Pos           { return token.NoPos }
+func (v *SPMDExtractMask) Pos() token.Pos     { return token.NoPos }
+func (v *SPMDVectorFromMemory) Pos() token.Pos { return v.pos }
 
 // Type returns Varying[ElemType]. Computed dynamically so SPMDIndex works
 // correctly whether constructed via emitSPMDIndex or directly.
@@ -2143,4 +2167,9 @@ func (v *SPMDIndex) Type() types.Type {
 // Type returns Varying[mask]. The result is always a mask type.
 func (v *SPMDExtractMask) Type() types.Type {
 	return spmdpkg.NewVaryingMask()
+}
+
+// Type returns Varying[ElemType]. Computed dynamically from ElemType.
+func (v *SPMDVectorFromMemory) Type() types.Type {
+	return types.NewVarying(v.ElemType)
 }

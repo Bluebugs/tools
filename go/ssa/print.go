@@ -439,6 +439,12 @@ func (v *SPMDExtractMask) String() string {
 	return fmt.Sprintf("spmd_extract_mask<%d> %s", v.Lanes, spmdRelName(v.X, v))
 }
 
+func (v *SPMDVectorFromMemory) String() string {
+	from := spmdRelPkg(v)
+	return fmt.Sprintf("spmd_vector_from_memory<%d, %s> %s %s",
+		v.Lanes, relType(v.ElemType, from), spmdRelName(v.Ptr, v), spmdRelName(v.Len, v))
+}
+
 func (s *MapUpdate) String() string {
 	return fmt.Sprintf("%s[%s] = %s", relName(s.Map, s), relName(s.Key, s), relName(s.Value, s))
 }
