@@ -36,6 +36,56 @@ type arrayCopyInfo struct {
 	indexInstrs []*Index // Index instructions on arrayLoad result (pattern 2)
 }
 
+// spmdLoopBodyBlocks returns all basic blocks that belong to the body of an
+// SPMD loop. This includes BodyBlock, LoopBlock, and any intermediate blocks
+// created by varying control flow (if/else, switch) within the body.
+//
+// The algorithm is a BFS from BodyBlock that stops at DoneBlock (loop exit)
+// and EntryBlock (loop entry predecessor). For non-merged loops (rangeindex),
+// the walk stops at LoopBlock without recursing into its successors, since
+// LoopBlock's successors are the back-edge to BodyBlock and DoneBlock — both
+// of which are already handled.
+func spmdLoopBodyBlocks(loop *SPMDLoopInfo) []*BasicBlock {
+	if loop.BodyBlock == nil {
+		return nil
+	}
+	visited := make(map[*BasicBlock]bool)
+	var blocks []*BasicBlock
+	var walk func(b *BasicBlock)
+	walk = func(b *BasicBlock) {
+		if b == nil || visited[b] {
+			return
+		}
+		// DoneBlock is outside the loop — stop here.
+		if b == loop.DoneBlock {
+			return
+		}
+		// EntryBlock is before the loop — stop here.
+		if b == loop.EntryBlock {
+			return
+		}
+		visited[b] = true
+		blocks = append(blocks, b)
+		// For non-merged loops (rangeindex), LoopBlock is the loop header whose
+		// successors are BodyBlock (back-edge) and DoneBlock (exit). Including
+		// LoopBlock itself is correct, but we must not recurse past it to avoid
+		// re-visiting BodyBlock and collecting DoneBlock.
+		if b == loop.LoopBlock && !loop.MergedBodyLoop {
+			return
+		}
+		for _, succ := range b.Succs {
+			walk(succ)
+		}
+	}
+	walk(loop.BodyBlock)
+	// For non-merged loops, ensure LoopBlock is included even if the BFS did
+	// not reach it via BodyBlock's successors (shouldn't happen, but be safe).
+	if loop.LoopBlock != nil && !visited[loop.LoopBlock] {
+		blocks = append(blocks, loop.LoopBlock)
+	}
+	return blocks
+}
+
 // promoteSPMDArrays promotes eligible small array allocations inside SPMD
 // loops. An Alloc is eligible when:
 //
@@ -62,13 +112,12 @@ func promoteSPMDArrays(f *Function) {
 	}
 
 	// Build a map from block to its enclosing SPMDLoopInfo.
+	// Use spmdLoopBodyBlocks to cover all blocks inside the loop body,
+	// including intermediate blocks created by varying control flow.
 	blockToLoop := make(map[*BasicBlock]*SPMDLoopInfo)
 	for _, loop := range f.SPMDLoops {
-		if loop.BodyBlock != nil {
-			blockToLoop[loop.BodyBlock] = loop
-		}
-		if loop.LoopBlock != nil {
-			blockToLoop[loop.LoopBlock] = loop
+		for _, b := range spmdLoopBodyBlocks(loop) {
+			blockToLoop[b] = loop
 		}
 	}
 
@@ -157,6 +206,8 @@ func checkArrayPromotion(alloc *Alloc, blockToLoop map[*BasicBlock]*SPMDLoopInfo
 				return nil, nil // multiple array loads — too complex
 			}
 			arrayLoadRef = r
+		case *DebugRef:
+			// ok — debug references don't affect semantics.
 		default:
 			// Any other referrer (Call directly on alloc, MakeInterface, etc.)
 			// means the alloc escapes.
@@ -421,6 +472,19 @@ func doPromoteArray(f *Function, alloc *Alloc, loop *SPMDLoopInfo, copyInfo *arr
 
 	affectedBlocks := make(map[*BasicBlock]bool)
 
+	// Remove DebugRef instructions that reference the alloc directly.
+	for _, ref := range *refs {
+		if dr, ok := ref.(*DebugRef); ok {
+			b := dr.Block()
+			spmdNilInstr(b, dr)
+			if refs := dr.X.Referrers(); refs != nil {
+				*refs = removeInstr(*refs, dr)
+			}
+			dr.block = nil
+			affectedBlocks[b] = true
+		}
+	}
+
 	// Process each IndexAddr and its Store referrers.
 	for _, ref := range *refs {
 		ia, ok := ref.(*IndexAddr)
@@ -554,7 +618,21 @@ func doPromoteCopyRead(f *Function, alloc *Alloc, loop *SPMDLoopInfo, ci *arrayC
 			affectedBlocks[b] = true
 		}
 
-		// Step 4b: remove the whole-array load (now unreferenced).
+		// Step 4b: remove DebugRef instructions on the array load result,
+		// then remove the whole-array load itself.
+		if alRefs := ci.arrayLoad.Referrers(); alRefs != nil {
+			for _, alRef := range *alRefs {
+				if dr, ok := alRef.(*DebugRef); ok {
+					b := dr.Block()
+					spmdNilInstr(b, dr)
+					if drRefs := dr.X.Referrers(); drRefs != nil {
+						*drRefs = removeInstr(*drRefs, dr)
+					}
+					dr.block = nil
+					affectedBlocks[b] = true
+				}
+			}
+		}
 		{
 			b := ci.arrayLoad.Block()
 			spmdNilInstr(b, ci.arrayLoad)
@@ -584,10 +662,25 @@ func doPromoteCopyRead(f *Function, alloc *Alloc, loop *SPMDLoopInfo, ci *arrayC
 		}
 
 		// Step 4: remove IndexAddr instructions (now unreferenced).
+		// Also clean up any DebugRef instructions that reference the IndexAddr
+		// result (e.g., for debug info on &arr[i] expressions).
 		for _, ref := range *alloc.Referrers() {
 			ia, ok := ref.(*IndexAddr)
 			if !ok {
 				continue
+			}
+			if iaRefs := ia.Referrers(); iaRefs != nil {
+				for _, iaRef := range *iaRefs {
+					if dr, ok := iaRef.(*DebugRef); ok {
+						b := dr.Block()
+						spmdNilInstr(b, dr)
+						if drRefs := dr.X.Referrers(); drRefs != nil {
+							*drRefs = removeInstr(*drRefs, dr)
+						}
+						dr.block = nil
+						affectedBlocks[b] = true
+					}
+				}
 			}
 			b := ia.Block()
 			spmdNilInstr(b, ia)
@@ -630,7 +723,22 @@ func doPromoteCopyRead(f *Function, alloc *Alloc, loop *SPMDLoopInfo, ci *arrayC
 		affectedBlocks[b] = true
 	}
 
-	// Step 7: remove the alloc itself.
+	// Step 7: remove DebugRef instructions that reference the alloc directly.
+	if refs := alloc.Referrers(); refs != nil {
+		for _, ref := range *refs {
+			if dr, ok := ref.(*DebugRef); ok {
+				b := dr.Block()
+				spmdNilInstr(b, dr)
+				if drRefs := dr.X.Referrers(); drRefs != nil {
+					*drRefs = removeInstr(*drRefs, dr)
+				}
+				dr.block = nil
+				affectedBlocks[b] = true
+			}
+		}
+	}
+
+	// Step 8: remove the alloc itself.
 	{
 		b := alloc.Block()
 		spmdNilInstr(b, alloc)
