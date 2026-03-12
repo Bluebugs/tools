@@ -21,6 +21,7 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"os"
 	"strings"
 	"testing"
 
@@ -276,6 +277,57 @@ func main() {
 	}
 	if !found {
 		t.Error("expected Alloc to remain (lane count mismatch)")
+	}
+}
+
+// TestPromoteSPMDArrays_EmitsVectorFromMemory verifies that the copy+read
+// pattern (copy(input[:], s) + loop reads) is promoted to SPMDVectorFromMemory.
+func TestPromoteSPMDArrays_EmitsVectorFromMemory(t *testing.T) {
+	src := `package main
+
+func process(s string) {
+	var input [16]byte
+	copy(input[:], s)
+	for i := range 16 {
+		_ = input[i] - 48
+	}
+}
+
+func main() {
+	process("hello")
+}
+`
+	pkg := buildSPMDProgram(t, src, 16)
+	fn := pkg.Func("process")
+	if fn == nil {
+		t.Fatal("process not found")
+	}
+
+	// After promotion, there should be an SPMDVectorFromMemory instruction.
+	found := false
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			if _, ok := instr.(*ssa.SPMDVectorFromMemory); ok {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Error("expected SPMDVectorFromMemory instruction after promotion")
+		fn.WriteTo(os.Stderr)
+	}
+
+	// No Alloc for [16]byte should remain.
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			if alloc, ok := instr.(*ssa.Alloc); ok {
+				if at, ok := alloc.Type().Underlying().(*types.Pointer); ok {
+					if _, ok := at.Elem().Underlying().(*types.Array); ok {
+						t.Errorf("found unpromoted array Alloc: %s", alloc)
+					}
+				}
+			}
+		}
 	}
 }
 
