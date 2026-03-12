@@ -12,12 +12,28 @@ import (
 
 // arrayCopyInfo captures the external-initialization pattern for an array:
 // a Slice of the alloc fed into a builtin copy call, plus the load
-// instructions that read back through IndexAddr.
+// instructions that read back through IndexAddr or via a whole-array load.
+//
+// Two access sub-patterns are supported:
+//
+//  1. IndexAddr pattern (rangeint / plain index):
+//     t1 = slice alloc[:]
+//     t2 = copy(t1, src)
+//     t3 = &alloc[i]        // IndexAddr
+//     t4 = *t3              // UnOp{MUL} load — collected in loads
+//
+//  2. Array-value pattern (rangeindex over array):
+//     t1 = slice alloc[:]
+//     t2 = copy(t1, src)
+//     t3 = *alloc           // UnOp{MUL} whole-array load — arrayLoad
+//     t4 = t3[i]            // Index on array value — collected in indexInstrs
 type arrayCopyInfo struct {
-	sliceInstr *Slice  // t1 = slice alloc[:]
-	copyCall   *Call   // t2 = copy(t1, src)
-	srcArg     Value   // second argument to copy (string or []byte slice)
-	loads      []*UnOp // UnOp{MUL} load results through IndexAddr
+	sliceInstr  *Slice   // t1 = slice alloc[:]
+	copyCall    *Call    // t2 = copy(t1, src)
+	srcArg      Value    // second argument to copy (string or []byte slice)
+	loads       []*UnOp  // UnOp{MUL} load results through IndexAddr (pattern 1)
+	arrayLoad   *UnOp    // UnOp{MUL} whole-array load from alloc (pattern 2)
+	indexInstrs []*Index // Index instructions on arrayLoad result (pattern 2)
 }
 
 // promoteSPMDArrays promotes eligible small array allocations inside SPMD
@@ -117,6 +133,7 @@ func checkArrayPromotion(alloc *Alloc, blockToLoop map[*BasicBlock]*SPMDLoopInfo
 
 	var loop *SPMDLoopInfo
 	var sliceRef *Slice // Slice instruction for copy+read pattern
+	var arrayLoadRef *UnOp // UnOp{MUL} whole-array load (rangeindex pattern)
 
 	for _, ref := range *refs {
 		switch r := ref.(type) {
@@ -129,6 +146,17 @@ func checkArrayPromotion(alloc *Alloc, blockToLoop map[*BasicBlock]*SPMDLoopInfo
 				return nil, nil // multiple slice ops, too complex
 			}
 			sliceRef = r
+		case *UnOp:
+			// Allow one whole-array load (rangeindex over array: t3 = *alloc).
+			// This is the array-value pattern where range over [N]T loads the
+			// entire array first, then indexes into the loaded value.
+			if r.Op != token.MUL {
+				return nil, nil // non-load UnOp — ineligible
+			}
+			if arrayLoadRef != nil {
+				return nil, nil // multiple array loads — too complex
+			}
+			arrayLoadRef = r
 		default:
 			// Any other referrer (Call directly on alloc, MakeInterface, etc.)
 			// means the alloc escapes.
@@ -147,11 +175,41 @@ func checkArrayPromotion(alloc *Alloc, blockToLoop map[*BasicBlock]*SPMDLoopInfo
 		copyInfo = ci
 	}
 
-	// Now validate all IndexAddr referrers for their access pattern.
+	// Check 5b: if there is a whole-array load referrer (rangeindex pattern),
+	// require a copy pattern and validate that the loaded value is used only
+	// via Index instructions keyed by IterPhi in the SPMD loop body.
+	if arrayLoadRef != nil {
+		if copyInfo == nil {
+			// Array-value reads without external init — ineligible.
+			return nil, nil
+		}
+		copyInfo.arrayLoad = arrayLoadRef
+
+		// Validate all referrers of the loaded array value.
+		alRefs := arrayLoadRef.Referrers()
+		if alRefs == nil || len(*alRefs) == 0 {
+			return nil, nil
+		}
+		for _, alRef := range *alRefs {
+			switch r := alRef.(type) {
+			case *Index:
+				// t8 = t3[t6]: index into the loaded array value.
+				// Validate below after we know the loop (IterPhi).
+				copyInfo.indexInstrs = append(copyInfo.indexInstrs, r)
+			case *DebugRef:
+				// ok — debug references don't affect semantics.
+			default:
+				// Any other use means the loaded array escapes.
+				return nil, nil
+			}
+		}
+	}
+
+	// Now validate all IndexAddr referrers for their access pattern (pattern 1).
 	for _, ref := range *refs {
 		ia, ok := ref.(*IndexAddr)
 		if !ok {
-			continue // Slice already handled above
+			continue // Slice, UnOp already handled above
 		}
 
 		// Check 6: IndexAddr must be inside an SPMD loop body.
@@ -214,27 +272,71 @@ func checkArrayPromotion(alloc *Alloc, blockToLoop map[*BasicBlock]*SPMDLoopInfo
 		}
 	}
 
+	// Check 8b: validate Index instructions for the array-value pattern (pattern 2).
+	// These must be in the SPMD loop body and indexed by IterPhi or IncrBinOp.
+	// For rangeindex, go/ssa emits: t5=phi(start,-1), t6=t5+1, body uses t6.
+	// So the index in the body is IncrBinOp (t6), not IterPhi (t5) directly.
+	var indexInstrs []*Index
+	if copyInfo != nil {
+		indexInstrs = copyInfo.indexInstrs
+	}
+	for _, idx := range indexInstrs {
+		// idx.X is the loaded array value (arrayLoadRef result).
+		// idx.Index is the loop iteration variable.
+
+		// Find or validate the loop from the block containing the Index.
+		l, ok := blockToLoop[idx.Block()]
+		if !ok {
+			return nil, nil
+		}
+		if loop == nil {
+			loop = l
+		} else if loop != l {
+			return nil, nil
+		}
+
+		// Index must be keyed by IterPhi or IncrBinOp (possibly via ChangeType).
+		// For rangeindex: IterPhi starts at -1, IncrBinOp = IterPhi+1 is used in body.
+		unwrapped := unwrapChangeType(idx.Index)
+		if unwrapped != loop.IterPhi && (loop.IncrBinOp == nil || unwrapped != Value(loop.IncrBinOp)) {
+			return nil, nil
+		}
+	}
+
 	if loop == nil {
 		return nil, nil
 	}
 
-	// Check 9: loop BoundValue is a constant equal to arrayLen.
-	// This ensures the array exactly covers one iteration of the loop
-	// (every element is written exactly once, one per lane). Non-constant
-	// bounds or mismatched lengths are ineligible.
-	if loop.BoundValue == nil {
-		return nil, nil
-	}
-	bv, ok := loop.BoundValue.(*Const)
-	if !ok {
-		return nil, nil
-	}
-	boundInt, ok := constant.Int64Val(bv.Value)
-	if !ok {
-		return nil, nil
-	}
-	if int(boundInt) != arrayLen {
-		return nil, nil
+	// Check 9: verify the loop iterates exactly arrayLen times.
+	// For rangeint, BoundValue is a constant N (e.g., range 16); check it
+	// equals arrayLen.
+	// For rangeindex over an array, the iteration count equals the array
+	// length by construction (range over [N]T iterates exactly N times), so
+	// we verify via the loop's LaneCount matching arrayLen instead. We do NOT
+	// check BoundValue because for rangeindex it is the array value itself
+	// (type [N]T), not a numeric constant.
+	if copyInfo != nil && copyInfo.arrayLoad != nil {
+		// Array-value pattern: bound is array length by construction.
+		// LaneCount must match arrayLen so every lane maps to one element.
+		if loop.LaneCount != arrayLen {
+			return nil, nil
+		}
+	} else {
+		// IndexAddr pattern (rangeint): BoundValue must be a constant equal to arrayLen.
+		if loop.BoundValue == nil {
+			return nil, nil
+		}
+		bv, ok := loop.BoundValue.(*Const)
+		if !ok {
+			return nil, nil
+		}
+		boundInt, ok := constant.Int64Val(bv.Value)
+		if !ok {
+			return nil, nil
+		}
+		if int(boundInt) != arrayLen {
+			return nil, nil
+		}
 	}
 
 	return loop, copyInfo
@@ -432,37 +534,72 @@ func doPromoteCopyRead(f *Function, alloc *Alloc, loop *SPMDLoopInfo, ci *arrayC
 	spmdAddReferrer(lenCall, vec)
 	affectedBlocks[copyBlock] = true
 
-	// Step 3: replace all UnOp{MUL} load results with the varying vector.
-	// replaceAll rewires all users of each load to use vec instead, and sets
-	// each load's referrer list to nil (marking it unused).
-	for _, load := range ci.loads {
-		replaceAll(load, vec)
-		b := load.Block()
-		spmdNilInstr(b, load)
-		// Clean up the load's operand referrer (the IndexAddr).
-		if refs := load.X.Referrers(); refs != nil {
-			*refs = removeInstr(*refs, load)
-		}
-		load.block = nil
-		affectedBlocks[b] = true
-	}
+	if ci.arrayLoad != nil {
+		// Pattern 2 (array-value / rangeindex): replace Index instruction results
+		// with the varying vector, then remove the whole-array load and Index instrs.
 
-	// Step 4: remove IndexAddr instructions (now unreferenced).
-	for _, ref := range *alloc.Referrers() {
-		ia, ok := ref.(*IndexAddr)
-		if !ok {
-			continue
+		// Step 3b: replace all Index results with the varying vector.
+		for _, idx := range ci.indexInstrs {
+			replaceAll(idx, vec)
+			b := idx.Block()
+			spmdNilInstr(b, idx)
+			// Clean up operand referrers for the Index.
+			if refs := idx.X.Referrers(); refs != nil {
+				*refs = removeInstr(*refs, idx)
+			}
+			if refs := idx.Index.Referrers(); refs != nil {
+				*refs = removeInstr(*refs, idx)
+			}
+			idx.block = nil
+			affectedBlocks[b] = true
 		}
-		b := ia.Block()
-		spmdNilInstr(b, ia)
-		if refs := ia.X.Referrers(); refs != nil {
-			*refs = removeInstr(*refs, ia)
+
+		// Step 4b: remove the whole-array load (now unreferenced).
+		{
+			b := ci.arrayLoad.Block()
+			spmdNilInstr(b, ci.arrayLoad)
+			if refs := ci.arrayLoad.X.Referrers(); refs != nil {
+				*refs = removeInstr(*refs, ci.arrayLoad)
+			}
+			ci.arrayLoad.block = nil
+			affectedBlocks[b] = true
 		}
-		if refs := ia.Index.Referrers(); refs != nil {
-			*refs = removeInstr(*refs, ia)
+	} else {
+		// Pattern 1 (IndexAddr / rangeint): replace UnOp{MUL} load results with
+		// the varying vector, then remove IndexAddr instructions.
+
+		// Step 3: replace all UnOp{MUL} load results with the varying vector.
+		// replaceAll rewires all users of each load to use vec instead, and sets
+		// each load's referrer list to nil (marking it unused).
+		for _, load := range ci.loads {
+			replaceAll(load, vec)
+			b := load.Block()
+			spmdNilInstr(b, load)
+			// Clean up the load's operand referrer (the IndexAddr).
+			if refs := load.X.Referrers(); refs != nil {
+				*refs = removeInstr(*refs, load)
+			}
+			load.block = nil
+			affectedBlocks[b] = true
 		}
-		ia.block = nil
-		affectedBlocks[b] = true
+
+		// Step 4: remove IndexAddr instructions (now unreferenced).
+		for _, ref := range *alloc.Referrers() {
+			ia, ok := ref.(*IndexAddr)
+			if !ok {
+				continue
+			}
+			b := ia.Block()
+			spmdNilInstr(b, ia)
+			if refs := ia.X.Referrers(); refs != nil {
+				*refs = removeInstr(*refs, ia)
+			}
+			if refs := ia.Index.Referrers(); refs != nil {
+				*refs = removeInstr(*refs, ia)
+			}
+			ia.block = nil
+			affectedBlocks[b] = true
+		}
 	}
 
 	// Step 5: remove the copy call.

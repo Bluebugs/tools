@@ -331,6 +331,59 @@ func main() {
 	}
 }
 
+// TestPromoteSPMDArrays_CopyRangeInput verifies that the copy+rangeindex
+// pattern (copy(input[:], s) followed by a rangeindex loop reading input[i])
+// is promoted to SPMDVectorFromMemory. This matches the pattern in the IPv4
+// parser's parseIPv4 function where `go for i, c := range input` reads a
+// [16]byte buffer filled by copy(input[:], s).
+func TestPromoteSPMDArrays_CopyRangeInput(t *testing.T) {
+	src := `package main
+
+import "lanes"
+
+func process(s string) lanes.Varying[byte] {
+	var input [16]byte
+	copy(input[:], s)
+	var result lanes.Varying[byte]
+	for i, c := range input {
+		_ = i
+		result = c
+	}
+	return result
+}
+
+func main() {
+	process("hello")
+}
+`
+	pkg := buildSPMDProgram(t, src, 16)
+	fn := pkg.Func("process")
+	if fn == nil {
+		t.Fatal("process not found")
+	}
+
+	// After promotion, there should be an SPMDVectorFromMemory and no array Alloc.
+	foundVFM := false
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			if _, ok := instr.(*ssa.SPMDVectorFromMemory); ok {
+				foundVFM = true
+			}
+			if alloc, ok := instr.(*ssa.Alloc); ok {
+				if at, ok := alloc.Type().Underlying().(*types.Pointer); ok {
+					if _, ok := at.Elem().Underlying().(*types.Array); ok {
+						t.Errorf("found unpromoted array Alloc: %s", alloc)
+					}
+				}
+			}
+		}
+	}
+	if !foundVFM {
+		t.Error("expected SPMDVectorFromMemory instruction after promotion")
+		fn.WriteTo(os.Stderr)
+	}
+}
+
 // TestPromoteSPMDArrays_Ineligible_UniformIndex verifies arrays accessed
 // with a uniform (non-IterPhi) index are NOT promoted.
 func TestPromoteSPMDArrays_Ineligible_UniformIndex(t *testing.T) {
