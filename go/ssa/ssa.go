@@ -1531,7 +1531,7 @@ type SPMDExtractMask struct {
 //	t1 = spmd_vector_from_memory<4, int32> t0 t2
 type SPMDVectorFromMemory struct {
 	register
-	Ptr      Value      // pointer to element type
+	Ptr      Value      // source value: string or []byte header (data pointer in field 0)
 	Len      Value      // number of valid elements
 	ElemType types.Type // element type (byte, int32, etc.)
 	Lanes    int        // lane count from enclosing SPMD loop
