@@ -121,6 +121,9 @@ func (w *Free) Has(typ types.Type) (res bool) {
 	case *types.TypeParam:
 		return true
 
+	case *types.SPMDType:
+		return w.Has(t.Elem())
+
 	default:
 		panic(t) // unreachable
 	}
