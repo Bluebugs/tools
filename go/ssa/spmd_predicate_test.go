@@ -4490,6 +4490,108 @@ func main() { var arr [16]byte; f(arr, 4) }
 	}
 }
 
+// TestPredicateSPMD_InnerScalarLoopExcluded verifies that an inner scalar
+// for-range loop inside a go-for loop is excluded from the SPMD scope.
+// Memory ops in the inner loop must remain as scalar UnOp{MUL} loads and
+// not be converted to SPMDLoad. Without this exclusion, a vector-typed
+// value would be passed where a scalar is expected, producing LLVM type
+// errors (e.g., "<2 x i32> passed where i32 expected").
+func TestPredicateSPMD_InnerScalarLoopExcluded(t *testing.T) {
+	src := `package main
+
+func f(arr []int, out []int) {
+	for i := range len(arr) {
+		// Outer SPMD: i is varying across lanes.
+		sum := 0
+		for j := range 4 {
+			// Inner scalar loop: j is uniform, arr[j] is a scalar load.
+			// These loads must NOT be converted to SPMDLoad.
+			sum += arr[j]
+		}
+		out[i] = sum
+	}
+}
+
+func main() { f(make([]int, 16), make([]int, 16)) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	var scalarLoads int
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if v, ok := instr.(*ssa.UnOp); ok && v.Op == token.MUL {
+				scalarLoads++
+			}
+		}
+	}
+
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+
+	if scalarLoads == 0 {
+		t.Errorf("expected scalar UnOp{MUL} load(s) for inner scalar loop;"+
+			" inner loop should NOT be converted to SPMDLoad:\n%s", output)
+	}
+}
+
+// TestPredicateSPMD_InnerLoopWithVaryingPhiInScope verifies that an inner
+// for-range loop whose header carries a lanes.Varying[T] phi is NOT excluded
+// from the SPMD scope. Such a loop is doing SPMD work; excluding it would
+// prevent its varying if-else bodies from being predicated with SPMDSelect,
+// causing LLVM branch-condition type errors downstream.
+func TestPredicateSPMD_InnerLoopWithVaryingPhiInScope(t *testing.T) {
+	src := `package main
+import "lanes"
+
+func f(data []uint8) {
+	for _, v := range data {
+		// Outer SPMD: v is Varying[uint8] (different per lane).
+		count := lanes.Varying[uint8](v)
+		for range 8 {
+			// Inner loop: count is loop-carried as Varying[uint8],
+			// so the inner loop header has a Varying phi. It must
+			// stay in SPMD scope so the varying if-else below is
+			// predicated with SPMDSelect.
+			if count > 0 {
+				count--
+			}
+		}
+		_ = count
+	}
+}
+
+func main() { f([]uint8{0xFF, 0x0F}) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	var selects int
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if _, ok := instr.(*ssa.SPMDSelect); ok {
+				selects++
+			}
+		}
+	}
+
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+
+	if selects == 0 {
+		t.Errorf("expected SPMDSelect(s) for varying if-else inside inner SPMD loop;"+
+			" inner loop with Varying phi must remain in SPMD scope:\n%s", output)
+	}
+}
+
 // TestPredicateSPMD_GatherGroup_SingleAccess verifies that a single Index
 // instruction on a [16]byte array with a varying index is not annotated with
 // an SPMDGatherGroup because groups require at least 2 members.

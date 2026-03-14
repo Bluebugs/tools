@@ -1215,6 +1215,49 @@ func spmdBuildExcludedIfs(fn *Function) map[*If]bool {
 // A block is in scope if it lies between the body block (inclusive) and the
 // done block (exclusive), reachable via CFG traversal within the loop.
 func spmdLoopScopeBlocks(loop *SPMDLoopInfo) map[*BasicBlock]bool {
+	// Pre-pass: identify inner loop headers. A block B (other than the SPMD
+	// loop's own LoopBlock/BodyBlock) is an inner loop header if it has a
+	// predecessor P where B can forward-reach P (i.e., B→...→P→B is a cycle)
+	// WITHOUT passing through the SPMD loop's own boundary blocks.
+	//
+	// pred.Index >= b.Index catches two back-edge forms:
+	//   - Normal back-edge (rangeindex): body block at higher index jumps
+	//     back to the loop header at a lower index (pred.Index >= b.Index).
+	//   - Self-loop (merged rangeint): the block is both body and loop; it
+	//     jumps back to itself, so pred.Index == b.Index.
+	//
+	// The constraint "without passing through loop boundaries" is critical: a
+	// path that goes through loop.LoopBlock or loop.DoneBlock escapes the SPMD
+	// loop and re-enters via the outer back-edge, which is NOT an inner loop.
+	// Without this constraint, switch body blocks (like block 8 with pred block 9
+	// reachable via block 4 → loop header → block 9) would be falsely flagged as
+	// inner loop headers, preventing them from being included in the SPMD scope
+	// and causing varying switch predication to panic.
+	loopBoundary := map[*BasicBlock]bool{
+		loop.LoopBlock: true,
+		loop.DoneBlock: true,
+	}
+	if loop.EntryBlock != nil {
+		loopBoundary[loop.EntryBlock] = true
+	}
+
+	innerLoopHeaders := make(map[*BasicBlock]bool)
+	fn := loop.BodyBlock.Parent()
+	for _, b := range fn.Blocks {
+		if b == loop.LoopBlock || b == loop.BodyBlock {
+			continue
+		}
+		for _, pred := range b.Preds {
+			// pred.Index >= b.Index catches both normal back-edges (body→header,
+			// where body has a higher index) and self-loops (merged rangeint blocks
+			// where the block loops back to itself, giving pred.Index == b.Index).
+			if pred.Index >= b.Index && spmdBlockCanReachWithin(b, pred, loopBoundary) && !spmdBlockHasSPMDPhi(b) {
+				innerLoopHeaders[b] = true
+				break
+			}
+		}
+	}
+
 	scope := make(map[*BasicBlock]bool)
 	// BFS from BodyBlock (and LoopBlock if separate), stopping at DoneBlock.
 	queue := []*BasicBlock{loop.BodyBlock}
@@ -1241,6 +1284,12 @@ func spmdLoopScopeBlocks(loop *SPMDLoopInfo) map[*BasicBlock]bool {
 			if spmdBlockHasReturn(succ) {
 				continue
 			}
+			// Stop at inner loop headers to avoid including their bodies in
+			// the SPMD scope. Inner loops operate on scalar values; converting
+			// their memory ops to masked vector ops produces type mismatches.
+			if innerLoopHeaders[succ] {
+				continue
+			}
 			scope[succ] = true
 			queue = append(queue, succ)
 		}
@@ -1249,10 +1298,51 @@ func spmdLoopScopeBlocks(loop *SPMDLoopInfo) map[*BasicBlock]bool {
 	return scope
 }
 
+// spmdBlockCanReachWithin reports whether a forward path exists from src to dst
+// via BFS over successors, without passing through any block in the stopAt set.
+// stopAt blocks are not visited (the BFS stops before entering them).
+// If stopAt is nil, all blocks are traversed (equivalent to spmdBlockCanReach).
+func spmdBlockCanReachWithin(src, dst *BasicBlock, stopAt map[*BasicBlock]bool) bool {
+	visited := make(map[*BasicBlock]bool)
+	queue := []*BasicBlock{src}
+	visited[src] = true
+	for len(queue) > 0 {
+		b := queue[0]
+		queue = queue[1:]
+		for _, succ := range b.Succs {
+			if succ == dst {
+				return true
+			}
+			if stopAt[succ] || visited[succ] {
+				continue
+			}
+			visited[succ] = true
+			queue = append(queue, succ)
+		}
+	}
+	return false
+}
+
 // spmdBlockHasReturn reports whether block b contains a Return instruction.
 func spmdBlockHasReturn(b *BasicBlock) bool {
 	for _, instr := range b.Instrs {
 		if _, ok := instr.(*Return); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// spmdBlockHasSPMDPhi reports whether block b has any phi instruction whose
+// result type is an SPMDType (lanes.Varying[T]). Such blocks are doing SPMD
+// work and must remain in the SPMD scope even if they are inner loop headers.
+func spmdBlockHasSPMDPhi(b *BasicBlock) bool {
+	for _, instr := range b.Instrs {
+		phi, ok := instr.(*Phi)
+		if !ok {
+			break // phis always appear at the start of a block
+		}
+		if _, ok := phi.Type().(*types.SPMDType); ok {
 			return true
 		}
 	}
