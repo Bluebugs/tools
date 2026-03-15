@@ -53,6 +53,17 @@ func deleteUnreachableBlocks(f *Function) {
 		if b.Index == white {
 			for _, c := range b.Succs {
 				if c.Index == black {
+					// Sanity: all phis in c must have edge counts == len(c.Preds).
+					for _, instr := range c.phis() {
+						phi := instr.(*Phi)
+						if len(phi.Edges) != len(c.Preds) {
+							predComments := make([]string, len(c.Preds))
+					for pi, pp := range c.Preds {
+						predComments[pi] = pp.Comment
+					}
+					panic(fmt.Sprintf("deleteUnreachableBlocks: phi edge mismatch in func=%s block-comment=%q: phi=%s edges=%d preds=%d preds-comments=%v (unreachable-block-comment=%q f.Blocks[i]=%d)", f.Name(), c.Comment, phi, len(phi.Edges), len(c.Preds), predComments, b.Comment, i))
+						}
+					}
 					c.removePred(b) // delete white->black edge
 				}
 			}

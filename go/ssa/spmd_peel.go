@@ -387,6 +387,18 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	// Clear entry's old successors; we will add new ones via addEdge below.
 	entry.Succs = entry.Succs[:0]
 
+	// Save done-phi entry-edges BEFORE removing entry from done.Preds so
+	// we can wire the "no-main-iterations" path after peeling.
+	donePhiEntryEdges := map[*Phi]Value{}
+	for _, instr := range done.phis() {
+		phi := instr.(*Phi)
+		for j, pred := range done.Preds {
+			if pred == entry {
+				donePhiEntryEdges[phi] = phi.Edges[j]
+			}
+		}
+	}
+
 	// Remove entry as a predecessor of body and done (the old loop-entry edges).
 	body.removePred(entry)
 	done.removePred(entry)
@@ -517,15 +529,14 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	addEdge(mainBody, tailCheck)
 
 	// --- Determine exit target for tailCheck and tailBody ---
-	// When the loop has accumulators, the done block may have phis that consume
-	// the final accumulator value. After peeling, done can be reached from two
-	// paths (tailCheck when no tail, tailBody after tail executes) and those
-	// paths carry different accumulator values. A trampoline block merges them.
-	// For loops without accumulators, both tailCheck and tailBody branch directly
-	// to done; exitBlock is set to done in that case.
+	// When the loop has accumulators, or when done has phis (values computed in
+	// the loop body and consumed after it), a trampoline block is needed to merge
+	// the two exit paths (tailCheck = no tail, tailBody = after tail) before
+	// jumping to done. Without a trampoline, done would have two predecessors but
+	// its phis would have no edges — a malformed SSA state.
 	exitBlock := done
 	var trampoline *BasicBlock
-	if len(loop.Accumulators) > 0 {
+	if len(loop.Accumulators) > 0 || len(done.phis()) > 0 {
 		trampoline = fn.newBasicBlock("spmd.trampoline")
 		exitBlock = trampoline
 		loop.TrampolineBlock = trampoline
@@ -641,12 +652,47 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 			phi := instr.(*Phi)
 			bodyEdge := donePhiBodyEdges[phi]
 			if mergeVal, ok := accMergeMap[bodyEdge]; ok {
+				// Body-block accumulator: the merge phi in the trampoline
+				// already holds the correct merged value.
 				phi.Edges = append(phi.Edges, mergeVal)
 				spmdAddReferrer(mergeVal, phi)
 				continue
 			}
-			// Non-accumulator phi: carry the original body-edge value.
-			phi.Edges = append(phi.Edges, bodyEdge)
+			// Done-block phi (not a body-block accumulator): the phi lives in
+			// done rather than body, so it's not in loop.Accumulators. We
+			// still need to merge the two exit paths (tailCheck, tailBody).
+			//
+			// Create a tailCheck phi that carries:
+			//   - from entry: the original entry-edge value (no iterations ran)
+			//   - from mainBody: the translated back-value (after main iterations)
+			// Then create a trampoline merge phi with:
+			//   - from tailCheck: the tailCheck phi
+			//   - from tailBody: the translated back-value for the tail iteration
+			entryEdge := donePhiEntryEdges[phi]
+			if entryEdge == nil {
+				// Edge not found (shouldn't happen in well-formed SSA); use bodyEdge.
+				entryEdge = bodyEdge
+			}
+			mainBackEdge := spmdTranslateValue(bodyEdge, mainValueMap)
+			tailCheckPhi := &Phi{Comment: "spmd.done.acc"}
+			tailCheckPhi.setType(phi.Type())
+			// tailCheck.Preds = [entry, mainBody] (see addEdge calls above).
+			tailCheckPhi.Edges = []Value{entryEdge, mainBackEdge}
+			spmdInsertPhiAtFront(tailCheck, tailCheckPhi)
+			spmdAddReferrer(entryEdge, tailCheckPhi)
+			spmdAddReferrer(mainBackEdge, tailCheckPhi)
+
+			tailBodyEdge := spmdTranslateValue(bodyEdge, tailValueMap)
+			mergePhi := &Phi{Comment: "spmd.done.merge"}
+			mergePhi.setType(phi.Type())
+			// trampoline.Preds = [tailCheck, tailBody].
+			mergePhi.Edges = []Value{tailCheckPhi, tailBodyEdge}
+			spmdInsertPhiAtFront(trampoline, mergePhi)
+			spmdAddReferrer(tailCheckPhi, mergePhi)
+			spmdAddReferrer(tailBodyEdge, mergePhi)
+
+			phi.Edges = append(phi.Edges, mergePhi)
+			spmdAddReferrer(mergePhi, phi)
 		}
 	}
 
