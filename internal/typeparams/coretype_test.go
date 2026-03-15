@@ -14,6 +14,76 @@ import (
 	"golang.org/x/tools/internal/typeparams"
 )
 
+func TestDeref(t *testing.T) {
+	intType := types.Typ[types.Int]
+	ptrInt := types.NewPointer(intType)
+
+	tests := []struct {
+		name string
+		in   types.Type
+		want types.Type
+	}{
+		{
+			name: "plain pointer *int → int",
+			in:   ptrInt,
+			want: intType,
+		},
+		{
+			name: "Varying[*int] → Varying[int]",
+			in:   types.NewVarying(ptrInt),
+			want: types.NewVarying(intType),
+		},
+		{
+			name: "Varying[int] (not a pointer) → Varying[int] unchanged",
+			in:   types.NewVarying(intType),
+			want: types.NewVarying(intType),
+		},
+		{
+			name: "plain int (not a pointer) → int unchanged",
+			in:   intType,
+			want: intType,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := typeparams.Deref(tc.in)
+			if !types.Identical(got, tc.want) {
+				t.Errorf("Deref(%v) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMustDeref(t *testing.T) {
+	intType := types.Typ[types.Int]
+	ptrInt := types.NewPointer(intType)
+
+	t.Run("plain pointer *int → int", func(t *testing.T) {
+		got := typeparams.MustDeref(ptrInt)
+		if !types.Identical(got, intType) {
+			t.Errorf("MustDeref(*int) = %v, want int", got)
+		}
+	})
+
+	t.Run("Varying[*int] → Varying[int]", func(t *testing.T) {
+		got := typeparams.MustDeref(types.NewVarying(ptrInt))
+		want := types.NewVarying(intType)
+		if !types.Identical(got, want) {
+			t.Errorf("MustDeref(Varying[*int]) = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("non-pointer panics", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("MustDeref(int) should have panicked")
+			}
+		}()
+		typeparams.MustDeref(intType)
+	})
+}
+
 func TestCoreType(t *testing.T) {
 	const source = `
 	package P

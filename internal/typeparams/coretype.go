@@ -133,9 +133,17 @@ func NormalTerms(T types.Type) ([]*types.Term, error) {
 // Do not assume that Deref(T)==T implies T is not a pointer:
 // consider "type T *T", for example.
 //
+// For Varying[*T] (a varying pointer), Deref returns Varying[T].
+//
 // TODO(adonovan): ideally this would live in typesinternal, but that
 // creates an import cycle. Move there when we melt this package down.
 func Deref(t types.Type) types.Type {
+	// Varying[*T] — a varying pointer: dereferencing gives Varying[T].
+	if spmd, ok := t.(*types.SPMDType); ok {
+		if ptr, ok := spmd.Elem().(*types.Pointer); ok {
+			return types.NewVarying(ptr.Elem())
+		}
+	}
 	if ptr, ok := CoreType(t).(*types.Pointer); ok {
 		return ptr.Elem()
 	}
@@ -145,9 +153,17 @@ func Deref(t types.Type) types.Type {
 // MustDeref returns the type of the variable pointed to by t.
 // It panics if t's core type is not a pointer.
 //
+// For Varying[*T] (a varying pointer), MustDeref returns Varying[T].
+//
 // TODO(adonovan): ideally this would live in typesinternal, but that
 // creates an import cycle. Move there when we melt this package down.
 func MustDeref(t types.Type) types.Type {
+	// Varying[*T] — a varying pointer: dereferencing gives Varying[T].
+	if spmd, ok := t.(*types.SPMDType); ok {
+		if ptr, ok := spmd.Elem().(*types.Pointer); ok {
+			return types.NewVarying(ptr.Elem())
+		}
+	}
 	if ptr, ok := CoreType(t).(*types.Pointer); ok {
 		return ptr.Elem()
 	}
