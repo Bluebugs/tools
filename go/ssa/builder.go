@@ -578,7 +578,19 @@ func (b *builder) addr(fn *Function, e ast.Expr, escaping bool) lvalue {
 		wantAddr := true
 		v := b.receiver(fn, e.X, wantAddr, escaping, sel)
 		index := sel.index[len(sel.index)-1]
-		fld := fieldOf(typeparams.MustDeref(v.Type()), index) // v is an addr.
+
+		// Determine the type of the field for the lazyAddress cache.
+		// For *Varying[S] receivers the field address is *Varying[fieldType], so
+		// the cached element type must be Varying[fieldType], not bare fieldType.
+		var fieldElemType types.Type
+		if isVaryingPtrStruct(v.Type()) {
+			spmd := typeparams.MustDeref(v.Type()).(*types.SPMDType)
+			fld := fieldOf(spmd.Elem(), index)
+			fieldElemType = types.NewVarying(fld.Type())
+		} else {
+			fld := fieldOf(typeparams.MustDeref(v.Type()), index) // v is an addr.
+			fieldElemType = fld.Type()
+		}
 
 		// Due to the two phases of resolving AssignStmt, a panic from x.f = p()
 		// when x is nil is required to come after the side-effects of
@@ -586,7 +598,7 @@ func (b *builder) addr(fn *Function, e ast.Expr, escaping bool) lvalue {
 		emit := func(fn *Function) Value {
 			return emitFieldSelection(fn, v, index, true, e.Sel)
 		}
-		return &lazyAddress{addr: emit, t: fld.Type(), pos: e.Sel.Pos(), expr: e.Sel}
+		return &lazyAddress{addr: emit, t: fieldElemType, pos: e.Sel.Pos(), expr: e.Sel}
 
 	case *ast.IndexExpr:
 		xt := fn.typeOf(e.X)

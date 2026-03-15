@@ -566,6 +566,22 @@ func emitImplicitSelections(f *Function, v Value, indices []int, pos token.Pos) 
 	return v
 }
 
+// isVaryingPtrStruct reports whether t is *Varying[S] for some struct type S.
+// This identifies uniform pointers to varying structs, which require per-lane
+// field access that produces Varying[fieldType] results.
+func isVaryingPtrStruct(t types.Type) bool {
+	ptr, ok := t.(*types.Pointer)
+	if !ok {
+		return false
+	}
+	spmd, ok := ptr.Elem().(*types.SPMDType)
+	if !ok {
+		return false
+	}
+	_, ok = spmd.Elem().Underlying().(*types.Struct)
+	return ok
+}
+
 // emitFieldSelection emits to f code to select the index'th field of v.
 //
 // If wantAddr, the input must be a pointer-to-struct and the result
@@ -574,13 +590,24 @@ func emitImplicitSelections(f *Function, v Value, indices []int, pos token.Pos) 
 // Ident id is used for position and debug info.
 func emitFieldSelection(f *Function, v Value, index int, wantAddr bool, id *ast.Ident) Value {
 	if isPointerCore(v.Type()) {
-		fld := fieldOf(typeparams.MustDeref(v.Type()), index)
+		var fieldAddrType types.Type
+		if isVaryingPtrStruct(v.Type()) {
+			// v has type *Varying[S]; deref gives Varying[S], whose Elem() is S.
+			// The field address is *Varying[fieldType] so that the subsequent load
+			// produces Varying[fieldType] rather than a bare scalar field type.
+			spmd := typeparams.MustDeref(v.Type()).(*types.SPMDType)
+			fld := fieldOf(spmd.Elem(), index)
+			fieldAddrType = types.NewPointer(types.NewVarying(fld.Type()))
+		} else {
+			fld := fieldOf(typeparams.MustDeref(v.Type()), index)
+			fieldAddrType = types.NewPointer(fld.Type())
+		}
 		instr := &FieldAddr{
 			X:     v,
 			Field: index,
 		}
 		instr.setPos(id.Pos())
-		instr.setType(types.NewPointer(fld.Type()))
+		instr.setType(fieldAddrType)
 		v = f.emit(instr)
 		// Load the field's value iff we don't want its address.
 		if !wantAddr {
