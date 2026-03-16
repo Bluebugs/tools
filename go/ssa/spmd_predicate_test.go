@@ -4636,3 +4636,42 @@ func main() { var arr [16]byte; f(arr, 4) }
 		}
 	}
 }
+
+func TestPredicateSPMD_ContiguousAggregateLoad(t *testing.T) {
+	src := `package main
+
+import "fmt"
+
+type Pair struct { A, B int }
+
+func f(pairs []Pair) {
+	for _, p := range pairs {
+		fmt.Println(p.A)
+	}
+}
+
+func main() { f(make([]Pair, 8)) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	foundContiguousLoad := false
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if load, ok := instr.(*ssa.SPMDLoad); ok && load.Contiguous {
+				// Check that the loaded type is the aggregate Pair, not a scalar field.
+				if _, isStruct := load.Type().Underlying().(*types.Struct); isStruct {
+					foundContiguousLoad = true
+				}
+			}
+		}
+	}
+	if !foundContiguousLoad {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Errorf("expected contiguous SPMDLoad for aggregate type, got:\n%s", buf.String())
+	}
+}

@@ -1970,8 +1970,14 @@ func spmdConvertScopedMemOps(fn *Function, scopeBlocks map[*BasicBlock]bool, mas
 				if instr.Op != token.MUL {
 					continue
 				}
-				// Only convert loads of SPMD-compatible element types.
-				if !spmdIsVectorizableElemType(instr.Type()) {
+				// Check if address is a contiguous IndexAddr.
+				indexAddr, isIndexAddr := instr.X.(*IndexAddr)
+				isContiguous := isIndexAddr && spmdIsContiguousIndex(fn, indexAddr.Index)
+
+				// Non-vectorizable types (structs, strings) are only converted
+				// to SPMDLoad when the access is contiguous. Non-contiguous
+				// aggregate loads are truly uniform (scalar broadcast is correct).
+				if !spmdIsVectorizableElemType(instr.Type()) && !isContiguous {
 					continue
 				}
 				load := &SPMDLoad{
@@ -1980,12 +1986,9 @@ func spmdConvertScopedMemOps(fn *Function, scopeBlocks map[*BasicBlock]bool, mas
 					Lanes: lanes,
 					pos:   instr.Pos(),
 				}
-				// Detect contiguous access: IndexAddr with iter-based index.
-				if indexAddr, ok := instr.X.(*IndexAddr); ok {
-					if spmdIsContiguousIndex(fn, indexAddr.Index) {
-						load.Contiguous = true
-						load.Source = indexAddr.X
-					}
+				if isContiguous {
+					load.Contiguous = true
+					load.Source = indexAddr.X
 				}
 				load.setType(instr.Type())
 				load.setBlock(block)
@@ -3596,10 +3599,14 @@ func spmdMaskMemOps(b *BasicBlock, mask Value, lanes int) {
 			if instr.Op != token.MUL {
 				continue
 			}
-			// Only convert loads of SPMD-compatible element types (basic
-			// types, pointers, SPMDType). Struct/interface/slice loads are
-			// left as regular instructions since TinyGo can't vectorize them.
-			if !spmdIsVectorizableElemType(instr.Type()) {
+			// Check if address is a contiguous IndexAddr.
+			indexAddr, isIndexAddr := instr.X.(*IndexAddr)
+			isContiguous := isIndexAddr && spmdIsContiguousIndex(b.parent, indexAddr.Index)
+
+			// Non-vectorizable types (structs, strings) are only converted
+			// to SPMDLoad when the access is contiguous. Non-contiguous
+			// aggregate loads are truly uniform (scalar broadcast is correct).
+			if !spmdIsVectorizableElemType(instr.Type()) && !isContiguous {
 				continue
 			}
 			// Replace pointer load with SPMDLoad.
@@ -3610,11 +3617,9 @@ func spmdMaskMemOps(b *BasicBlock, mask Value, lanes int) {
 				pos:   instr.Pos(),
 			}
 			// Detect contiguous access via IndexAddr with iter-based index.
-			if indexAddr, ok := instr.X.(*IndexAddr); ok {
-				if spmdIsContiguousIndex(b.parent, indexAddr.Index) {
-					load.Contiguous = true
-					load.Source = indexAddr.X
-				}
+			if isContiguous {
+				load.Contiguous = true
+				load.Source = indexAddr.X
 			}
 			load.setType(instr.Type())
 			load.setBlock(b)
