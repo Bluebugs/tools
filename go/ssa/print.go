@@ -445,6 +445,12 @@ func (v *SPMDVectorFromMemory) String() string {
 		v.Lanes, relType(v.ElemType, from), spmdRelName(v.Ptr, v), spmdRelName(v.Len, v))
 }
 
+func (v *SPMDVectorFromPtr) String() string {
+	from := spmdRelPkg(v)
+	return fmt.Sprintf("spmd_vector_from_ptr<%d, %s> %s",
+		v.Lanes, relType(v.ElemType, from), spmdRelName(v.Ptr, v))
+}
+
 func (s *MapUpdate) String() string {
 	return fmt.Sprintf("%s[%s] = %s", relName(s.Map, s), relName(s.Key, s), relName(s.Value, s))
 }

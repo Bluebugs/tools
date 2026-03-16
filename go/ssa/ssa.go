@@ -1537,6 +1537,36 @@ type SPMDVectorFromMemory struct {
 	Lanes    int        // lane count from enclosing SPMD loop
 }
 
+// SPMDVectorFromPtr loads a fixed-size array from a raw pointer directly into
+// a SIMD vector. Unlike SPMDVectorFromMemory, the source has exactly Lanes
+// valid elements, so no zero-padding is needed. Lowers to a single v128.load.
+//
+// This arises when a [N]T struct field is copied to a local variable and then
+// iterated with go for: the copy alloc is eliminated and the field pointer is
+// used directly.
+//
+// The result type is Varying[ElemType].
+//
+// Example printed form:
+//
+//	t1 = spmd_vector_from_ptr<16, byte> t0
+type SPMDVectorFromPtr struct {
+	register
+	Ptr      Value      // *[N]T — pointer to the source array (e.g., from FieldAddr)
+	ElemType types.Type // element type (byte, int32, etc.)
+	Lanes    int        // lane count (= N)
+}
+
+func (v *SPMDVectorFromPtr) Operands(rands []*Value) []*Value {
+	return append(rands, &v.Ptr)
+}
+
+func (v *SPMDVectorFromPtr) Pos() token.Pos { return v.pos }
+
+func (v *SPMDVectorFromPtr) Type() types.Type {
+	return types.NewVarying(v.ElemType)
+}
+
 // The MapUpdate instruction updates the association of Map[Key] to
 // Value.
 //

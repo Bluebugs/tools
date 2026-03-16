@@ -414,3 +414,42 @@ func main() {
 		t.Error("expected Alloc to remain (uniform index)")
 	}
 }
+
+// Compile-time interface compliance checks for SPMDVectorFromPtr.
+var _ ssa.Value = (*ssa.SPMDVectorFromPtr)(nil)
+var _ ssa.Instruction = (*ssa.SPMDVectorFromPtr)(nil)
+
+func TestSPMDVectorFromPtr_Type(t *testing.T) {
+	byteType := types.Typ[types.Byte]
+	instr := &ssa.SPMDVectorFromPtr{ElemType: byteType, Lanes: 16}
+	got := instr.Type()
+	want := types.NewVarying(byteType)
+	if !types.Identical(got, want) {
+		t.Errorf("Type() = %v, want %v", got, want)
+	}
+}
+
+func TestSPMDVectorFromPtr_Operands(t *testing.T) {
+	byteType := types.Typ[types.Byte]
+	instr := &ssa.SPMDVectorFromPtr{ElemType: byteType, Lanes: 16}
+	var rands []*ssa.Value
+	got := instr.Operands(rands)
+	if len(got) != 1 {
+		t.Fatalf("Operands() len = %d, want 1", len(got))
+	}
+	if got[0] != &instr.Ptr {
+		t.Errorf("Operands()[0] not &Ptr")
+	}
+}
+
+func TestSPMDVectorFromPtr_String(t *testing.T) {
+	byteType := types.Typ[types.Byte]
+	instr := &ssa.SPMDVectorFromPtr{Ptr: ptrConst(), ElemType: byteType, Lanes: 16}
+	got := instr.String()
+	if !strings.Contains(got, "spmd_vector_from_ptr") {
+		t.Errorf("String() = %q, want spmd_vector_from_ptr prefix", got)
+	}
+	if !strings.Contains(got, "16") {
+		t.Errorf("String() = %q, missing lane count", got)
+	}
+}

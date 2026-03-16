@@ -730,3 +730,14 @@ func emitSPMDVectorFromMemory(f *Function, ptr, length Value, lanes int, elemTyp
 	f.emit(v)
 	return v
 }
+
+func emitSPMDVectorFromPtr(f *Function, ptr Value, lanes int, elemType types.Type, pos token.Pos) *SPMDVectorFromPtr {
+	v := &SPMDVectorFromPtr{
+		Ptr:      ptr,
+		ElemType: elemType,
+		Lanes:    lanes,
+	}
+	v.pos = pos
+	f.emit(v)
+	return v
+}

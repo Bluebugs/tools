@@ -280,6 +280,17 @@ func (s *sanity) checkInstr(idx int, instr Instruction) {
 			s.errorf("SPMDVectorFromMemory has nil Len")
 		}
 
+	case *SPMDVectorFromPtr:
+		if instr.Lanes <= 0 {
+			s.errorf("SPMDVectorFromPtr: Lanes must be positive, got %d", instr.Lanes)
+		}
+		if instr.ElemType == nil {
+			s.errorf("SPMDVectorFromPtr: ElemType is nil")
+		}
+		if instr.Ptr == nil {
+			s.errorf("SPMDVectorFromPtr: Ptr is nil")
+		}
+
 	default:
 		panic(fmt.Sprintf("Unknown instruction type: %T", instr))
 	}
