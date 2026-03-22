@@ -249,6 +249,11 @@ func peelSPMDLoops(fn *Function) {
 		if loop.IterPhi == nil || loop.BoundValue == nil {
 			continue
 		}
+		// Skip peeling for scalar fallback (laneCount=1): no main/tail split
+		// is needed when the loop processes one element at a time.
+		if loop.LaneCount <= 1 {
+			continue
+		}
 		peelSPMDLoop(fn, loop)
 	}
 }

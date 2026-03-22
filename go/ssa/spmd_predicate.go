@@ -82,6 +82,11 @@ func predicateSPMD(fn *Function) {
 	}
 
 	for _, loop := range fn.SPMDLoops {
+		// Skip predication for scalar fallback (laneCount=1): the loop body
+		// is already a plain scalar loop with no vectorization needed.
+		if loop.LaneCount <= 1 {
+			continue
+		}
 		predicateSPMDLoop(fn, loop)
 	}
 }
