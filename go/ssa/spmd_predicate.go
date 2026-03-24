@@ -3732,6 +3732,399 @@ func spmdMaskMemOps(b *BasicBlock, mask Value, lanes int) {
 	}
 }
 
+// spmdMergeRedundantStores merges consecutive SPMDStore instructions to the
+// same address into a single SPMDStore with chained SPMDSelect values.
+// This eliminates the redundant masked read-modify-write pattern that the LLVM
+// backend would otherwise emit for each store.
+//
+// Must run after predicateSPMD (which creates SPMDStores) and before
+// peelSPMDLoops (which clones blocks). It targets the pattern produced by
+// if/else-if/else chains where each branch stores a different value to the
+// same address — e.g., the clamp pattern:
+//
+//	if v < lo { result[i] = lo } else if v > hi { result[i] = hi } else { result[i] = v }
+//
+// After predication these become 3 SPMDStores in a linear block chain.
+// After merging:
+//
+//	sel1 = SPMDSelect(mask_gt, hi,    lo)
+//	sel2 = SPMDSelect(mask_else, v,   sel1)
+//	SPMDStore(result[i], sel2, allMask)
+func spmdMergeRedundantStores(fn *Function) {
+	if len(fn.SPMDLoops) == 0 {
+		return
+	}
+	for _, loop := range fn.SPMDLoops {
+		if loop.LaneCount <= 1 {
+			continue
+		}
+		scopeBlocks := spmdLoopScopeBlocks(loop)
+		spmdMergeStoresInScope(fn, scopeBlocks, loop.LaneCount)
+	}
+}
+
+// spmdAddrKey is a canonical key for an SPMDStore address that normalises
+// distinct IndexAddr instructions with identical (X, Index) operands into a
+// single representative. For any other address shape the key is the Value
+// pointer itself, keeping identity semantics.
+//
+// This is critical for the clamp/if-else-if-else pattern where predication
+// inserts a fresh IndexAddr (e.g. &result[i]) in each linearised branch even
+// though all branches target the same logical slice element.
+type spmdAddrKey struct {
+	// For IndexAddr: (base, index) operand pair.
+	// For all others: (addr, nil).
+	base  Value
+	index Value
+}
+
+// spmdNormalizeAddr returns a canonical key for the address operand of an
+// SPMDStore. IndexAddr instructions with the same X and Index map to the same
+// key; all other addresses use identity.
+func spmdNormalizeAddr(addr Value) spmdAddrKey {
+	if ia, ok := addr.(*IndexAddr); ok {
+		return spmdAddrKey{base: ia.X, index: ia.Index}
+	}
+	return spmdAddrKey{base: addr}
+}
+
+// spmdAddrIsLoad reports whether load.Addr matches the given canonical key,
+// using the same normalisation as spmdNormalizeAddr.
+func spmdAddrIsLoad(load *SPMDLoad, key spmdAddrKey) bool {
+	return spmdNormalizeAddr(load.Addr) == key
+}
+
+// spmdMergeStoresInScope finds groups of SPMDStore instructions to the same
+// logical address within linear block chains in scopeBlocks and merges them.
+func spmdMergeStoresInScope(fn *Function, scopeBlocks map[*BasicBlock]bool, lanes int) {
+	// Merge within single blocks first (handles stores that ended up in the
+	// same block after predication, e.g. a switch with fallthrough).
+	for _, block := range fn.Blocks {
+		if !scopeBlocks[block] {
+			continue
+		}
+		spmdMergeStoresInBlock(block, lanes)
+	}
+
+	// Merge across consecutive blocks in linear chains.
+	// A linear chain: B0 → B1 → B2 where each Bi has exactly one successor
+	// and that successor has exactly one predecessor.
+	// This handles the clamp pattern where if/else stores land in separate
+	// blocks after CFG linearization.
+	visited := make(map[*BasicBlock]bool)
+	for _, block := range fn.Blocks {
+		if !scopeBlocks[block] || visited[block] {
+			continue
+		}
+		// Grow chain forward.
+		chain := []*BasicBlock{block}
+		visited[block] = true
+		b := block
+		for {
+			if len(b.Succs) != 1 {
+				break
+			}
+			next := b.Succs[0]
+			if !scopeBlocks[next] || visited[next] || len(next.Preds) != 1 {
+				break
+			}
+			chain = append(chain, next)
+			visited[next] = true
+			b = next
+		}
+		if len(chain) < 2 {
+			continue
+		}
+		spmdMergeStoresAcrossChain(chain, lanes)
+	}
+}
+
+// spmdMergeStoresInBlock merges SPMDStore instructions within a single block
+// that share the same logical address, with no intervening SPMDLoad.
+func spmdMergeStoresInBlock(block *BasicBlock, lanes int) {
+	type addrGroup struct {
+		stores []int // indices into block.Instrs
+	}
+	groups := map[spmdAddrKey]*addrGroup{}
+	order := []spmdAddrKey{}
+	for i, instr := range block.Instrs {
+		store, ok := instr.(*SPMDStore)
+		if !ok {
+			continue
+		}
+		key := spmdNormalizeAddr(store.Addr)
+		g, exists := groups[key]
+		if !exists {
+			g = &addrGroup{}
+			groups[key] = g
+			order = append(order, key)
+		}
+		g.stores = append(g.stores, i)
+	}
+	for _, key := range order {
+		g := groups[key]
+		if len(g.stores) < 2 {
+			continue
+		}
+		first, last := g.stores[0], g.stores[len(g.stores)-1]
+		if spmdHasLoadBetweenIndices(block, key, first, last) {
+			continue
+		}
+		stores := make([]*SPMDStore, len(g.stores))
+		for i, idx := range g.stores {
+			stores[i] = block.Instrs[idx].(*SPMDStore)
+		}
+		spmdMergeStoreGroup(block, stores, lanes)
+	}
+}
+
+// spmdMergeStoresAcrossChain finds SPMDStore instructions to the same logical
+// address across the given linear block chain and merges them. The merge
+// inserts SPMDSelect instructions into the last store's block.
+func spmdMergeStoresAcrossChain(chain []*BasicBlock, lanes int) {
+	type chainStoreInfo struct {
+		store    *SPMDStore
+		blockIdx int
+	}
+	groups := map[spmdAddrKey][]chainStoreInfo{}
+	order := []spmdAddrKey{}
+	for bi, blk := range chain {
+		for _, instr := range blk.Instrs {
+			store, ok := instr.(*SPMDStore)
+			if !ok {
+				continue
+			}
+			key := spmdNormalizeAddr(store.Addr)
+			if _, exists := groups[key]; !exists {
+				order = append(order, key)
+			}
+			groups[key] = append(groups[key], chainStoreInfo{store, bi})
+		}
+	}
+	for _, key := range order {
+		infos := groups[key]
+		if len(infos) < 2 {
+			continue
+		}
+		if spmdHasLoadInChain(chain, key, infos[0].blockIdx, infos[len(infos)-1].blockIdx) {
+			continue
+		}
+		stores := make([]*SPMDStore, len(infos))
+		for i, info := range infos {
+			stores[i] = info.store
+		}
+		lastBlock := chain[infos[len(infos)-1].blockIdx]
+		spmdMergeStoreGroupCrossBlock(chain, stores, lastBlock, lanes)
+	}
+}
+
+// spmdBuildCombinedMask computes the OR of all store masks and inserts the
+// BinOp{OR} instructions before target in block. Returns the combined mask.
+// If there is only one distinct mask, it is returned directly (no OR emitted).
+func spmdBuildCombinedMask(block *BasicBlock, stores []*SPMDStore, target Instruction) Value {
+	combined := stores[0].Mask
+	for i := 1; i < len(stores); i++ {
+		orOp := &BinOp{
+			Op: token.OR,
+			X:  combined,
+			Y:  stores[i].Mask,
+		}
+		orOp.setType(combined.Type())
+		spmdInsertBeforeInstr(block, target, orOp)
+		spmdAddReferrer(combined, orOp)
+		spmdAddReferrer(stores[i].Mask, orOp)
+		combined = orOp
+	}
+	return combined
+}
+
+// spmdMergeStoreGroup merges a group of SPMDStore instructions within a single
+// block that all write to the same address. It builds a chain of SPMDSelect
+// instructions and replaces all stores with a single final store.
+//
+// The surviving store uses a combined mask = OR of all original store masks,
+// so that any lane that was written to by any original store is still written.
+//
+// acc = stores[0].Val
+// acc = SPMDSelect(stores[1].Mask, stores[1].Val, acc)
+// ...
+// combinedMask = stores[0].Mask | stores[1].Mask | ...
+// SPMDStore(addr, acc, combinedMask)
+//
+// Earlier stores are removed.
+func spmdMergeStoreGroup(block *BasicBlock, stores []*SPMDStore, lanes int) {
+	if len(stores) < 2 {
+		return
+	}
+	lastStore := stores[len(stores)-1]
+
+	// SPMDSelect requires X.Type() == Y.Type(). All store values targeting the
+	// same address share the same element type (as enforced by the SPMDStore
+	// sanity checker), so the type of the first store's value is authoritative.
+	selType := stores[0].Val.Type()
+
+	// Build select chain: start with the first store's value, then fold in
+	// subsequent stores via SPMDSelect(laterMask, laterVal, acc).
+	acc := stores[0].Val
+	for i := 1; i < len(stores); i++ {
+		s := stores[i]
+		sel := &SPMDSelect{
+			Mask:  s.Mask,
+			X:     s.Val,
+			Y:     acc,
+			Lanes: lanes,
+		}
+		sel.setType(selType)
+		sel.setBlock(block)
+		spmdAddReferrer(s.Mask, sel)
+		spmdAddReferrer(s.Val, sel)
+		spmdAddReferrer(acc, sel)
+		// Insert sel before lastStore.
+		spmdInsertBeforeInstr(block, lastStore, sel)
+		acc = sel
+	}
+
+	// Compute the combined mask (OR of all individual masks) so the merged
+	// store executes for every lane that any original store would have executed.
+	combinedMask := spmdBuildCombinedMask(block, stores, lastStore)
+
+	// Point lastStore's Val and Mask at the merged values.
+	if refs := lastStore.Val.Referrers(); refs != nil {
+		*refs = removeInstr(*refs, lastStore)
+	}
+	if refs := lastStore.Mask.Referrers(); refs != nil {
+		*refs = removeInstr(*refs, lastStore)
+	}
+	lastStore.Val = acc
+	lastStore.Mask = combinedMask
+	spmdAddReferrer(acc, lastStore)
+	spmdAddReferrer(combinedMask, lastStore)
+
+	// Remove all stores except the last.
+	for i := 0; i < len(stores)-1; i++ {
+		s := stores[i]
+		spmdDropStoreReferrers(s)
+		spmdRemoveInstrFromBlock(block, s)
+		s.setBlock(nil)
+	}
+}
+
+// spmdMergeStoreGroupCrossBlock merges SPMDStore instructions spread across
+// multiple blocks in a linear chain. All SPMDSelect instructions and the
+// surviving store are placed in lastBlock.
+//
+// Earlier stores (in earlier chain blocks) are removed. The SPMDSelect
+// instructions are inserted before lastStore in lastBlock.
+func spmdMergeStoreGroupCrossBlock(chain []*BasicBlock, stores []*SPMDStore, lastBlock *BasicBlock, lanes int) {
+	if len(stores) < 2 {
+		return
+	}
+	lastStore := stores[len(stores)-1]
+
+	// SPMDSelect requires X.Type() == Y.Type(). All store values targeting the
+	// same address share the same element type, so the first store value's type
+	// is authoritative for all SPMDSelect instructions in the chain.
+	selType := stores[0].Val.Type()
+
+	acc := stores[0].Val
+	for i := 1; i < len(stores); i++ {
+		s := stores[i]
+		sel := &SPMDSelect{
+			Mask:  s.Mask,
+			X:     s.Val,
+			Y:     acc,
+			Lanes: lanes,
+		}
+		sel.setType(selType)
+		sel.setBlock(lastBlock)
+		spmdAddReferrer(s.Mask, sel)
+		spmdAddReferrer(s.Val, sel)
+		spmdAddReferrer(acc, sel)
+		spmdInsertBeforeInstr(lastBlock, lastStore, sel)
+		acc = sel
+	}
+
+	// Compute the combined mask (OR of all individual masks) so the merged
+	// store executes for every lane that any original store would have executed.
+	combinedMask := spmdBuildCombinedMask(lastBlock, stores, lastStore)
+
+	// Update lastStore Val and Mask.
+	if refs := lastStore.Val.Referrers(); refs != nil {
+		*refs = removeInstr(*refs, lastStore)
+	}
+	if refs := lastStore.Mask.Referrers(); refs != nil {
+		*refs = removeInstr(*refs, lastStore)
+	}
+	lastStore.Val = acc
+	lastStore.Mask = combinedMask
+	spmdAddReferrer(acc, lastStore)
+	spmdAddReferrer(combinedMask, lastStore)
+
+	// Remove all stores except the last from their respective blocks.
+	for i := 0; i < len(stores)-1; i++ {
+		s := stores[i]
+		ownerBlock := s.Block()
+		spmdDropStoreReferrers(s)
+		if ownerBlock != nil {
+			spmdRemoveInstrFromBlock(ownerBlock, s)
+		}
+		s.setBlock(nil)
+	}
+}
+
+// spmdDropStoreReferrers removes s from the referrer lists of all its operands.
+func spmdDropStoreReferrers(s *SPMDStore) {
+	if refs := s.Addr.Referrers(); refs != nil {
+		*refs = removeInstr(*refs, s)
+	}
+	if refs := s.Val.Referrers(); refs != nil {
+		*refs = removeInstr(*refs, s)
+	}
+	if refs := s.Mask.Referrers(); refs != nil {
+		*refs = removeInstr(*refs, s)
+	}
+	if s.Source != nil {
+		if refs := s.Source.Referrers(); refs != nil {
+			*refs = removeInstr(*refs, s)
+		}
+	}
+}
+
+// spmdRemoveInstrFromBlock removes target from block.Instrs.
+func spmdRemoveInstrFromBlock(block *BasicBlock, target Instruction) {
+	for i, instr := range block.Instrs {
+		if instr == target {
+			block.Instrs = append(block.Instrs[:i], block.Instrs[i+1:]...)
+			return
+		}
+	}
+}
+
+// spmdHasLoadBetweenIndices reports whether there is an SPMDLoad from the
+// address identified by key between instruction indices first (exclusive) and
+// last (exclusive) in block.
+func spmdHasLoadBetweenIndices(block *BasicBlock, key spmdAddrKey, first, last int) bool {
+	for i := first + 1; i < last; i++ {
+		if load, ok := block.Instrs[i].(*SPMDLoad); ok && spmdAddrIsLoad(load, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// spmdHasLoadInChain reports whether any block in chain[startBlock..endBlock]
+// contains an SPMDLoad from the address identified by key.
+func spmdHasLoadInChain(chain []*BasicBlock, key spmdAddrKey, startBlock, endBlock int) bool {
+	for bi := startBlock; bi <= endBlock; bi++ {
+		for _, instr := range chain[bi].Instrs {
+			if load, ok := instr.(*SPMDLoad); ok && spmdAddrIsLoad(load, key) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // spmdMaskCallOps sweeps all Call instructions in fn and sets their SPMDMask
 // to defaultMask for any SPMD function call that doesn't already have a mask
 // (i.e., calls not inside a varying if/else/switch that already received a

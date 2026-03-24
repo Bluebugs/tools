@@ -410,6 +410,11 @@ func (f *Function) finishBody() {
 		// mask-gated operations. Runs after loop resolution so LaneCount is
 		// available, and before numberRegisters so new instructions get numbered.
 		predicateSPMD(f)
+		// Merge consecutive SPMDStore instructions to the same address into a
+		// single SPMDStore with chained SPMDSelect values. Must run after
+		// predicateSPMD (which creates SPMDStores) and before peelSPMDLoops
+		// (which clones blocks and would duplicate un-merged stores).
+		spmdMergeRedundantStores(f)
 		// Split each SPMD loop into a full-width main phase and a masked tail
 		// phase. Runs after predicateSPMD so the loop body is already in
 		// predicated form before cloning.

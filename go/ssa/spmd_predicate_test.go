@@ -1161,18 +1161,27 @@ func main() { f(make([]int, 16)) }
 		t.Fatal("expected SPMDSwitchChains to be populated")
 	}
 
-	// Count SPMDStore instructions — one per case body (3 cases + 1 default = 4).
+	// Count SPMDStore and SPMDSelect instructions.
+	// Before store-merge: 4 stores (one per case/default).
+	// After store-merge: 1 store + 3 SPMDSelects (chained).
 	spmdStoreCount := 0
+	spmdSelectCount := 0
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
-			if _, ok := instr.(*ssa.SPMDStore); ok {
+			switch instr.(type) {
+			case *ssa.SPMDStore:
 				spmdStoreCount++
+			case *ssa.SPMDSelect:
+				spmdSelectCount++
 			}
 		}
 	}
-	// 4 case/default bodies, each with one store → 4 SPMDStore instructions.
-	if spmdStoreCount != 4 {
-		t.Errorf("expected 4 SPMDStore instructions (one per case), got %d", spmdStoreCount)
+	// After merge: 4 case stores collapsed to 1 store + 3 selects.
+	if spmdStoreCount != 1 {
+		t.Errorf("expected 1 merged SPMDStore (one per dst[i] address), got %d", spmdStoreCount)
+	}
+	if spmdSelectCount < 3 {
+		t.Errorf("expected at least 3 SPMDSelect (one per merged case), got %d", spmdSelectCount)
 	}
 
 	// The lane count on all SPMDStore instructions must match the loop's lane count.
@@ -1380,6 +1389,9 @@ func main() { f(make([]int, 16)) }
 		liveBlocks[b] = true
 	}
 
+	// After store-merge: the 3 per-case stores (300, 200, 100) to dst[i] are
+	// collapsed into 1 SPMDStore with 2 chained SPMDSelects.
+	// Verify mask correctness on surviving SPMDStores.
 	spmdStoreCount := 0
 	badMaskCount := 0
 	for _, block := range fn.Blocks {
@@ -1406,8 +1418,9 @@ func main() { f(make([]int, 16)) }
 			}
 		}
 	}
-	if spmdStoreCount < 3 {
-		t.Errorf("expected at least 3 SPMDStore instructions, got %d", spmdStoreCount)
+	// After merge: 3 case stores → 1 merged store.
+	if spmdStoreCount != 1 {
+		t.Errorf("expected 1 merged SPMDStore instruction, got %d", spmdStoreCount)
 	}
 	if badMaskCount > 0 {
 		t.Errorf("%d SPMDStore(s) had incorrect masks (wrong type or in deleted block)", badMaskCount)
@@ -4206,11 +4219,21 @@ func f(dst []int32, lo, hi int32) {
 	}
 
 	// All memory ops inside varying branches must have been masked.
-	// The direct-write pattern (no phi) uses masked stores rather than
-	// SPMDSelect. Verify at least one SPMDStore with a non-constant mask exists.
+	// After spmdMergeRedundantStores, the 3 per-branch stores to dst[i] are
+	// collapsed into 1 SPMDStore with 2 chained SPMDSelects.
 	storeCount := strings.Count(output, "spmd_store")
-	if storeCount < 3 {
-		t.Errorf("expected at least 3 masked SPMDStore instructions (one per branch), got %d", storeCount)
+	selectCount := strings.Count(output, "spmd_select")
+	if storeCount < 1 {
+		t.Errorf("expected at least 1 SPMDStore instruction, got %d", storeCount)
+		t.Logf("SSA output:\n%s", output)
+	}
+	// After merge: 3 branch stores collapse to 1 store + 2 selects.
+	if storeCount >= 3 {
+		t.Errorf("expected merged SPMDStores (got %d stores, %d selects); merge optimization not applied", storeCount, selectCount)
+		t.Logf("SSA output:\n%s", output)
+	}
+	if selectCount < 2 {
+		t.Errorf("expected at least 2 SPMDSelect for three-way clamp (got %d)", selectCount)
 		t.Logf("SSA output:\n%s", output)
 	}
 }
@@ -4673,5 +4696,131 @@ func main() { f(make([]Pair, 8)) }
 		var buf bytes.Buffer
 		ssa.WriteFunction(&buf, fn)
 		t.Errorf("expected contiguous SPMDLoad for aggregate type, got:\n%s", buf.String())
+	}
+}
+
+// TestPredicateSPMD_MergeStoresClamp verifies that spmdMergeRedundantStores
+// collapses the 3 SPMDStores produced by a clamp if/else-if/else chain into a
+// single SPMDStore with 2 chained SPMDSelect instructions.
+//
+// Before merge (3 stores, one per branch):
+//
+//	SPMDStore(result[i], lo,   mask_lt)   // v < lo
+//	SPMDStore(result[i], hi,   mask_gt)   // v > hi
+//	SPMDStore(result[i], v,    mask_else) // else
+//
+// After merge (1 store, 2 selects):
+//
+//	sel1 = SPMDSelect(mask_gt,   hi, lo)
+//	sel2 = SPMDSelect(mask_else, v,  sel1)
+//	SPMDStore(result[i], sel2, mask_else)
+func TestPredicateSPMD_MergeStoresClamp(t *testing.T) {
+	src := `package main
+
+func clamp(data []int32, lo, hi int32) []int32 {
+	result := make([]int32, len(data))
+	for i := range len(data) {
+		v := data[i]
+		if v < lo {
+			result[i] = lo
+		} else if v > hi {
+			result[i] = hi
+		} else {
+			result[i] = v
+		}
+	}
+	return result
+}
+
+func main() { clamp(make([]int32, 16), -10, 10) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("clamp")
+	if fn == nil {
+		t.Fatal("function clamp not found")
+	}
+
+	// Count SPMDStore and SPMDSelect instructions across all blocks.
+	storeCount := 0
+	selectCount := 0
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			switch instr.(type) {
+			case *ssa.SPMDStore:
+				storeCount++
+			case *ssa.SPMDSelect:
+				selectCount++
+			}
+		}
+	}
+
+	// After merge: the 3 clamp stores collapse to 1. Other stores (e.g. for
+	// the make initialisation) may also be present, but there should be fewer
+	// than 3 stores specifically for the result[i] address. We check that the
+	// total store count is strictly less than 3 (the un-merged baseline) and
+	// that at least 2 SPMDSelects were inserted for the chain.
+	if storeCount >= 3 {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Errorf("expected merged SPMDStores (got %d stores, %d selects):\n%s",
+			storeCount, selectCount, buf.String())
+	}
+	if selectCount < 2 {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Errorf("expected at least 2 SPMDSelect for clamp merge (got %d):\n%s",
+			selectCount, buf.String())
+	}
+}
+
+// TestPredicateSPMD_MergeStoresSimple verifies that two SPMDStores to the same
+// address within a single linearized block (simple if/else writing to the same
+// variable) are merged into one store with one SPMDSelect.
+func TestPredicateSPMD_MergeStoresSimple(t *testing.T) {
+	src := `package main
+
+func f(data []int32) {
+	for i := range len(data) {
+		if data[i] > 0 {
+			data[i] = 1
+		} else {
+			data[i] = -1
+		}
+	}
+}
+
+func main() { f(make([]int32, 16)) }
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	storeCount := 0
+	selectCount := 0
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			switch instr.(type) {
+			case *ssa.SPMDStore:
+				storeCount++
+			case *ssa.SPMDSelect:
+				selectCount++
+			}
+		}
+	}
+
+	// 2 stores (then/else) should merge to 1 store + 1 select.
+	if storeCount >= 2 {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Errorf("expected 1 merged SPMDStore (got %d stores, %d selects):\n%s",
+			storeCount, selectCount, buf.String())
+	}
+	if selectCount < 1 {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Errorf("expected at least 1 SPMDSelect for simple merge (got %d):\n%s",
+			selectCount, buf.String())
 	}
 }
