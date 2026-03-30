@@ -48,6 +48,11 @@ type Program struct {
 	objectMethods   map[*types.Func]*Function
 
 	noReturn func(*types.Func) bool // (optional) predicate that decides whether a given call cannot return
+
+	// SIMDRegisterBits is the SIMD register width in bits (e.g. 128, 256, 512).
+	// Set by callers after NewProgram (e.g. from types.Config.SIMDRegisterSize*8).
+	// Zero means use the default of 128.
+	SIMDRegisterBits int
 }
 
 // A Package is a single analyzed Go package containing Members for

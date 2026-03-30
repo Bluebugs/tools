@@ -237,8 +237,12 @@ func spmdDetectGatherGroups(fn *Function, loop *SPMDLoopInfo, scopeBlocks map[*B
 		}
 	}
 
-	// stride = 16 / laneCount (bytes per lane in the merged swizzle result).
-	stride := 16 / loop.LaneCount
+	// stride = regBytes / laneCount (bytes per lane in the merged swizzle result).
+	regBits := fn.Prog.SIMDRegisterBits
+	if regBits == 0 {
+		regBits = 128
+	}
+	stride := (regBits / 8) / loop.LaneCount
 
 	// Annotate groups with ≥ 2 members.
 	for key, candidates := range groups {
@@ -598,12 +602,16 @@ func spmdFuncBodyLaneCount(fn *Function) int {
 		if !ok {
 			continue
 		}
-		// Compute lane count from element type: 128 / element-size-in-bits.
-		// Use the same formula as the type checker (128-bit SIMD register).
+		// Compute lane count from element type: regBits / element-size-in-bits.
+		// Uses prog.SIMDRegisterBits when set; defaults to 128 (WASM SIMD128).
 		elem := stype.Elem()
-		bits := spmdElemBits(elem)
-		if bits > 0 {
-			return 128 / bits
+		elemBits := spmdElemBits(elem)
+		if elemBits > 0 {
+			regBits := fn.Prog.SIMDRegisterBits
+			if regBits == 0 {
+				regBits = 128
+			}
+			return regBits / elemBits
 		}
 	}
 	return 0

@@ -168,8 +168,13 @@ func checkArrayPromotion(alloc *Alloc, blockToLoop map[*BasicBlock]*SPMDLoopInfo
 	}
 	arrayLen := int(arrayType.Len())
 
-	// Check 3: fits in v128 (16 bytes).
-	if arrayLen*elemSize > 16 {
+	// Check 3: fits in SIMD register (default 16 bytes for 128-bit registers).
+	regBits := alloc.Parent().Prog.SIMDRegisterBits
+	if regBits == 0 {
+		regBits = 128
+	}
+	regBytes := regBits / 8
+	if arrayLen*elemSize > regBytes {
 		return nil, nil
 	}
 
