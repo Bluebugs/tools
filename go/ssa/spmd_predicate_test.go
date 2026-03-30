@@ -4238,6 +4238,74 @@ func f(dst []int32, lo, hi int32) {
 	}
 }
 
+// TestPredicateSPMD_GoForElseIfRangeindex verifies that an if/else-if/else
+// chain inside a rangeindex loop (range data, not range len(data)) is correctly
+// predicated. Rangeindex produces separate rangeindex.loop and rangeindex.body
+// blocks, and the else-if chain's branches jump to the loop header, triggering
+// the nil-merge recovery path in spmdLinearizeElseIf.
+func TestPredicateSPMD_GoForElseIfRangeindex(t *testing.T) {
+	src := `package main
+
+func f(dst []int32, lo, hi int32) {
+	for i, v := range dst {
+		if v < lo {
+			dst[i] = lo
+		} else if v > hi {
+			dst[i] = hi
+		} else {
+			dst[i] = v
+		}
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("f")
+	if fn == nil {
+		t.Fatal("function f not found")
+	}
+
+	var buf bytes.Buffer
+	ssa.WriteFunction(&buf, fn)
+	output := buf.String()
+
+	// No varying If should remain after predication.
+	for _, block := range fn.Blocks {
+		if len(block.Instrs) == 0 {
+			continue
+		}
+		if vif, ok := block.Instrs[len(block.Instrs)-1].(*ssa.If); ok && vif.IsVarying {
+			t.Errorf("varying If still present in block %s after predication", block)
+			t.Logf("SSA output:\n%s", output)
+		}
+	}
+
+	// All memory ops inside varying branches must have been masked.
+	storeCount := strings.Count(output, "spmd_store")
+	selectCount := strings.Count(output, "spmd_select")
+	if storeCount < 1 {
+		t.Errorf("expected at least 1 SPMDStore instruction, got %d", storeCount)
+		t.Logf("SSA output:\n%s", output)
+	}
+	if selectCount < 2 {
+		t.Errorf("expected at least 2 SPMDSelect for three-way clamp (got %d)", selectCount)
+		t.Logf("SSA output:\n%s", output)
+	}
+
+	// Loop header (rangeindex.loop) should not contain SPMDSelect — loop-carried
+	// phis are untouched by the if/else predication.
+	for _, block := range fn.Blocks {
+		if strings.Contains(block.Comment, "rangeindex.loop") {
+			for _, instr := range block.Instrs {
+				if _, ok := instr.(*ssa.SPMDSelect); ok {
+					t.Errorf("unexpected SPMDSelect in loop header block %s", block)
+					t.Logf("SSA output:\n%s", output)
+					break
+				}
+			}
+		}
+	}
+}
+
 // TestPredicateSPMD_GoForElseIfSanity verifies that the sanity checker passes
 // after predication of an if/else-if/else chain in a go-for loop.
 func TestPredicateSPMD_GoForElseIfSanity(t *testing.T) {

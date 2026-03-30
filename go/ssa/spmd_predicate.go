@@ -1784,8 +1784,25 @@ func spmdLinearizeElseIf(fn *Function, lanes int, ifBlock *BasicBlock, vif *If, 
 	mergeBlock := findMergeBlock(fn, thenBlock, elseBlock)
 	if mergeBlock == nil {
 		// Could not find a safe merge block after inner linearization.
-		// This can happen if the inner linearization produced a loop-header
-		// merge or other complex pattern. Skip phi conversion.
+		//
+		// Rangeindex loop-header merge: all branches of the if/else-if/else
+		// chain jump directly to the loop header (or to a trampoline inserted
+		// by the recursive call that in turn jumps to the loop header). This
+		// produces a loop header with >2 predecessors that findMergeBlock
+		// correctly rejects as a SPMDSelect merge target.
+		//
+		// Recovery: if thenBlock jumps to the SPMD loop header, wire
+		// thenBlock→elseBlock (so all branches execute in sequence), remove
+		// thenBlock from the loop header's pred list (compacting its phis),
+		// and mask thenBlock's mem ops. The else-chain's masking and phi
+		// handling at the loop header were already performed by the recursive
+		// predicateVaryingIf call via spmdInsertMergeTrampoline.
+		if len(thenBlock.Succs) == 1 && isLoopHeader(fn, thenBlock.Succs[0]) {
+			loopHeader := thenBlock.Succs[0]
+			spmdRewireThenToElse(thenBlock, loopHeader, elseBlock)
+			loopHeader.removePred(thenBlock)
+			spmdMaskMemOps(thenBlock, thenMask, lanes)
+		}
 		return
 	}
 
