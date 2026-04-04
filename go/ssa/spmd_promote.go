@@ -373,8 +373,10 @@ func checkArrayPromotion(alloc *Alloc, blockToLoop map[*BasicBlock]*SPMDLoopInfo
 	// (type [N]T), not a numeric constant.
 	if copyInfo != nil && copyInfo.arrayLoad != nil {
 		// Array-value pattern: bound is array length by construction.
-		// LaneCount must match arrayLen so every lane maps to one element.
-		if loop.LaneCount != arrayLen {
+		// LaneCount >= arrayLen: the SPMD tail mask handles inactive lanes
+		// beyond arrayLen. SPMDVectorFromMemory takes Lanes=arrayLen and
+		// uses the source length for safe partial loads.
+		if loop.LaneCount < arrayLen {
 			return nil, nil
 		}
 	} else {
