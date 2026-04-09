@@ -430,6 +430,12 @@ func (s *SPMDStore) String() string {
 		s.Lanes, spmdRelName(s.Addr, s), spmdRelName(s.Val, s), spmdRelName(s.Mask, s), suffix)
 }
 
+func (s *SPMDCompactStore) String() string {
+	return fmt.Sprintf("spmd_compact_store<%d> %s %s mask %s len %s",
+		s.Lanes, spmdRelName(s.Addr, s), spmdRelName(s.Val, s),
+		spmdRelName(s.ExplicitMask, s), spmdRelName(s.SourceLen, s))
+}
+
 func (v *SPMDIndex) String() string {
 	from := spmdRelPkg(v)
 	return fmt.Sprintf("spmd_index<%d, %s>", v.Lanes, relType(v.ElemType, from))

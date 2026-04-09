@@ -251,6 +251,20 @@ func (s *sanity) checkInstr(idx int, instr Instruction) {
 			s.errorf("SPMDStore: Contiguous is false but Source is non-nil")
 		}
 
+	case *SPMDCompactStore:
+		if instr.Lanes <= 0 {
+			s.errorf("SPMDCompactStore: Lanes must be > 0, got %d", instr.Lanes)
+		}
+		if !spmd.IsVaryingMask(instr.ExplicitMask.Type()) {
+			s.errorf("SPMDCompactStore: ExplicitMask must be Varying[mask], got %s", instr.ExplicitMask.Type())
+		}
+		if _, ok := instr.Addr.Type().Underlying().(*types.Pointer); !ok {
+			s.errorf("SPMDCompactStore: Addr must be a pointer type, got %s", instr.Addr.Type())
+		}
+		if !types.Identical(instr.Type(), types.Typ[types.Int]) {
+			s.errorf("SPMDCompactStore: result type must be int, got %s", instr.Type())
+		}
+
 	case *SPMDIndex:
 		if instr.Lanes <= 0 {
 			s.errorf("SPMDIndex: Lanes must be > 0, got %d", instr.Lanes)

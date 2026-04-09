@@ -1492,6 +1492,26 @@ type SPMDStore struct {
 	pos        token.Pos // optional source position
 }
 
+// SPMDCompactStore stores active lanes of Val contiguously into Addr.
+// Effective mask = ExplicitMask AND enclosing execution mask.
+// Produces a uniform int: the number of elements written (popcount of effective mask).
+// ExplicitMask uses the existing mask representation (Varying[bool] at Go level,
+// lowered to <N x i1> on WASM or <N x i32> on x86).
+//
+// Example printed form:
+//
+//	t5 = spmd_compact_store<16> t1 t2 mask t3 len t4
+type SPMDCompactStore struct {
+	register
+	Addr         Value     // *T (pointer extracted from slice)
+	Val          Value     // Varying[T]
+	ExplicitMask Value     // Varying[bool] (user-provided mask)
+	Lanes        int       // SIMD width
+	Source       Value     // original slice (for bounds check)
+	SourceLen    Value     // len(slice) (for bounds check)
+	pos          token.Pos // optional source position
+}
+
 // SPMDIndex produces consecutive lane indices [0, 1, ..., Lanes-1]
 // in the loop's natural element type. It replaces lanes.Index() calls inside SPMD loops.
 // ElemType is the loop's natural element type (byte, int16, int32, etc.).
@@ -2170,6 +2190,17 @@ func (s *SPMDStore) Operands(rands []*Value) []*Value {
 	return rands
 }
 
+func (s *SPMDCompactStore) Operands(rands []*Value) []*Value {
+	rands = append(rands, &s.Addr, &s.Val, &s.ExplicitMask)
+	if s.Source != nil {
+		rands = append(rands, &s.Source)
+	}
+	if s.SourceLen != nil {
+		rands = append(rands, &s.SourceLen)
+	}
+	return rands
+}
+
 func (v *SPMDIndex) Operands(rands []*Value) []*Value {
 	return rands // no value operands; Lanes and ElemType are not Values
 }
@@ -2186,10 +2217,11 @@ func (v *SPMDVectorFromMemory) Operands(rands []*Value) []*Value {
 // SPMDSelect and SPMDIndex return NoPos because they are synthetic nodes
 // with no single source location (analogous to Phi).
 
-func (v *SPMDSelect) Pos() token.Pos          { return token.NoPos }
-func (v *SPMDLoad) Pos() token.Pos            { return v.pos }
-func (s *SPMDStore) Pos() token.Pos           { return s.pos }
-func (v *SPMDIndex) Pos() token.Pos           { return token.NoPos }
+func (v *SPMDSelect) Pos() token.Pos           { return token.NoPos }
+func (v *SPMDLoad) Pos() token.Pos             { return v.pos }
+func (s *SPMDStore) Pos() token.Pos            { return s.pos }
+func (s *SPMDCompactStore) Pos() token.Pos     { return s.pos }
+func (v *SPMDIndex) Pos() token.Pos            { return token.NoPos }
 func (v *SPMDExtractMask) Pos() token.Pos     { return token.NoPos }
 func (v *SPMDVectorFromMemory) Pos() token.Pos { return v.pos }
 
