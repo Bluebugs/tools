@@ -2075,6 +2075,22 @@ func spmdConvertScopedMemOps(fn *Function, scopeBlocks map[*BasicBlock]bool, mas
 				}
 				instr.block = nil
 
+			case *SPMDCompactStore:
+				// AND the scope mask into ExplicitMask so varying control flow is respected.
+				andOp := &BinOp{Op: token.AND, X: mask, Y: instr.ExplicitMask}
+				andOp.setType(spmdpkg.NewVaryingMask())
+				andOp.setBlock(block)
+				spmdAddReferrer(mask, andOp)
+				spmdAddReferrer(instr.ExplicitMask, andOp)
+				newInstrs := make([]Instruction, 0, len(block.Instrs)+1)
+				newInstrs = append(newInstrs, block.Instrs[:i]...)
+				newInstrs = append(newInstrs, andOp)
+				newInstrs = append(newInstrs, block.Instrs[i:]...)
+				block.Instrs = newInstrs
+				instr.ExplicitMask = andOp
+				spmdAddReferrer(andOp, instr)
+				i++ // skip past the inserted AND on next iteration
+
 			case *MakeInterface:
 				if instr.SPMDMask != nil {
 					continue
@@ -3511,6 +3527,22 @@ func spmdConvertAllMemOps(fn *Function, mask Value, lanes int) {
 				}
 				instr.block = nil
 
+			case *SPMDCompactStore:
+				// AND the func-body mask into ExplicitMask so varying control flow is respected.
+				andOp := &BinOp{Op: token.AND, X: mask, Y: instr.ExplicitMask}
+				andOp.setType(spmdpkg.NewVaryingMask())
+				andOp.setBlock(block)
+				spmdAddReferrer(mask, andOp)
+				spmdAddReferrer(instr.ExplicitMask, andOp)
+				newInstrs := make([]Instruction, 0, len(block.Instrs)+1)
+				newInstrs = append(newInstrs, block.Instrs[:i]...)
+				newInstrs = append(newInstrs, andOp)
+				newInstrs = append(newInstrs, block.Instrs[i:]...)
+				block.Instrs = newInstrs
+				instr.ExplicitMask = andOp
+				spmdAddReferrer(andOp, instr)
+				i++ // skip past the inserted AND on next iteration
+
 			case *MakeInterface:
 				if instr.SPMDMask != nil {
 					continue
@@ -3717,6 +3749,22 @@ func spmdMaskMemOps(b *BasicBlock, mask Value, lanes int) {
 				*refs = removeInstr(*refs, instr)
 			}
 			instr.block = nil
+
+		case *SPMDCompactStore:
+			// AND the branch mask into ExplicitMask so varying control flow is respected.
+			andOp := &BinOp{Op: token.AND, X: mask, Y: instr.ExplicitMask}
+			andOp.setType(spmdpkg.NewVaryingMask())
+			andOp.setBlock(b)
+			spmdAddReferrer(mask, andOp)
+			spmdAddReferrer(instr.ExplicitMask, andOp)
+			newInstrs := make([]Instruction, 0, len(b.Instrs)+1)
+			newInstrs = append(newInstrs, b.Instrs[:i]...)
+			newInstrs = append(newInstrs, andOp)
+			newInstrs = append(newInstrs, b.Instrs[i:]...)
+			b.Instrs = newInstrs
+			instr.ExplicitMask = andOp
+			spmdAddReferrer(andOp, instr)
+			i++ // skip past the inserted AND on next iteration
 
 		case *Call:
 			// Set mask on calls to SPMD functions (those with varying params).
