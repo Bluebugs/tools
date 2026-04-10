@@ -211,6 +211,29 @@ func (s *sanity) checkInstr(idx int, instr Instruction) {
 				instr.X.Type(), instr.Y.Type())
 		}
 
+	case *SPMDMux:
+		if instr.Lanes <= 0 {
+			s.errorf("SPMDMux: Lanes must be > 0, got %d", instr.Lanes)
+		}
+		if len(instr.Values) < 2 {
+			s.errorf("SPMDMux: need at least 2 Values, got %d", len(instr.Values))
+		}
+		if len(instr.Indices) != instr.Lanes {
+			s.errorf("SPMDMux: len(Indices) = %d, want %d (Lanes)", len(instr.Indices), instr.Lanes)
+		}
+		for i, idx := range instr.Indices {
+			if idx < 0 || idx >= len(instr.Values) {
+				s.errorf("SPMDMux: Indices[%d] = %d, out of range [0, %d)", i, idx, len(instr.Values))
+			}
+		}
+		baseType := instr.Values[0].Type()
+		for i := 1; i < len(instr.Values); i++ {
+			if !types.Identical(instr.Values[i].Type(), baseType) {
+				s.errorf("SPMDMux: Values[%d] type %s != Values[0] type %s",
+					i, instr.Values[i].Type(), baseType)
+			}
+		}
+
 	case *SPMDLoad:
 		if instr.Lanes <= 0 {
 			s.errorf("SPMDLoad: Lanes must be > 0, got %d", instr.Lanes)

@@ -1453,6 +1453,24 @@ type SPMDSelect struct {
 	Lanes int   // lane count from enclosing SPMD loop
 }
 
+// SPMDMux selects per-lane from N value operands based on a compile-time
+// constant index vector. Replaces chains of SPMDSelect when the masks
+// derive from IterPhi % constant comparisons, enabling a single shuffle
+// instead of N-1 masked selects.
+//
+// All Values must have identical types. Indices[i] must be in [0, len(Values)).
+// The result type matches Values[0].Type().
+//
+// Example printed form:
+//
+//	t8 = spmd_mux<16> [t3, t5, t7] indices [0,1,2,0,0,1,2,0,...]
+type SPMDMux struct {
+	register
+	Values  []Value // N value operands (one per case)
+	Indices []int   // per-lane index into Values (len = Lanes)
+	Lanes   int     // SIMD width
+}
+
 // SPMDLoad loads from Addr only for lanes where Mask is active.
 // Inactive lanes receive a zero value. It replaces UnOp{MUL} in varying paths.
 // Mask must be of type Varying[mask] (spmd.NewVaryingMask()).
@@ -2174,6 +2192,13 @@ func (v *SPMDSelect) Operands(rands []*Value) []*Value {
 	return append(rands, &v.Mask, &v.X, &v.Y)
 }
 
+func (v *SPMDMux) Operands(rands []*Value) []*Value {
+	for i := range v.Values {
+		rands = append(rands, &v.Values[i])
+	}
+	return rands
+}
+
 func (v *SPMDLoad) Operands(rands []*Value) []*Value {
 	rands = append(rands, &v.Addr, &v.Mask)
 	if v.Source != nil {
@@ -2218,6 +2243,7 @@ func (v *SPMDVectorFromMemory) Operands(rands []*Value) []*Value {
 // with no single source location (analogous to Phi).
 
 func (v *SPMDSelect) Pos() token.Pos           { return token.NoPos }
+func (v *SPMDMux) Pos() token.Pos              { return token.NoPos }
 func (v *SPMDLoad) Pos() token.Pos             { return v.pos }
 func (s *SPMDStore) Pos() token.Pos            { return s.pos }
 func (s *SPMDCompactStore) Pos() token.Pos     { return s.pos }

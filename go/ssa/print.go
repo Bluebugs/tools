@@ -412,6 +412,26 @@ func (v *SPMDSelect) String() string {
 		v.Lanes, spmdRelName(v.Mask, v), spmdRelName(v.X, v), spmdRelName(v.Y, v))
 }
 
+func (v *SPMDMux) String() string {
+	var vals []string
+	for _, val := range v.Values {
+		vals = append(vals, spmdRelName(val, v))
+	}
+	idxStr := ""
+	for i, idx := range v.Indices {
+		if i > 0 {
+			idxStr += ","
+		}
+		if i >= 8 {
+			idxStr += "..."
+			break
+		}
+		idxStr += fmt.Sprintf("%d", idx)
+	}
+	return fmt.Sprintf("spmd_mux<%d> [%s] indices [%s]",
+		v.Lanes, strings.Join(vals, ", "), idxStr)
+}
+
 func (v *SPMDLoad) String() string {
 	suffix := ""
 	if v.Contiguous {

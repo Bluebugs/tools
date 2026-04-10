@@ -128,6 +128,26 @@ func spmdCloneBlock(fn *Function, srcBlock *BasicBlock, dstBlock *BasicBlock,
 			spmdAddReferrer(newInstr.X, newInstr)
 			spmdAddReferrer(newInstr.Y, newInstr)
 
+		case *SPMDMux:
+			newValues := make([]Value, len(v.Values))
+			for i, val := range v.Values {
+				newValues[i] = spmdTranslateValue(val, valueMap)
+			}
+			newIndices := make([]int, len(v.Indices))
+			copy(newIndices, v.Indices)
+			newInstr := &SPMDMux{
+				Values:  newValues,
+				Indices: newIndices,
+				Lanes:   v.Lanes,
+			}
+			newInstr.setType(v.Type())
+			newInstr.setBlock(dstBlock)
+			dstBlock.Instrs = append(dstBlock.Instrs, newInstr)
+			valueMap[v] = newInstr
+			for _, val := range newInstr.Values {
+				spmdAddReferrer(val, newInstr)
+			}
+
 		case *SPMDIndex:
 			newInstr := &SPMDIndex{Lanes: v.Lanes, ElemType: v.ElemType}
 			newInstr.setType(v.Type())

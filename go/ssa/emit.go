@@ -724,6 +724,21 @@ func emitSPMDCompactStore(f *Function, addr, val, mask, source, sourceLen Value,
 	return s
 }
 
+// emitSPMDMux emits an SPMDMux instruction.
+// values must have at least 2 elements with identical types.
+// indices must have len == lanes, with each value in [0, len(values)).
+// The result type matches values[0].Type().
+func emitSPMDMux(f *Function, values []Value, indices []int, lanes int) *SPMDMux {
+	v := &SPMDMux{
+		Values:  values,
+		Indices: indices,
+		Lanes:   lanes,
+	}
+	v.setType(values[0].Type())
+	f.emit(v)
+	return v
+}
+
 // emitSPMDIndex emits an SPMDIndex instruction into the current block of f.
 // lanes must be > 0 and elemType must be a basic type.
 // The result type is Varying[elemType].
