@@ -4383,6 +4383,10 @@ func spmdIsSelectChainInner(sel *SPMDSelect, scopeBlocks map[*BasicBlock]bool) b
 
 func spmdTryCollapseMux(sel *SPMDSelect, loop *SPMDLoopInfo) *SPMDMux {
 	// Step 1: Unwind the chain collecting (mask, value) pairs.
+	// For NEQ masks (negated), the SPMDSelect's X is the "else" value and Y
+	// is the "then" value — the opposite of EQL. We handle this by swapping
+	// X/Y when the mask traces to NEQ, and following the X branch for the
+	// inner chain instead of Y.
 	type maskValPair struct {
 		mask Value
 		val  Value
@@ -4391,23 +4395,41 @@ func spmdTryCollapseMux(sel *SPMDSelect, loop *SPMDLoopInfo) *SPMDMux {
 	var defaultVal Value
 	cur := sel
 	for {
-		pairs = append(pairs, maskValPair{mask: cur.Mask, val: cur.X})
-		inner, ok := cur.Y.(*SPMDSelect)
-		if !ok {
-			defaultVal = cur.Y
-			break
+		// Probe this mask to see if it's negated (NEQ).
+		_, _, negated, probeOk := spmdTraceMaskToRemComparison(cur.Mask)
+		if probeOk && negated {
+			// NEQ: X is the "not-matching" side (the inner chain),
+			// Y is the "matching" side (the value for the EQL constant).
+			// Swap: collect Y as the value, follow X for the chain.
+			pairs = append(pairs, maskValPair{mask: cur.Mask, val: cur.Y})
+			inner, ok := cur.X.(*SPMDSelect)
+			if !ok {
+				defaultVal = cur.X
+				break
+			}
+			cur = inner
+		} else {
+			// EQL (or unknown): X is the matching value, follow Y for chain.
+			pairs = append(pairs, maskValPair{mask: cur.Mask, val: cur.X})
+			inner, ok := cur.Y.(*SPMDSelect)
+			if !ok {
+				defaultVal = cur.Y
+				break
+			}
+			cur = inner
 		}
-		cur = inner
 	}
 	if len(pairs) < 2 {
 		return nil
 	}
 
-	// Step 2: Trace each mask to BinOp{EQL}(BinOp{REM}(iter, k), c).
+	// Step 2: Trace each mask to BinOp{EQL or NEQ}(BinOp{REM}(iter, k), c).
+	// For NEQ masks, the constant c identifies the lanes that DON'T match —
+	// but we already swapped X/Y above, so caseMap[c] holds the correct value.
 	var sharedRem *BinOp
 	caseMap := make(map[int64]Value)
 	for _, pair := range pairs {
-		rem, constVal, ok := spmdTraceMaskToRemEQL(pair.mask)
+		rem, constVal, _, ok := spmdTraceMaskToRemComparison(pair.mask)
 		if !ok {
 			return nil
 		}
@@ -4486,45 +4508,54 @@ func spmdTryCollapseMux(sel *SPMDSelect, loop *SPMDLoopInfo) *SPMDMux {
 //	thenMask = BinOp{AND}(activeMask, Convert(BinOp{EQL}(rem, c)))
 //
 // We need to peel through AND and Convert to find the EQL.
-func spmdTraceMaskToRemEQL(mask Value) (*BinOp, int64, bool) {
-	eql := spmdPeelToEQL(mask)
-	if eql == nil {
-		return nil, 0, false
+// spmdTraceMaskToRemComparison traces a mask to BinOp{EQL or NEQ}(BinOp{REM}(iter, k), c).
+// Returns the REM BinOp, comparison constant, whether the condition is negated (NEQ), and success.
+func spmdTraceMaskToRemComparison(mask Value) (rem *BinOp, constVal int64, negated bool, ok bool) {
+	cmp, isNeg := spmdPeelToComparison(mask)
+	if cmp == nil {
+		return nil, 0, false, false
 	}
-	rem, constVal := spmdMatchRemAndConst(eql)
-	if rem == nil {
-		return nil, 0, false
+	r, c := spmdMatchRemAndConst(cmp)
+	if r == nil {
+		return nil, 0, false, false
 	}
-	return rem, constVal, true
+	return r, c, isNeg, true
 }
 
-func spmdPeelToEQL(v Value) *BinOp {
+// spmdPeelToComparison peels through BinOp{AND}, Convert, ChangeType to find
+// a BinOp{EQL} or BinOp{NEQ}. Returns the comparison BinOp and whether it's
+// negated (NEQ returns true, EQL returns false).
+func spmdPeelToComparison(v Value) (*BinOp, bool) {
 	for {
 		switch x := v.(type) {
 		case *BinOp:
 			if x.Op == token.EQL {
-				return x
+				return x, false
+			}
+			if x.Op == token.NEQ {
+				return x, true
 			}
 			if x.Op == token.AND {
-				if eql := spmdPeelToEQL(x.X); eql != nil {
-					return eql
+				if cmp, neg := spmdPeelToComparison(x.X); cmp != nil {
+					return cmp, neg
 				}
-				return spmdPeelToEQL(x.Y)
+				return spmdPeelToComparison(x.Y)
 			}
 			if x.Op == token.AND_NOT {
-				// ~mask case: AND_NOT(active, Convert(EQL)) for else branches
-				if eql := spmdPeelToEQL(x.Y); eql != nil {
-					return eql
+				// ~mask case: AND_NOT(active, Convert(cmp)) for else branches.
+				// The AND_NOT inverts the condition, so flip the negation.
+				if cmp, neg := spmdPeelToComparison(x.Y); cmp != nil {
+					return cmp, !neg
 				}
-				return nil
+				return nil, false
 			}
-			return nil
+			return nil, false
 		case *Convert:
 			v = x.X
 		case *ChangeType:
 			v = x.X
 		default:
-			return nil
+			return nil, false
 		}
 	}
 }
