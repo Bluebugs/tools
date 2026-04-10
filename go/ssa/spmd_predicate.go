@@ -4327,3 +4327,259 @@ func spmdNarrowMaskAtTypeAsserts(fn *Function, scopeBlocks map[*BasicBlock]bool,
 		}
 	}
 }
+
+// spmdDetectMuxPatterns scans SPMD loop bodies for chains of SPMDSelect
+// instructions whose masks derive from IterPhi % constant comparisons.
+// Such chains are replaced with a single SPMDMux instruction.
+func spmdDetectMuxPatterns(fn *Function) {
+	for _, loop := range fn.SPMDLoops {
+		if loop.LaneCount <= 1 {
+			continue
+		}
+		scopeBlocks := spmdLoopScopeBlocks(loop)
+		spmdDetectMuxInScope(fn, loop, scopeBlocks)
+	}
+}
+
+func spmdDetectMuxInScope(fn *Function, loop *SPMDLoopInfo, scopeBlocks map[*BasicBlock]bool) {
+	for _, block := range fn.Blocks {
+		if !scopeBlocks[block] {
+			continue
+		}
+		for i := 0; i < len(block.Instrs); i++ {
+			sel, ok := block.Instrs[i].(*SPMDSelect)
+			if !ok {
+				continue
+			}
+			// Only process chain roots (not inner nodes used as Y of another SPMDSelect).
+			if spmdIsSelectChainInner(sel, scopeBlocks) {
+				continue
+			}
+			if mux := spmdTryCollapseMux(sel, loop); mux != nil {
+				// Replace the SPMDSelect with SPMDMux.
+				mux.setBlock(block)
+				block.Instrs[i] = mux
+				replaceAll(sel, mux)
+				sel.block = nil
+			}
+		}
+	}
+}
+
+func spmdIsSelectChainInner(sel *SPMDSelect, scopeBlocks map[*BasicBlock]bool) bool {
+	refs := sel.Referrers()
+	if refs == nil {
+		return false
+	}
+	for _, ref := range *refs {
+		if parentSel, ok := ref.(*SPMDSelect); ok {
+			if parentSel.Y == sel && parentSel.block != nil && scopeBlocks[parentSel.block] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func spmdTryCollapseMux(sel *SPMDSelect, loop *SPMDLoopInfo) *SPMDMux {
+	// Step 1: Unwind the chain collecting (mask, value) pairs.
+	type maskValPair struct {
+		mask Value
+		val  Value
+	}
+	var pairs []maskValPair
+	var defaultVal Value
+	cur := sel
+	for {
+		pairs = append(pairs, maskValPair{mask: cur.Mask, val: cur.X})
+		inner, ok := cur.Y.(*SPMDSelect)
+		if !ok {
+			defaultVal = cur.Y
+			break
+		}
+		cur = inner
+	}
+	if len(pairs) < 2 {
+		return nil
+	}
+
+	// Step 2: Trace each mask to BinOp{EQL}(BinOp{REM}(iter, k), c).
+	var sharedRem *BinOp
+	caseMap := make(map[int64]Value)
+	for _, pair := range pairs {
+		rem, constVal, ok := spmdTraceMaskToRemEQL(pair.mask)
+		if !ok {
+			return nil
+		}
+		if sharedRem == nil {
+			sharedRem = rem
+		} else if sharedRem != rem {
+			return nil
+		}
+		caseMap[constVal] = pair.val
+	}
+
+	// Step 3: Extract divisor k.
+	remConst, ok := sharedRem.Y.(*Const)
+	if !ok {
+		return nil
+	}
+	k, ok := constant.Int64Val(remConst.Value)
+	if !ok || k <= 0 {
+		return nil
+	}
+
+	// Step 4: Verify laneCount % k == 0.
+	laneCount := loop.LaneCount
+	if int64(laneCount)%k != 0 {
+		return nil
+	}
+
+	// Step 5: Verify the REM's left operand derives from IterPhi.
+	if !spmdTracesToIterPhi(sharedRem.X, loop) {
+		return nil
+	}
+
+	// Step 6: Build Values slice and Indices vector.
+	// Sort keys for deterministic output order.
+	sortedKeys := make([]int64, 0, len(caseMap))
+	for c := range caseMap {
+		sortedKeys = append(sortedKeys, c)
+	}
+	slices.Sort(sortedKeys)
+
+	values := make([]Value, 0, len(caseMap)+1)
+	constToIdx := make(map[int64]int)
+	for _, c := range sortedKeys {
+		constToIdx[c] = len(values)
+		values = append(values, caseMap[c])
+	}
+	defaultIdx := len(values)
+	values = append(values, defaultVal)
+
+	indices := make([]int, laneCount)
+	for lane := 0; lane < laneCount; lane++ {
+		remainder := int64(lane) % k
+		if idx, ok := constToIdx[remainder]; ok {
+			indices[lane] = idx
+		} else {
+			indices[lane] = defaultIdx
+		}
+	}
+
+	// Step 7: Build SPMDMux.
+	mux := &SPMDMux{
+		Values:  values,
+		Indices: indices,
+		Lanes:   laneCount,
+	}
+	mux.setType(values[0].Type())
+	for _, v := range values {
+		spmdAddReferrer(v, mux)
+	}
+	return mux
+}
+
+// spmdTraceMaskToRemEQL traces a mask value back to BinOp{EQL}(BinOp{REM}(x, k), c).
+// The mask from predication is typically:
+//
+//	thenMask = BinOp{AND}(activeMask, Convert(BinOp{EQL}(rem, c)))
+//
+// We need to peel through AND and Convert to find the EQL.
+func spmdTraceMaskToRemEQL(mask Value) (*BinOp, int64, bool) {
+	eql := spmdPeelToEQL(mask)
+	if eql == nil {
+		return nil, 0, false
+	}
+	rem, constVal := spmdMatchRemAndConst(eql)
+	if rem == nil {
+		return nil, 0, false
+	}
+	return rem, constVal, true
+}
+
+func spmdPeelToEQL(v Value) *BinOp {
+	for {
+		switch x := v.(type) {
+		case *BinOp:
+			if x.Op == token.EQL {
+				return x
+			}
+			if x.Op == token.AND {
+				if eql := spmdPeelToEQL(x.X); eql != nil {
+					return eql
+				}
+				return spmdPeelToEQL(x.Y)
+			}
+			if x.Op == token.AND_NOT {
+				// ~mask case: AND_NOT(active, Convert(EQL)) for else branches
+				if eql := spmdPeelToEQL(x.Y); eql != nil {
+					return eql
+				}
+				return nil
+			}
+			return nil
+		case *Convert:
+			v = x.X
+		case *ChangeType:
+			v = x.X
+		default:
+			return nil
+		}
+	}
+}
+
+func spmdMatchRemAndConst(eql *BinOp) (*BinOp, int64) {
+	// Try X=REM, Y=Const
+	if rem, ok := eql.X.(*BinOp); ok && rem.Op == token.REM {
+		if c, ok := eql.Y.(*Const); ok {
+			if val, ok := constant.Int64Val(c.Value); ok {
+				return rem, val
+			}
+		}
+	}
+	// Try X=Const, Y=REM
+	if rem, ok := eql.Y.(*BinOp); ok && rem.Op == token.REM {
+		if c, ok := eql.X.(*Const); ok {
+			if val, ok := constant.Int64Val(c.Value); ok {
+				return rem, val
+			}
+		}
+	}
+	return nil, 0
+}
+
+func spmdTracesToIterPhi(v Value, loop *SPMDLoopInfo) bool {
+	seen := make(map[Value]bool)
+	return spmdTracesToIterPhiImpl(v, loop, seen)
+}
+
+func spmdTracesToIterPhiImpl(v Value, loop *SPMDLoopInfo, seen map[Value]bool) bool {
+	if seen[v] {
+		return false
+	}
+	seen[v] = true
+	if v == loop.IterPhi {
+		return true
+	}
+	switch x := v.(type) {
+	case *Convert:
+		return spmdTracesToIterPhiImpl(x.X, loop, seen)
+	case *ChangeType:
+		return spmdTracesToIterPhiImpl(x.X, loop, seen)
+	case *BinOp:
+		if x.Op == token.ADD || x.Op == token.SUB || x.Op == token.MUL {
+			_, xConst := x.X.(*Const)
+			_, yConst := x.Y.(*Const)
+			if xConst {
+				return spmdTracesToIterPhiImpl(x.Y, loop, seen)
+			}
+			if yConst {
+				return spmdTracesToIterPhiImpl(x.X, loop, seen)
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
