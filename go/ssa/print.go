@@ -432,6 +432,15 @@ func (v *SPMDMux) String() string {
 		v.Lanes, strings.Join(vals, ", "), idxStr)
 }
 
+func (s *SPMDInterleaveStore) String() string {
+	var vals []string
+	for _, val := range s.Values {
+		vals = append(vals, spmdRelName(val, s))
+	}
+	return fmt.Sprintf("spmd_interleave_store<%d, period=%d> %s [%s]",
+		s.Lanes, s.Period, spmdRelName(s.Addr, s), strings.Join(vals, ", "))
+}
+
 func (v *SPMDLoad) String() string {
 	suffix := ""
 	if v.Contiguous {

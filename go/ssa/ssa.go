@@ -1471,6 +1471,33 @@ type SPMDMux struct {
 	Lanes   int     // SIMD width
 }
 
+// SPMDInterleaveStore writes N value vectors interleaved with period K
+// contiguously to Addr. Replaces SPMDMux + CompactStore when the Mux
+// indices are periodic and the CompactStore mask matches.
+//
+// For period K=4 with 3 values [A, B, C] and 16 byte lanes:
+//
+//	From each group of K input lanes, extracts the diagonal:
+//	  group g: Values[0][g*K+0], Values[1][g*K+1], Values[2][g*K+2]
+//	Output = [A[0],B[1],C[2], A[4],B[5],C[6], A[8],B[9],C[10], A[12],B[13],C[14]]
+//
+// Returns the number of elements written: len(Values) * Lanes / Period.
+//
+// Example printed form:
+//
+//	t9 = spmd_interleave_store<16, period=4> t1 [t3, t5, t7]
+type SPMDInterleaveStore struct {
+	register
+	Addr      Value   // destination (slice value — TinyGo extracts ptr)
+	Values    []Value // N value vectors to interleave
+	Period    int     // K (group size / interleave stride)
+	Lanes     int     // SIMD width of input vectors
+	Mask      Value   // execution mask (may be nil for all-ones)
+	Source    Value   // original slice (for bounds)
+	SourceLen Value   // len(slice)
+	pos       token.Pos
+}
+
 // SPMDLoad loads from Addr only for lanes where Mask is active.
 // Inactive lanes receive a zero value. It replaces UnOp{MUL} in varying paths.
 // Mask must be of type Varying[mask] (spmd.NewVaryingMask()).
@@ -2199,6 +2226,23 @@ func (v *SPMDMux) Operands(rands []*Value) []*Value {
 	return rands
 }
 
+func (s *SPMDInterleaveStore) Operands(rands []*Value) []*Value {
+	rands = append(rands, &s.Addr)
+	for i := range s.Values {
+		rands = append(rands, &s.Values[i])
+	}
+	if s.Mask != nil {
+		rands = append(rands, &s.Mask)
+	}
+	if s.Source != nil {
+		rands = append(rands, &s.Source)
+	}
+	if s.SourceLen != nil {
+		rands = append(rands, &s.SourceLen)
+	}
+	return rands
+}
+
 func (v *SPMDLoad) Operands(rands []*Value) []*Value {
 	rands = append(rands, &v.Addr, &v.Mask)
 	if v.Source != nil {
@@ -2242,9 +2286,10 @@ func (v *SPMDVectorFromMemory) Operands(rands []*Value) []*Value {
 // SPMDSelect and SPMDIndex return NoPos because they are synthetic nodes
 // with no single source location (analogous to Phi).
 
-func (v *SPMDSelect) Pos() token.Pos           { return token.NoPos }
-func (v *SPMDMux) Pos() token.Pos              { return token.NoPos }
-func (v *SPMDLoad) Pos() token.Pos             { return v.pos }
+func (v *SPMDSelect) Pos() token.Pos              { return token.NoPos }
+func (v *SPMDMux) Pos() token.Pos                 { return token.NoPos }
+func (s *SPMDInterleaveStore) Pos() token.Pos     { return s.pos }
+func (v *SPMDLoad) Pos() token.Pos                { return v.pos }
 func (s *SPMDStore) Pos() token.Pos            { return s.pos }
 func (s *SPMDCompactStore) Pos() token.Pos     { return s.pos }
 func (v *SPMDIndex) Pos() token.Pos            { return token.NoPos }

@@ -234,6 +234,29 @@ func (s *sanity) checkInstr(idx int, instr Instruction) {
 			}
 		}
 
+	case *SPMDInterleaveStore:
+		if instr.Lanes <= 0 {
+			s.errorf("SPMDInterleaveStore: Lanes must be > 0, got %d", instr.Lanes)
+		}
+		if instr.Period <= 0 {
+			s.errorf("SPMDInterleaveStore: Period must be > 0, got %d", instr.Period)
+		}
+		if instr.Lanes%instr.Period != 0 {
+			s.errorf("SPMDInterleaveStore: Lanes (%d) must be divisible by Period (%d)", instr.Lanes, instr.Period)
+		}
+		if len(instr.Values) < 1 {
+			s.errorf("SPMDInterleaveStore: need at least 1 Value, got %d", len(instr.Values))
+		}
+		if len(instr.Values) >= instr.Period {
+			s.errorf("SPMDInterleaveStore: len(Values) (%d) must be < Period (%d)", len(instr.Values), instr.Period)
+		}
+		if _, ok := instr.Addr.Type().Underlying().(*types.Pointer); !ok {
+			// Addr may be a slice type (TinyGo extracts ptr) — allow both.
+			if _, ok2 := instr.Addr.Type().Underlying().(*types.Slice); !ok2 {
+				s.errorf("SPMDInterleaveStore: Addr must be a pointer or slice type, got %s", instr.Addr.Type())
+			}
+		}
+
 	case *SPMDLoad:
 		if instr.Lanes <= 0 {
 			s.errorf("SPMDLoad: Lanes must be > 0, got %d", instr.Lanes)

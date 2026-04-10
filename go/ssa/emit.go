@@ -739,6 +739,23 @@ func emitSPMDMux(f *Function, values []Value, indices []int, lanes int) *SPMDMux
 	return v
 }
 
+// emitSPMDInterleaveStore emits an SPMDInterleaveStore instruction.
+func emitSPMDInterleaveStore(f *Function, addr Value, values []Value, period, lanes int, mask, source, sourceLen Value, pos token.Pos) *SPMDInterleaveStore {
+	s := &SPMDInterleaveStore{
+		Addr:      addr,
+		Values:    values,
+		Period:    period,
+		Lanes:     lanes,
+		Mask:      mask,
+		Source:    source,
+		SourceLen: sourceLen,
+		pos:       pos,
+	}
+	s.setType(types.Typ[types.Int])
+	f.emit(s)
+	return s
+}
+
 // emitSPMDIndex emits an SPMDIndex instruction into the current block of f.
 // lanes must be > 0 and elemType must be a basic type.
 // The result type is Varying[elemType].
