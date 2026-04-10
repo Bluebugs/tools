@@ -4583,3 +4583,174 @@ func spmdTracesToIterPhiImpl(v Value, loop *SPMDLoopInfo, seen map[Value]bool) b
 		return false
 	}
 }
+
+// spmdDetectInterleaveStore scans SPMD loop bodies for the pattern:
+//
+//	mux = SPMDMux(Values, periodic Indices with period K)
+//	n = Call(lanes.CompactStore, dst_slice, mux, mask)
+//
+// and replaces both with SPMDInterleaveStore.
+func spmdDetectInterleaveStore(fn *Function) {
+	for _, loop := range fn.SPMDLoops {
+		if loop.LaneCount <= 1 {
+			continue
+		}
+		scopeBlocks := spmdLoopScopeBlocks(loop)
+		spmdDetectInterleaveStoreInScope(fn, loop, scopeBlocks)
+	}
+}
+
+func spmdDetectInterleaveStoreInScope(fn *Function, loop *SPMDLoopInfo, scopeBlocks map[*BasicBlock]bool) {
+	for _, block := range fn.Blocks {
+		if !scopeBlocks[block] {
+			continue
+		}
+		for i := 0; i < len(block.Instrs); i++ {
+			mux, ok := block.Instrs[i].(*SPMDMux)
+			if !ok {
+				continue
+			}
+			// Check that Indices are periodic.
+			period := spmdMuxIndicesPeriod(mux)
+			if period <= 0 {
+				continue
+			}
+			// Find a lanes.CompactStore call consuming this Mux.
+			call, callIdx, callBlock := spmdFindCompactStoreCall(mux, scopeBlocks)
+			if call == nil {
+				continue
+			}
+			// Verify the CompactStore mask matches the Mux gap pattern.
+			if !spmdCompactStoreMaskMatchesMux(mux, period) {
+				continue
+			}
+
+			// Build SPMDInterleaveStore.
+			// lanes.CompactStore[T](dst []T, v Varying[T], mask Varying[bool]) int
+			// call.Call.Args: [0]=dst slice, [1]=value (the mux), [2]=mask
+			dstSlice := call.Call.Args[0]
+
+			interleave := &SPMDInterleaveStore{
+				Addr:   dstSlice,
+				Values: mux.Values,
+				Period: period,
+				Lanes:  mux.Lanes,
+				pos:    call.Pos(),
+			}
+			// Execution mask from the CompactStore call's SPMDMask.
+			if call.Call.SPMDMask != nil {
+				interleave.Mask = call.Call.SPMDMask
+				spmdAddReferrer(call.Call.SPMDMask, interleave)
+			}
+			interleave.Source = dstSlice
+			interleave.setType(types.Typ[types.Int])
+
+			// Add referrers for all values.
+			spmdAddReferrer(dstSlice, interleave)
+			for _, v := range interleave.Values {
+				spmdAddReferrer(v, interleave)
+			}
+
+			// Replace the CompactStore call with SPMDInterleaveStore.
+			interleave.setBlock(callBlock)
+			callBlock.Instrs[callIdx] = interleave
+			replaceAll(call, interleave)
+			call.block = nil
+
+			// The SPMDMux may now be dead (only user was CompactStore).
+			// Check if it has no remaining referrers.
+			if refs := mux.Referrers(); refs != nil && len(*refs) == 0 {
+				// Remove mux from its block.
+				for j, instr := range block.Instrs {
+					if instr == mux {
+						block.Instrs = append(block.Instrs[:j], block.Instrs[j+1:]...)
+						mux.block = nil
+						i-- // adjust index since we removed an instruction
+						break
+					}
+				}
+			}
+		}
+	}
+}
+
+// spmdMuxIndicesPeriod returns the smallest period K of the SPMDMux Indices,
+// or -1 if not periodic. Periodic means Indices[i] == Indices[i%K] for all i.
+func spmdMuxIndicesPeriod(mux *SPMDMux) int {
+	n := len(mux.Indices)
+	for k := 2; k <= n/2; k++ {
+		if n%k != 0 {
+			continue
+		}
+		periodic := true
+		for i := k; i < n; i++ {
+			if mux.Indices[i] != mux.Indices[i%k] {
+				periodic = false
+				break
+			}
+		}
+		if periodic {
+			return k
+		}
+	}
+	return -1
+}
+
+// spmdFindCompactStoreCall walks the referrers of mux to find a *ssa.Call
+// to lanes.CompactStore where mux is the value argument (Args[1]).
+func spmdFindCompactStoreCall(mux *SPMDMux, scopeBlocks map[*BasicBlock]bool) (*Call, int, *BasicBlock) {
+	refs := mux.Referrers()
+	if refs == nil {
+		return nil, 0, nil
+	}
+	for _, ref := range *refs {
+		call, ok := ref.(*Call)
+		if !ok {
+			continue
+		}
+		if call.block == nil || !scopeBlocks[call.block] {
+			continue
+		}
+		// Check that this is a call to lanes.CompactStore.
+		callee := call.Call.StaticCallee()
+		if callee == nil {
+			continue
+		}
+		if callee.Pkg == nil || callee.Pkg.Pkg == nil || callee.Pkg.Pkg.Name() != "lanes" {
+			continue
+		}
+		if !strings.HasPrefix(callee.Name(), "CompactStore[") {
+			continue
+		}
+		// Verify mux is Args[1] (the value argument).
+		if len(call.Call.Args) >= 2 && call.Call.Args[1] == mux {
+			for idx, instr := range call.block.Instrs {
+				if instr == call {
+					return call, idx, call.block
+				}
+			}
+		}
+	}
+	return nil, 0, nil
+}
+
+// spmdCompactStoreMaskMatchesMux verifies that the SPMDMux has exactly one
+// "gap" index per period — the gap position maps to the default value (last
+// Values entry). This means the CompactStore removes exactly those gap lanes.
+func spmdCompactStoreMaskMatchesMux(mux *SPMDMux, period int) bool {
+	// Count how many distinct value indices appear in one period.
+	// The gap index is the one that maps to the default (last) value.
+	if len(mux.Values) < 2 {
+		return false
+	}
+	// Check: exactly one position per period maps to the last value index (default/gap).
+	defaultIdx := len(mux.Values) - 1
+	gapCount := 0
+	for i := 0; i < period; i++ {
+		if mux.Indices[i] == defaultIdx {
+			gapCount++
+		}
+	}
+	// We expect exactly one gap per period (e.g., period=4, 3 active values + 1 gap).
+	return gapCount == 1
+}

@@ -418,6 +418,9 @@ func (f *Function) finishBody() {
 		// Detect SPMDSelect chains from IterPhi % constant patterns
 		// and collapse them into SPMDMux instructions.
 		spmdDetectMuxPatterns(f)
+		// Detect SPMDMux + CompactStore pairs with periodic indices
+		// and replace with SPMDInterleaveStore.
+		spmdDetectInterleaveStore(f)
 		// Split each SPMD loop into a full-width main phase and a masked tail
 		// phase. Runs after predicateSPMD so the loop body is already in
 		// predicated form before cloning.
