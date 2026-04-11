@@ -153,12 +153,15 @@ func spmdCloneBlock(fn *Function, srcBlock *BasicBlock, dstBlock *BasicBlock,
 			for i, val := range v.Values {
 				newValues[i] = spmdTranslateValue(val, valueMap)
 			}
+			newIndices := make([]int, len(v.Indices))
+			copy(newIndices, v.Indices)
 			newInstr := &SPMDInterleaveStore{
-				Addr:   spmdTranslateValue(v.Addr, valueMap),
-				Values: newValues,
-				Period: v.Period,
-				Lanes:  v.Lanes,
-				pos:    v.pos,
+				Addr:    spmdTranslateValue(v.Addr, valueMap),
+				Values:  newValues,
+				Indices: newIndices,
+				Period:  v.Period,
+				Lanes:   v.Lanes,
+				pos:     v.pos,
 			}
 			if v.Mask != nil {
 				newInstr.Mask = spmdTranslateValue(v.Mask, valueMap)

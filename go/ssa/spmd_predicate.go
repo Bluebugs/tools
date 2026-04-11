@@ -4661,12 +4661,17 @@ func spmdDetectInterleaveStoreInScope(fn *Function, loop *SPMDLoopInfo, scopeBlo
 			// call.Call.Args: [0]=dst slice, [1]=value (the mux), [2]=mask
 			dstSlice := call.Call.Args[0]
 
+			// Copy the first period of Mux Indices as the per-position mapping.
+			indices := make([]int, period)
+			copy(indices, mux.Indices[:period])
+
 			interleave := &SPMDInterleaveStore{
-				Addr:   dstSlice,
-				Values: mux.Values,
-				Period: period,
-				Lanes:  mux.Lanes,
-				pos:    call.Pos(),
+				Addr:    dstSlice,
+				Values:  mux.Values,
+				Indices: indices,
+				Period:  period,
+				Lanes:   mux.Lanes,
+				pos:     call.Pos(),
 			}
 			// Execution mask from the CompactStore call's SPMDMask.
 			if call.Call.SPMDMask != nil {
@@ -4747,10 +4752,9 @@ func spmdFindCompactStoreCall(mux *SPMDMux, scopeBlocks map[*BasicBlock]bool) (*
 		if callee == nil {
 			continue
 		}
-		if callee.Pkg == nil || callee.Pkg.Pkg == nil || callee.Pkg.Pkg.Name() != "lanes" {
-			continue
-		}
-		if !strings.HasPrefix(callee.Name(), "CompactStore[") {
+		// Use RelString for reliable identification — callee.Pkg may be nil
+		// for generic function instantiations like lanes.CompactStore[byte].
+		if !strings.HasPrefix(callee.RelString(nil), "lanes.CompactStore[") {
 			continue
 		}
 		// Verify mux is Args[1] (the value argument).
@@ -4765,23 +4769,24 @@ func spmdFindCompactStoreCall(mux *SPMDMux, scopeBlocks map[*BasicBlock]bool) (*
 	return nil, 0, nil
 }
 
-// spmdCompactStoreMaskMatchesMux verifies that the SPMDMux has exactly one
-// "gap" index per period — the gap position maps to the default value (last
-// Values entry). This means the CompactStore removes exactly those gap lanes.
+// spmdCompactStoreMaskMatchesMux verifies that the SPMDMux + CompactStore
+// combination is valid for interleave-store optimization. The number of
+// distinct value indices used per period must equal period - 1 (one gap lane
+// per period that the CompactStore removes).
+//
+// For base64 (period=4, Values=[out0, out2, out1_default]):
+//   Indices = [0, 2, 1, 2]  →  3 distinct active indices per period
+//   period - active = 4 - 3 = 1 gap  →  matches CompactStore removing 1 lane/group
 func spmdCompactStoreMaskMatchesMux(mux *SPMDMux, period int) bool {
-	// Count how many distinct value indices appear in one period.
-	// The gap index is the one that maps to the default (last) value.
-	if len(mux.Values) < 2 {
+	if len(mux.Values) < 2 || period < 2 {
 		return false
 	}
-	// Check: exactly one position per period maps to the last value index (default/gap).
-	defaultIdx := len(mux.Values) - 1
-	gapCount := 0
-	for i := 0; i < period; i++ {
-		if mux.Indices[i] == defaultIdx {
-			gapCount++
-		}
+	// Count distinct index values used in one period.
+	seen := make(map[int]bool)
+	for i := 0; i < period && i < len(mux.Indices); i++ {
+		seen[mux.Indices[i]] = true
 	}
-	// We expect exactly one gap per period (e.g., period=4, 3 active values + 1 gap).
-	return gapCount == 1
+	activePerPeriod := len(seen)
+	// Exactly one gap per period: the CompactStore removes one lane per group.
+	return period-activePerPeriod == 1
 }

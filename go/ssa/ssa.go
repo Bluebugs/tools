@@ -1490,6 +1490,7 @@ type SPMDInterleaveStore struct {
 	register
 	Addr      Value   // destination (slice value — TinyGo extracts ptr)
 	Values    []Value // N value vectors to interleave
+	Indices   []int   // per-position-in-period → Values index (len = Period)
 	Period    int     // K (group size / interleave stride)
 	Lanes     int     // SIMD width of input vectors
 	Mask      Value   // execution mask (may be nil for all-ones)
