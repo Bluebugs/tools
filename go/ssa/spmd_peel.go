@@ -128,68 +128,6 @@ func spmdCloneBlock(fn *Function, srcBlock *BasicBlock, dstBlock *BasicBlock,
 			spmdAddReferrer(newInstr.X, newInstr)
 			spmdAddReferrer(newInstr.Y, newInstr)
 
-		case *SPMDMux:
-			newValues := make([]Value, len(v.Values))
-			for i, val := range v.Values {
-				newValues[i] = spmdTranslateValue(val, valueMap)
-			}
-			newIndices := make([]int, len(v.Indices))
-			copy(newIndices, v.Indices)
-			newInstr := &SPMDMux{
-				Values:  newValues,
-				Indices: newIndices,
-				Lanes:   v.Lanes,
-			}
-			newInstr.setType(v.Type())
-			newInstr.setBlock(dstBlock)
-			dstBlock.Instrs = append(dstBlock.Instrs, newInstr)
-			valueMap[v] = newInstr
-			for _, val := range newInstr.Values {
-				spmdAddReferrer(val, newInstr)
-			}
-
-		case *SPMDInterleaveStore:
-			newValues := make([]Value, len(v.Values))
-			for i, val := range v.Values {
-				newValues[i] = spmdTranslateValue(val, valueMap)
-			}
-			newIndices := make([]int, len(v.Indices))
-			copy(newIndices, v.Indices)
-			newInstr := &SPMDInterleaveStore{
-				Addr:    spmdTranslateValue(v.Addr, valueMap),
-				Values:  newValues,
-				Indices: newIndices,
-				Period:  v.Period,
-				Lanes:   v.Lanes,
-				pos:     v.pos,
-			}
-			if v.Mask != nil {
-				newInstr.Mask = spmdTranslateValue(v.Mask, valueMap)
-			}
-			if v.Source != nil {
-				newInstr.Source = spmdTranslateValue(v.Source, valueMap)
-			}
-			if v.SourceLen != nil {
-				newInstr.SourceLen = spmdTranslateValue(v.SourceLen, valueMap)
-			}
-			newInstr.setType(v.Type())
-			newInstr.setBlock(dstBlock)
-			dstBlock.Instrs = append(dstBlock.Instrs, newInstr)
-			valueMap[v] = newInstr
-			spmdAddReferrer(newInstr.Addr, newInstr)
-			for _, val := range newInstr.Values {
-				spmdAddReferrer(val, newInstr)
-			}
-			if newInstr.Mask != nil {
-				spmdAddReferrer(newInstr.Mask, newInstr)
-			}
-			if newInstr.Source != nil {
-				spmdAddReferrer(newInstr.Source, newInstr)
-			}
-			if newInstr.SourceLen != nil {
-				spmdAddReferrer(newInstr.SourceLen, newInstr)
-			}
-
 		case *SPMDIndex:
 			newInstr := &SPMDIndex{Lanes: v.Lanes, ElemType: v.ElemType}
 			newInstr.setType(v.Type())

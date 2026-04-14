@@ -702,60 +702,6 @@ func emitSPMDStore(f *Function, addr, val, mask Value, lanes int, pos token.Pos)
 	return s
 }
 
-// emitSPMDCompactStore emits an SPMDCompactStore instruction.
-// addr is a pointer to the destination element type.
-// val is the Varying[T] value to compact.
-// mask is the explicit Varying[bool] mask.
-// source is the original slice value (for bounds checking).
-// sourceLen is the len of the slice (for bounds checking).
-// The result type is int (uniform).
-func emitSPMDCompactStore(f *Function, addr, val, mask, source, sourceLen Value, lanes int, pos token.Pos) *SPMDCompactStore {
-	s := &SPMDCompactStore{
-		Addr:         addr,
-		Val:          val,
-		ExplicitMask: mask,
-		Lanes:        lanes,
-		Source:       source,
-		SourceLen:    sourceLen,
-		pos:          pos,
-	}
-	s.setType(types.Typ[types.Int]) // returns uniform int
-	f.emit(s)
-	return s
-}
-
-// emitSPMDMux emits an SPMDMux instruction.
-// values must have at least 2 elements with identical types.
-// indices must have len == lanes, with each value in [0, len(values)).
-// The result type matches values[0].Type().
-func emitSPMDMux(f *Function, values []Value, indices []int, lanes int) *SPMDMux {
-	v := &SPMDMux{
-		Values:  values,
-		Indices: indices,
-		Lanes:   lanes,
-	}
-	v.setType(values[0].Type())
-	f.emit(v)
-	return v
-}
-
-// emitSPMDInterleaveStore emits an SPMDInterleaveStore instruction.
-func emitSPMDInterleaveStore(f *Function, addr Value, values []Value, period, lanes int, mask, source, sourceLen Value, pos token.Pos) *SPMDInterleaveStore {
-	s := &SPMDInterleaveStore{
-		Addr:      addr,
-		Values:    values,
-		Period:    period,
-		Lanes:     lanes,
-		Mask:      mask,
-		Source:    source,
-		SourceLen: sourceLen,
-		pos:       pos,
-	}
-	s.setType(types.Typ[types.Int])
-	f.emit(s)
-	return s
-}
-
 // emitSPMDIndex emits an SPMDIndex instruction into the current block of f.
 // lanes must be > 0 and elemType must be a basic type.
 // The result type is Varying[elemType].

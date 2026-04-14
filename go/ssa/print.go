@@ -412,35 +412,6 @@ func (v *SPMDSelect) String() string {
 		v.Lanes, spmdRelName(v.Mask, v), spmdRelName(v.X, v), spmdRelName(v.Y, v))
 }
 
-func (v *SPMDMux) String() string {
-	var vals []string
-	for _, val := range v.Values {
-		vals = append(vals, spmdRelName(val, v))
-	}
-	idxStr := ""
-	for i, idx := range v.Indices {
-		if i > 0 {
-			idxStr += ","
-		}
-		if i >= 8 {
-			idxStr += "..."
-			break
-		}
-		idxStr += fmt.Sprintf("%d", idx)
-	}
-	return fmt.Sprintf("spmd_mux<%d> [%s] indices [%s]",
-		v.Lanes, strings.Join(vals, ", "), idxStr)
-}
-
-func (s *SPMDInterleaveStore) String() string {
-	var vals []string
-	for _, val := range s.Values {
-		vals = append(vals, spmdRelName(val, s))
-	}
-	return fmt.Sprintf("spmd_interleave_store<%d, period=%d> %s [%s]",
-		s.Lanes, s.Period, spmdRelName(s.Addr, s), strings.Join(vals, ", "))
-}
-
 func (v *SPMDLoad) String() string {
 	suffix := ""
 	if v.Contiguous {
@@ -457,12 +428,6 @@ func (s *SPMDStore) String() string {
 	}
 	return fmt.Sprintf("spmd_store<%d> %s %s mask %s%s",
 		s.Lanes, spmdRelName(s.Addr, s), spmdRelName(s.Val, s), spmdRelName(s.Mask, s), suffix)
-}
-
-func (s *SPMDCompactStore) String() string {
-	return fmt.Sprintf("spmd_compact_store<%d> %s %s mask %s len %s",
-		s.Lanes, spmdRelName(s.Addr, s), spmdRelName(s.Val, s),
-		spmdRelName(s.ExplicitMask, s), spmdRelName(s.SourceLen, s))
 }
 
 func (v *SPMDIndex) String() string {
