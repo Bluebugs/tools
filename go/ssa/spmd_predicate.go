@@ -1300,7 +1300,10 @@ func spmdLoopScopeBlocks(loop *SPMDLoopInfo) map[*BasicBlock]bool {
 			// Stop at inner loop headers to avoid including their bodies in
 			// the SPMD scope. Inner loops operate on scalar values; converting
 			// their memory ops to masked vector ops produces type mismatches.
-			if innerLoopHeaders[succ] {
+			// Exception: divergent inner loops (where the loop bound varies per
+			// lane) must be included so their condition If gets predicated with
+			// a narrowing mask (lanes finish at different iterations).
+			if innerLoopHeaders[succ] && !spmdInnerLoopHasVaryingBound(succ) {
 				continue
 			}
 			scope[succ] = true
@@ -1309,6 +1312,38 @@ func spmdLoopScopeBlocks(loop *SPMDLoopInfo) map[*BasicBlock]bool {
 	}
 
 	return scope
+}
+
+// spmdInnerLoopHasVaryingBound checks if an inner loop header's termination
+// condition involves a varying value. This detects divergent inner loops
+// (e.g., "for j := range v" where len(v) varies per lane).
+func spmdInnerLoopHasVaryingBound(header *BasicBlock) bool {
+	if len(header.Instrs) == 0 {
+		return false
+	}
+	terminator := header.Instrs[len(header.Instrs)-1]
+	ifInstr, ok := terminator.(*If)
+	if !ok {
+		return false
+	}
+	return spmdValueHasSPMDType(ifInstr.Cond)
+}
+
+// spmdValueHasSPMDType checks if a value has an SPMD (varying) type,
+// tracing through BinOp comparisons to find varying operands.
+func spmdValueHasSPMDType(v Value) bool {
+	if _, ok := v.Type().(*types.SPMDType); ok {
+		return true
+	}
+	if binop, ok := v.(*BinOp); ok {
+		if _, ok := binop.X.Type().(*types.SPMDType); ok {
+			return true
+		}
+		if _, ok := binop.Y.Type().(*types.SPMDType); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // spmdBlockCanReachWithin reports whether a forward path exists from src to dst
