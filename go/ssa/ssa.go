@@ -437,6 +437,12 @@ type SPMDLoopInfo struct {
 	TailMask        Value       // virtual parameter representing the tail mask; TinyGo materializes it
 	MainIterPhi     *Phi        // iter phi in MainBodyBlock
 	TailIterPhi     *Phi        // iter phi in TailCheckBlock
+	// BackEdgeBlock is the block whose If terminates with Succs[0]==body and
+	// Succs[1]==done (the loop back-edge). For shapeSimple loops it equals
+	// BodyBlock. For shapeUniformExit loops it is a separate block reached
+	// after the uniform early-exit decision. Populated by peelSPMDLoop;
+	// nil when IsPeeled is false.
+	BackEdgeBlock *BasicBlock
 
 	// iterAlloc is the Alloc for the loop iterator, saved during construction
 	// for post-lift phi resolution. Cleared after resolution.

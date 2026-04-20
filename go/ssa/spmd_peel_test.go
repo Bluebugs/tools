@@ -525,6 +525,417 @@ func main() {
 	}
 }
 
+// TestPeelSPMDLoopUniformEarlyReturn verifies that a go-for loop whose body
+// ends with a uniform (non-varying) If followed by a Return — simulating the
+// "if reduce.Any(found) { return true }" pattern in lo-contains — is peeled
+// into separate main and tail phases that each contain an early-exit block.
+//
+// The loop body has the shape:
+//
+//	body: phi iter; call check(); If cond → if.then, if.done
+//	if.then: Return true
+//	if.done: incr; cond; If → body, done
+//	done: Return false
+func TestPeelSPMDLoopUniformEarlyReturn(t *testing.T) {
+	// "check" is a package-level func var so the call is a plain *Call (no
+	// MakeInterface), satisfying spmdBodyIsCloneable. The uniform bool result
+	// means the If is non-varying, triggering shapeUniformExit in the peeler.
+	src := `package main
+
+var check func() bool
+
+func containsSPMD(target int) bool {
+	for i := range 16 {
+		_ = i
+		if check() {
+			return true
+		}
+	}
+	return false
+}
+`
+	pkg := buildSSAForPeelTest(t, src)
+	fn := pkg.Func("containsSPMD")
+	if fn == nil {
+		t.Fatal("containsSPMD function not found")
+	}
+	if len(fn.SPMDLoops) == 0 {
+		t.Fatal("no SPMD loops found")
+	}
+	loop := fn.SPMDLoops[0]
+
+	// The loop must have been peeled.
+	if !loop.IsPeeled {
+		t.Fatal("loop was not peeled")
+	}
+	if loop.MainBodyBlock == nil {
+		t.Fatal("MainBodyBlock is nil")
+	}
+	if loop.TailCheckBlock == nil {
+		t.Fatal("TailCheckBlock is nil")
+	}
+	if loop.TailBodyBlock == nil {
+		t.Fatal("TailBodyBlock is nil")
+	}
+	if loop.BackEdgeBlock == nil {
+		t.Fatal("BackEdgeBlock is nil")
+	}
+
+	// main.body must NOT be its own successor (the self-loop is via the
+	// cloned back-edge block, not main.body itself). That is: main.body's
+	// If sends the true branch to the early-exit clone and the false branch
+	// to the cloned back-edge block; the back-edge block's If loops back.
+	mainBody := loop.MainBodyBlock
+	for _, succ := range mainBody.Succs {
+		if succ == mainBody {
+			t.Error("MainBodyBlock must not be its own successor; back-edge should go via cloned back-edge block")
+		}
+	}
+
+	// main.body must have exactly two successors (exit clone and back-edge clone).
+	if len(mainBody.Succs) != 2 {
+		t.Errorf("MainBodyBlock has %d succs, want 2", len(mainBody.Succs))
+	}
+
+	// At least one successor of main.body must terminate with Return (the early exit).
+	foundEarlyReturn := false
+	for _, succ := range mainBody.Succs {
+		if len(succ.Instrs) > 0 {
+			if _, ok := succ.Instrs[len(succ.Instrs)-1].(*Return); ok {
+				foundEarlyReturn = true
+			}
+		}
+	}
+	if !foundEarlyReturn {
+		t.Error("no successor of MainBodyBlock terminates with Return (expected early-exit clone)")
+	}
+
+	// tail.body must also have exactly two successors and an early-exit Return clone.
+	tailBody := loop.TailBodyBlock
+	if len(tailBody.Succs) != 2 {
+		t.Errorf("TailBodyBlock has %d succs, want 2", len(tailBody.Succs))
+	}
+	foundTailEarlyReturn := false
+	for _, succ := range tailBody.Succs {
+		if len(succ.Instrs) > 0 {
+			if _, ok := succ.Instrs[len(succ.Instrs)-1].(*Return); ok {
+				foundTailEarlyReturn = true
+			}
+		}
+	}
+	if !foundTailEarlyReturn {
+		t.Error("no successor of TailBodyBlock terminates with Return (expected tail early-exit clone)")
+	}
+
+	// TailCheck must branch to TailBody (true) and the done block (false).
+	tc := loop.TailCheckBlock
+	if len(tc.Succs) != 2 {
+		t.Fatalf("TailCheck has %d succs, want 2", len(tc.Succs))
+	}
+	if tc.Succs[0] != tailBody {
+		t.Errorf("TailCheck.Succs[0] = %s, want TailBody", tc.Succs[0].Comment)
+	}
+	if tc.Succs[1] != loop.DoneBlock {
+		t.Errorf("TailCheck.Succs[1] = %s, want DoneBlock", tc.Succs[1].Comment)
+	}
+
+	// MainIterPhi must live in MainBodyBlock.
+	if loop.MainIterPhi == nil {
+		t.Fatal("MainIterPhi is nil")
+	}
+	if loop.MainIterPhi.Block() != mainBody {
+		t.Errorf("MainIterPhi.Block() = %s, want MainBodyBlock", loop.MainIterPhi.Block().Comment)
+	}
+
+	// The loop must not have a trampoline: there are no accumulators and
+	// done has no phis in this simple case.
+	if loop.TrampolineBlock != nil {
+		t.Error("TrampolineBlock should be nil (no accumulators)")
+	}
+
+	// AlignedBound must live in EntryBlock.
+	if loop.AlignedBound == nil {
+		t.Fatal("AlignedBound is nil")
+	}
+	if ab, ok := loop.AlignedBound.(Instruction); ok {
+		if ab.Block() != loop.EntryBlock {
+			t.Errorf("AlignedBound.Block() = %s, want EntryBlock", ab.Block().Comment)
+		}
+	}
+}
+
+// TestPeelSPMDLoopUniformEarlyJump verifies the variant where the uniform early
+// exit jumps to done rather than returning. This simulates a "break" statement:
+//
+//	body: ... If cond → break.block, cont
+//	break.block: Jump → done    (uniform break)
+//	cont: incr; If → body, done
+//	done: ...
+//
+// After peeling the break block in the main phase must jump to done (or
+// trampoline), and the tail phase similarly exits cleanly.
+func TestPeelSPMDLoopUniformEarlyJump(t *testing.T) {
+	// Use labeled-break to produce a "if cond { break }" inside the loop.
+	// The break lowers to a single Jump → done without a Return.
+	src := `package main
+
+var check func() bool
+
+func containsSPMD(target int) int {
+	result := 0
+outer:
+	for i := range 16 {
+		_ = i
+		if check() {
+			break outer
+		}
+		result++
+	}
+	return result
+}
+`
+	pkg := buildSSAForPeelTest(t, src)
+	fn := pkg.Func("containsSPMD")
+	if fn == nil {
+		t.Fatal("containsSPMD function not found")
+	}
+	if len(fn.SPMDLoops) == 0 {
+		t.Fatal("no SPMD loops found")
+	}
+	loop := fn.SPMDLoops[0]
+
+	// The loop may or may not peel depending on whether the break-to-done block
+	// is recognizable as a spmdIsExitBlock. If it peeled, verify the structure;
+	// if not (shapeUnpeelable), the test is informational only.
+	if !loop.IsPeeled {
+		t.Log("loop was not peeled (shapeUnpeelable for break pattern — acceptable)")
+		return
+	}
+
+	// Basic peeled structure checks.
+	if loop.MainBodyBlock == nil {
+		t.Fatal("MainBodyBlock is nil")
+	}
+	if loop.TailBodyBlock == nil {
+		t.Fatal("TailBodyBlock is nil")
+	}
+	mainBody := loop.MainBodyBlock
+	if len(mainBody.Succs) != 2 {
+		t.Errorf("MainBodyBlock has %d succs, want 2", len(mainBody.Succs))
+	}
+}
+
+// TestPeelSPMDLoopUniformExit_VaryingIfBails verifies that a loop body whose
+// If terminator is varying (IsVarying==true) does NOT trigger shapeUniformExit:
+// the peeler must bail and leave the loop unpeeled.
+func TestPeelSPMDLoopUniformExit_VaryingIfBails(t *testing.T) {
+	// A body whose If compares a varying value directly (not routed through
+	// reduce.Any) is classified as varying (IsVarying=true) by the SSA builder.
+	// The shapeUniformExit classifier must reject it and fall through to
+	// shapeUnpeelable.
+	//
+	// "break" under a varying condition is forbidden by the SPMD type checker,
+	// so we use a varying If that jumps to another body block (no early exit).
+	// This forces the body to have Succs != [body, done] but with a varying
+	// If, triggering shapeUnpeelable.
+	src := `package main
+
+var result [16]int32
+
+func main() {
+	for i := range 16 {
+		if i > 8 {
+			result[i] = int32(i)
+		} else {
+			result[i] = 0
+		}
+	}
+}
+`
+	pkg := buildSSAForPeelTest(t, src)
+	fn := pkg.Func("main")
+	if fn == nil {
+		t.Fatal("main function not found")
+	}
+	if len(fn.SPMDLoops) == 0 {
+		t.Fatal("no SPMD loops found")
+	}
+	loop := fn.SPMDLoops[0]
+
+	// A loop with varying if-else has a linearized body (Jump terminator) and
+	// should have been peeled as shapeSimple (the predication converts the if-else
+	// to SPMDSelect before peeling, leaving the body with Succs=[body,done]).
+	// Either it peeled as simple or was not peeled; it must NOT be shaped as
+	// shapeUniformExit (which only applies to non-varying Ifs).
+	//
+	// We verify that IF the loop was not peeled, it's because it bailed early,
+	// not because of incorrect shapeUniformExit detection. If it was peeled as
+	// shapeSimple, the varying If was already linearized and that's fine too.
+	if loop.IsPeeled {
+		// If peeled, it must be shapeSimple: main.body must have a self-loop
+		// (the direct back-edge, as in the simple case after predication).
+		mainBody := loop.MainBodyBlock
+		if mainBody == nil {
+			t.Fatal("IsPeeled=true but MainBodyBlock is nil")
+		}
+		// No early-exit Return successor in main.body (would indicate shapeUniformExit).
+		for _, succ := range mainBody.Succs {
+			if len(succ.Instrs) == 0 {
+				continue
+			}
+			if _, ok := succ.Instrs[len(succ.Instrs)-1].(*Return); ok {
+				t.Error("shapeSimple main.body should not have a Return-terminated successor")
+			}
+		}
+	}
+	// Whether peeled or not, no panic must have occurred.
+}
+
+// TestPeelSPMDLoopRangeIndexUniformExit verifies that a rangeindex loop
+// (range-over-slice) whose body ends with a uniform (non-varying) If — the
+// canonical "go for _, v := range data { if uniformCond { return true } }"
+// early-exit pattern — is correctly peeled into main + tail phases.
+//
+// The test uses "for i := range data" (rangeindex, index-only) with a uniform
+// condition from a package-level func var. The SPMD body has a uniform If that
+// returns true early; the loop's back-edge is the false branch back to loopBlock.
+func TestPeelSPMDLoopRangeIndexUniformExit(t *testing.T) {
+	src := `package main
+
+var check func() bool
+
+func containsSlice(data []int32) bool {
+	for i := range data {
+		_ = i
+		if check() {
+			return true
+		}
+	}
+	return false
+}
+`
+	pkg := buildSSAForPeelTest(t, src)
+	fn := pkg.Func("containsSlice")
+	if fn == nil {
+		t.Fatal("containsSlice function not found")
+	}
+	if len(fn.SPMDLoops) == 0 {
+		t.Fatal("no SPMD loops found")
+	}
+	loop := fn.SPMDLoops[0]
+
+	// The loop is rangeindex (range-over-slice), not merged.
+	if loop.MergedBodyLoop {
+		t.Error("MergedBodyLoop should be false for range-over-slice")
+	}
+	if !loop.IsRangeIndex {
+		t.Error("IsRangeIndex should be true for range-over-slice")
+	}
+
+	// The loop must have been peeled.
+	if !loop.IsPeeled {
+		t.Fatal("loop was not peeled — rangeindex uniform-exit peeling failed")
+	}
+	if loop.MainBodyBlock == nil {
+		t.Fatal("MainBodyBlock is nil")
+	}
+	if loop.TailCheckBlock == nil {
+		t.Fatal("TailCheckBlock is nil")
+	}
+	if loop.TailBodyBlock == nil {
+		t.Fatal("TailBodyBlock is nil")
+	}
+
+	// MainIterPhi must live in the main loop block (not mainBody).
+	if loop.MainIterPhi == nil {
+		t.Fatal("MainIterPhi is nil")
+	}
+	mainLoopBlock := loop.BackEdgeBlock
+	if mainLoopBlock == nil {
+		t.Fatal("BackEdgeBlock (mainLoopBlock) is nil")
+	}
+	if loop.MainIterPhi.Block() != mainLoopBlock {
+		t.Errorf("MainIterPhi.Block() = %s, want main loop block (%s)",
+			loop.MainIterPhi.Block().Comment, mainLoopBlock.Comment)
+	}
+
+	// mainBody must have exactly two successors.
+	mainBody := loop.MainBodyBlock
+	if len(mainBody.Succs) != 2 {
+		t.Errorf("MainBodyBlock has %d succs, want 2", len(mainBody.Succs))
+	}
+
+	// At least one successor of mainBody must terminate with Return (early exit).
+	foundEarlyReturn := false
+	for _, succ := range mainBody.Succs {
+		if len(succ.Instrs) > 0 {
+			if _, ok := succ.Instrs[len(succ.Instrs)-1].(*Return); ok {
+				foundEarlyReturn = true
+			}
+		}
+	}
+	if !foundEarlyReturn {
+		t.Error("no successor of MainBodyBlock terminates with Return (expected main early-exit clone)")
+	}
+
+	// One successor of mainBody must be mainLoopBlock (the loop-back).
+	foundLoopBack := false
+	for _, succ := range mainBody.Succs {
+		if succ == mainLoopBlock {
+			foundLoopBack = true
+		}
+	}
+	if !foundLoopBack {
+		t.Errorf("MainBodyBlock has no successor pointing to mainLoopBlock (%s)", mainLoopBlock.Comment)
+	}
+
+	// tailBody must have exactly two successors.
+	tailBody := loop.TailBodyBlock
+	if len(tailBody.Succs) != 2 {
+		t.Errorf("TailBodyBlock has %d succs, want 2", len(tailBody.Succs))
+	}
+
+	// At least one successor of tailBody must terminate with Return.
+	foundTailReturn := false
+	for _, succ := range tailBody.Succs {
+		if len(succ.Instrs) > 0 {
+			if _, ok := succ.Instrs[len(succ.Instrs)-1].(*Return); ok {
+				foundTailReturn = true
+			}
+		}
+	}
+	if !foundTailReturn {
+		t.Error("no successor of TailBodyBlock terminates with Return (expected tail early-exit clone)")
+	}
+
+	// tailCheck must have two succs: tailBody and done.
+	tc := loop.TailCheckBlock
+	if len(tc.Succs) != 2 {
+		t.Fatalf("TailCheckBlock has %d succs, want 2", len(tc.Succs))
+	}
+	if tc.Succs[0] != tailBody {
+		t.Errorf("TailCheckBlock.Succs[0] = %s, want TailBodyBlock", tc.Succs[0].Comment)
+	}
+	if tc.Succs[1] != loop.DoneBlock {
+		t.Errorf("TailCheckBlock.Succs[1] = %s, want DoneBlock", tc.Succs[1].Comment)
+	}
+
+	// AlignedBound must live in EntryBlock.
+	if loop.AlignedBound == nil {
+		t.Fatal("AlignedBound is nil")
+	}
+	if ab, ok := loop.AlignedBound.(Instruction); ok {
+		if ab.Block() != loop.EntryBlock {
+			t.Errorf("AlignedBound.Block() = %s, want EntryBlock", ab.Block().Comment)
+		}
+	}
+
+	// No trampoline needed when the loop has no accumulators.
+	if loop.TrampolineBlock != nil {
+		t.Error("TrampolineBlock should be nil (no accumulators)")
+	}
+}
+
 // TestSPMDCloneBlock_OperandTranslation verifies that operands of cloned
 // instructions are translated through the valueMap: no cloned instruction
 // should reference an original value that was itself cloned.

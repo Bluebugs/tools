@@ -213,6 +213,21 @@ func spmdCloneBlock(fn *Function, srcBlock *BasicBlock, dstBlock *BasicBlock,
 			valueMap[v] = newInstr
 			// Alloc has no input operands to register referrers for.
 
+		case *MakeInterface:
+			newInstr := &MakeInterface{SPMDLanes: v.SPMDLanes}
+			newInstr.X = spmdTranslateValue(v.X, valueMap)
+			if v.SPMDMask != nil {
+				newInstr.SPMDMask = spmdTranslateValue(v.SPMDMask, valueMap)
+			}
+			newInstr.setType(v.Type())
+			newInstr.setBlock(dstBlock)
+			dstBlock.Instrs = append(dstBlock.Instrs, newInstr)
+			valueMap[v] = newInstr
+			spmdAddReferrer(newInstr.X, newInstr)
+			if newInstr.SPMDMask != nil {
+				spmdAddReferrer(newInstr.SPMDMask, newInstr)
+			}
+
 		case *SPMDVectorFromMemory:
 			clone := &SPMDVectorFromMemory{
 				Ptr:      spmdTranslateValue(v.Ptr, valueMap),
@@ -305,30 +320,110 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 		return
 	}
 
-	// Only handle merged body+loop blocks (rangeint form after block fusion).
-	if !loop.MergedBodyLoop {
-		return
-	}
-
 	body := loop.BodyBlock
 	entry := loop.EntryBlock
 	done := loop.DoneBlock
 
-	// Only peel simple loops where the body block has exactly two successors:
-	// itself (the self-loop back-edge) and done (the loop exit). After
-	// predicateSPMD, a loop body with varying control flow (switch, if-else)
-	// will have its terminator replaced with a Jump, producing a different
-	// successor set. Those multi-block scopes are not yet supported.
-	if len(body.Succs) != 2 || body.Succs[0] != body || body.Succs[1] != done {
-		return
+	if loop.MergedBodyLoop {
+		// Merged rangeint form: body block is its own loop header.
+		// Classify the loop body shape. shapeSimple is the existing fast path.
+		// shapeUniformExit extends peeling to loops whose body ends with a
+		// uniform If (e.g., "if reduce.Any(found) { return true }") before
+		// the back-edge.
+		shape, earlyExitBlock, chainBlocks, backEdgeBlock := spmdClassifyLoopBody(body, done)
+		switch shape {
+		case shapeSimple:
+			// Existing fast path: body.Succs == [body, done].
+			if !spmdBodyIsCloneable(body) {
+				return
+			}
+			peelSPMDLoopSimple(fn, loop, laneCount, body, entry, done)
+			return
+		case shapeUniformExit:
+			// Multi-block body with a uniform early-exit before the back-edge.
+			if !spmdBodyIsCloneable(body) {
+				return
+			}
+			for _, cb := range chainBlocks {
+				if !spmdBodyIsCloneable(cb) {
+					return
+				}
+			}
+			if !spmdBodyIsCloneable(backEdgeBlock) {
+				return
+			}
+			if !spmdBodyIsCloneable(earlyExitBlock) {
+				return
+			}
+			peelSPMDLoopUniformExit(fn, loop, laneCount, body, entry, done,
+				earlyExitBlock, chainBlocks, backEdgeBlock)
+			return
+		default:
+			return
+		}
 	}
 
-	// Only peel loops whose body contains instruction types that spmdCloneBlock
-	// knows how to copy. If the body contains an unsupported instruction (e.g.,
-	// MakeInterface, Select, TypeAssert), skip peeling rather than panicking.
+	// Non-merged rangeindex form: loopBlock and bodyBlock are separate.
+	// The loop structure is:
+	//   entry → loopBlock (unconditionally)
+	//   loopBlock: iter phi, incr, cond, If → body, done
+	//   body: SPMD ops, uniform If → earlyExit, loopBlock  (shapeRangeIndexUniformExit)
+	//     OR body: SPMD ops, Jump → loopBlock              (shapeRangeIndexSimple, not yet handled)
+	//   earlyExit: Return
+	//   done: Return
+	loopBlock := loop.LoopBlock
+	if loopBlock == nil || body == nil || done == nil {
+		return
+	}
 	if !spmdBodyIsCloneable(body) {
 		return
 	}
+	if !spmdBodyIsCloneable(loopBlock) {
+		return
+	}
+
+	// Check for the uniform-exit shape: body ends with a non-varying If
+	// where one successor is a dedicated exit block (Return or Jump→done),
+	// and the other is loopBlock (the continuation back to the loop header).
+	var rangeIdxExitBlock *BasicBlock
+	if len(body.Succs) == 2 {
+		bodyIf, ok := body.Instrs[len(body.Instrs)-1].(*If)
+		if ok && !bodyIf.IsVarying {
+			for _, succ := range [2]*BasicBlock{body.Succs[0], body.Succs[1]} {
+				// succ must not be done or loopBlock itself.
+				if succ == done || succ == loopBlock {
+					continue
+				}
+				if spmdIsExitBlock(succ, done) {
+					other := body.Succs[0]
+					if succ == body.Succs[0] {
+						other = body.Succs[1]
+					}
+					if other == loopBlock {
+						rangeIdxExitBlock = succ
+					}
+				}
+			}
+		}
+	}
+
+	if rangeIdxExitBlock == nil {
+		// Neither shapeSimple nor shapeUniformExit for rangeindex: bail.
+		return
+	}
+	if !spmdBodyIsCloneable(rangeIdxExitBlock) {
+		return
+	}
+
+	peelSPMDLoopRangeIndexUniformExit(fn, loop, laneCount,
+		entry, loopBlock, body, done, rangeIdxExitBlock)
+}
+
+// peelSPMDLoopSimple is the existing fast-path peeler for loops whose body
+// block is its own back-edge (Succs[0]==body, Succs[1]==done). The full
+// description is in the peelSPMDLoop doc comment above.
+func peelSPMDLoopSimple(fn *Function, loop *SPMDLoopInfo, laneCount int,
+	body, entry, done *BasicBlock) {
 
 	// Use the IterPhi's type for all arithmetic. After the lift pass, the
 	// IterPhi is always a typed integer (e.g., "int"), never "untyped int".
@@ -366,11 +461,11 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	// in its condition operand so the sanity checker does not complain.
 	n := len(entry.Instrs)
 	if n == 0 {
-		panic("peelSPMDLoop: entry block has no instructions")
+		panic("peelSPMDLoopSimple: entry block has no instructions")
 	}
 	oldIf, ok := entry.Instrs[n-1].(*If)
 	if !ok {
-		panic("peelSPMDLoop: entry block last instruction is not If")
+		panic("peelSPMDLoopSimple: entry block last instruction is not If")
 	}
 
 	// Extract the live bound from the guard condition before removing the If.
@@ -539,11 +634,11 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	// the two exit paths (tailCheck = no tail, tailBody = after tail) before
 	// jumping to done. Without a trampoline, done would have two predecessors but
 	// its phis would have no edges — a malformed SSA state.
-	exitBlock := done
+	tailExitTarget := done
 	var trampoline *BasicBlock
 	if len(loop.Accumulators) > 0 || len(done.phis()) > 0 {
 		trampoline = fn.newBasicBlock("spmd.trampoline")
-		exitBlock = trampoline
+		tailExitTarget = trampoline
 		loop.TrampolineBlock = trampoline
 	}
 
@@ -588,26 +683,26 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	spmdAddReferrer(tailIterPhi, hasTail)
 	spmdAddReferrer(typedBound, hasTail)
 
-	// If(hasTail) → tailBody, exitBlock (done or trampoline).
+	// If(hasTail) → tailBody, tailExitTarget (done or trampoline).
 	tailCheckIf := &If{Cond: hasTail}
 	tailCheckIf.setBlock(tailCheck)
 	tailCheck.Instrs = append(tailCheck.Instrs, tailCheckIf)
 	spmdAddReferrer(hasTail, tailCheckIf)
 
-	// Wire tailCheck → tailBody and tailCheck → exitBlock.
+	// Wire tailCheck → tailBody and tailCheck → tailExitTarget.
 	addEdge(tailCheck, tailBody)
-	addEdge(tailCheck, exitBlock)
+	addEdge(tailCheck, tailExitTarget)
 
 	// --- Populate tail body ---
 	spmdCloneBlock(fn, body, tailBody, tailValueMap)
 
-	// Jump → exitBlock (done or trampoline).
+	// Jump → tailExitTarget (done or trampoline).
 	tailJump := &Jump{}
 	tailJump.setBlock(tailBody)
 	tailBody.Instrs = append(tailBody.Instrs, tailJump)
 
-	// Wire tailBody → exitBlock.
-	addEdge(tailBody, exitBlock)
+	// Wire tailBody → tailExitTarget.
+	addEdge(tailBody, tailExitTarget)
 
 	// --- Build trampoline (only when accumulators are present) ---
 	// The trampoline merges the accumulator value from the two paths that
@@ -706,6 +801,7 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	loop.MainBodyBlock = mainBody
 	loop.TailCheckBlock = tailCheck
 	loop.TailBodyBlock = tailBody
+	loop.BackEdgeBlock = body // shapeSimple: the body is its own back-edge
 	loop.AlignedBound = alignedBound
 	loop.MainIterPhi = mainIterPhi
 	loop.TailIterPhi = tailIterPhi
@@ -714,6 +810,907 @@ func peelSPMDLoop(fn *Function, loop *SPMDLoopInfo) {
 	// the lift pass promoted away; typedBound holds the current live value.
 	loop.BoundValue = typedBound
 	// TrampolineBlock is set above when accumulators are present, nil otherwise.
+}
+
+// peelSPMDLoopUniformExit peels a loop whose body ends with a uniform (non-
+// varying) If that provides an early exit before the loop back-edge. After
+// peeling, both the main and tail phases contain clones of the full block chain
+// (body + chain blocks + back-edge block), each with its own clone of the early-
+// exit block. The return/jump in each exit clone is independently translatable
+// through the per-clone valueMap.
+//
+// The concrete SSA shape handled here (shapeUniformExit):
+//
+//	entry:      If (0 < bound) → body, done
+//
+//	body:       phi iter [entry: 0, backEdge: incr]
+//	            ... body instructions ...
+//	            If uniformCond → earlyExit, chainStart
+//
+//	earlyExit:  Return <val>               (or Jump → done)
+//
+//	chainBlocks: zero or more straight-line blocks
+//
+//	backEdge:   ... incr computations ...
+//	            If (incr < bound) → body, done
+//
+//	done:       Return <val>
+//
+// After peeling:
+//
+//	entry:      alignedBound = bound & ^(lc-1)
+//	            If (alignedBound > 0) → mainBody, tailCheck
+//
+//	mainBody:   phi mainIter [entry: 0, mainBackEdge: mainIncr]
+//	            ... cloned body ... cloned chain ...
+//	            If clonedCond → mainEarlyExit, mainBackEdge
+//
+//	mainEarlyExit: Return <translated val>
+//
+//	mainBackEdge: mainIncr = mainIter + laneCount
+//	              If (mainIncr < alignedBound) → mainBody, tailCheck
+//
+//	tailCheck:  phi tailIter [entry: 0, mainBackEdge: mainIncr]
+//	            If (tailIter < bound) → tailBody, done
+//
+//	tailBody:   ... cloned body ... cloned chain ...
+//	            If clonedCond → tailEarlyExit, tailBackEdge
+//
+//	tailEarlyExit: Return <translated val>
+//
+//	tailBackEdge: Jump → done
+//
+//	done:       Return false
+func peelSPMDLoopUniformExit(fn *Function, loop *SPMDLoopInfo, laneCount int,
+	body, entry, done, earlyExitBlock *BasicBlock,
+	chainBlocks []*BasicBlock, backEdgeBlock *BasicBlock) {
+
+	intType := loop.IterPhi.Type()
+	typedBound := spmdTypedBound(loop.BoundValue, intType)
+
+	// Extract live bound from entry guard (same logic as peelSPMDLoopSimple).
+	n := len(entry.Instrs)
+	if n == 0 {
+		panic("peelSPMDLoopUniformExit: entry block has no instructions")
+	}
+	oldEntryIf, ok := entry.Instrs[n-1].(*If)
+	if !ok {
+		panic("peelSPMDLoopUniformExit: entry block last instruction is not If")
+	}
+	if guardCond, ok2 := oldEntryIf.Cond.(*BinOp); ok2 && guardCond.Op == token.LSS {
+		typedBound = spmdTypedBound(guardCond.Y, intType)
+	}
+
+	notMaskConst := NewConst(constant.MakeInt64(int64(^(laneCount-1))), intType)
+	laneCountConst := NewConst(constant.MakeInt64(int64(laneCount)), intType)
+	zeroConst := NewConst(constant.MakeInt64(0), intType)
+
+	// Create new blocks for main and tail phases.
+	mainBody := fn.newBasicBlock("spmd.main.body")
+	mainEarlyExit := fn.newBasicBlock("spmd.main.exit")
+	mainBackEdge := fn.newBasicBlock("spmd.main.backedge")
+	tailCheck := fn.newBasicBlock("spmd.tail.check")
+	tailBody := fn.newBasicBlock("spmd.tail.body")
+	tailEarlyExit := fn.newBasicBlock("spmd.tail.exit")
+	tailBackEdge := fn.newBasicBlock("spmd.tail.backedge")
+
+	// Also create cloned chain blocks for main and tail phases.
+	// chainBlocks may be empty (direct body → backEdge connection).
+	mainChain := make([]*BasicBlock, len(chainBlocks))
+	tailChain := make([]*BasicBlock, len(chainBlocks))
+	for i, cb := range chainBlocks {
+		mainChain[i] = fn.newBasicBlock("spmd.main.chain." + cb.Comment)
+		tailChain[i] = fn.newBasicBlock("spmd.tail.chain." + cb.Comment)
+	}
+
+	// --- Rewrite entry block ---
+	if refs := oldEntryIf.Cond.Referrers(); refs != nil {
+		*refs = spmdRemoveOneReferrer(*refs, oldEntryIf)
+	}
+	entry.Instrs = entry.Instrs[:n-1]
+	entry.Succs = entry.Succs[:0]
+
+	// Snapshot done-phi entry edges before rewiring.
+	donePhiEntryEdges := map[*Phi]Value{}
+	for _, instr := range done.phis() {
+		phi := instr.(*Phi)
+		for j, pred := range done.Preds {
+			if pred == entry {
+				donePhiEntryEdges[phi] = phi.Edges[j]
+			}
+		}
+	}
+
+	// Remove entry→body and entry→done edges; also remove backEdge→done.
+	// In shapeUniformExit the done block is reached from backEdgeBlock (not body).
+	body.removePred(entry)
+	done.removePred(entry)
+
+	// Save backEdge→done phi values before removing backEdge from done.Preds.
+	// These values flow from the back-edge block, not the body block.
+	donePhiBackEdgeEdges := map[*Phi]Value{}
+	for _, instr := range done.phis() {
+		phi := instr.(*Phi)
+		for j, pred := range done.Preds {
+			if pred == backEdgeBlock {
+				donePhiBackEdgeEdges[phi] = phi.Edges[j]
+			}
+		}
+	}
+	done.removePred(backEdgeBlock)
+
+	// Remove earlyExitBlock from done.Preds if it was a direct Jump→done.
+	// (When earlyExitBlock has Return terminator this is a no-op.)
+	if len(earlyExitBlock.Succs) == 1 && earlyExitBlock.Succs[0] == done {
+		done.removePred(earlyExitBlock)
+	}
+
+	// Build aligned-bound computation in entry.
+	alignedBound := &BinOp{Op: token.AND}
+	alignedBound.X = typedBound
+	alignedBound.Y = notMaskConst
+	alignedBound.setType(intType)
+	alignedBound.setBlock(entry)
+	entry.Instrs = append(entry.Instrs, alignedBound)
+	spmdAddReferrer(typedBound, alignedBound)
+	spmdAddReferrer(notMaskConst, alignedBound)
+
+	hasMain := &BinOp{Op: token.GTR}
+	hasMain.X = alignedBound
+	hasMain.Y = zeroConst
+	hasMain.setType(types.Typ[types.Bool])
+	hasMain.setBlock(entry)
+	entry.Instrs = append(entry.Instrs, hasMain)
+	spmdAddReferrer(alignedBound, hasMain)
+	spmdAddReferrer(zeroConst, hasMain)
+
+	entryIf := &If{Cond: hasMain}
+	entryIf.setBlock(entry)
+	entry.Instrs = append(entry.Instrs, entryIf)
+	spmdAddReferrer(hasMain, entryIf)
+	addEdge(entry, mainBody)
+	addEdge(entry, tailCheck)
+
+	// --- Populate main body ---
+	// mainIterPhi: phi [entry: 0, mainBackEdge: mainIncr]
+	// Preds order will be [entry, mainBackEdge] matching edge order.
+	mainIterPhi := &Phi{Comment: "spmd.main.iter"}
+	mainIterPhi.setType(intType)
+	mainIterPhi.Edges = []Value{zeroConst, nil} // back-edge filled after mainBackEdge is built
+	spmdInsertPhiAtFront(mainBody, mainIterPhi)
+	spmdAddReferrer(zeroConst, mainIterPhi)
+
+	// Accumulator phis in mainBody (same pattern as peelSPMDLoopSimple).
+	mainAccPhis := make([]*Phi, len(loop.Accumulators))
+	mainValueMap := map[Value]Value{loop.IterPhi: mainIterPhi}
+	for i, acc := range loop.Accumulators {
+		mainAccPhi := &Phi{Comment: "spmd.main.acc"}
+		mainAccPhi.setType(acc.Phi.Type())
+		mainAccPhi.Edges = []Value{acc.InitValue, nil}
+		spmdInsertPhiAtFront(mainBody, mainAccPhi)
+		spmdAddReferrer(acc.InitValue, mainAccPhi)
+		mainValueMap[acc.Phi] = mainAccPhi
+		mainAccPhis[i] = mainAccPhi
+	}
+
+	// Clone body instructions into mainBody.
+	spmdCloneBlock(fn, body, mainBody, mainValueMap)
+
+	// Wire the main body's cloned uniform-exit If:
+	//   Succs[0] (true  branch) → mainEarlyExit
+	//   Succs[1] (false branch) → first chain block or mainBackEdge
+	mainBodyCont := spmdFirstChainOrBackEdge(mainChain, mainBackEdge)
+	addEdge(mainBody, mainEarlyExit)
+	addEdge(mainBody, mainBodyCont)
+	// Restore the cloned If terminator targeting the new blocks. spmdCloneBlock
+	// skips If terminators; we add the cloned If here using the translated cond.
+	bodyTermIf := body.Instrs[len(body.Instrs)-1].(*If)
+	mainBodyIf := &If{Cond: spmdTranslateValue(bodyTermIf.Cond, mainValueMap)}
+	mainBodyIf.setBlock(mainBody)
+	mainBody.Instrs = append(mainBody.Instrs, mainBodyIf)
+	spmdAddReferrer(mainBodyIf.Cond, mainBodyIf)
+
+	// --- Populate main chain blocks ---
+	spmdCloneChainBlocks(fn, chainBlocks, mainChain, mainBackEdge, mainValueMap)
+
+	// --- Populate main back-edge block ---
+	spmdCloneBlock(fn, backEdgeBlock, mainBackEdge, mainValueMap)
+
+	// mainIncr = mainIterPhi + laneCount.
+	mainIncr := &BinOp{Op: token.ADD}
+	mainIncr.X = mainIterPhi
+	mainIncr.Y = laneCountConst
+	mainIncr.setType(intType)
+	mainIncr.setBlock(mainBackEdge)
+	mainBackEdge.Instrs = append(mainBackEdge.Instrs, mainIncr)
+	spmdAddReferrer(mainIterPhi, mainIncr)
+	spmdAddReferrer(laneCountConst, mainIncr)
+
+	// mainCond = mainIncr < alignedBound.
+	mainCond := &BinOp{Op: token.LSS}
+	mainCond.X = mainIncr
+	mainCond.Y = alignedBound
+	mainCond.setType(types.Typ[types.Bool])
+	mainCond.setBlock(mainBackEdge)
+	mainBackEdge.Instrs = append(mainBackEdge.Instrs, mainCond)
+	spmdAddReferrer(mainIncr, mainCond)
+	spmdAddReferrer(alignedBound, mainCond)
+
+	mainBackIf := &If{Cond: mainCond}
+	mainBackIf.setBlock(mainBackEdge)
+	mainBackEdge.Instrs = append(mainBackEdge.Instrs, mainBackIf)
+	spmdAddReferrer(mainCond, mainBackIf)
+	addEdge(mainBackEdge, mainBody)    // true  → loop back to mainBody
+	addEdge(mainBackEdge, tailCheck)   // false → proceed to tail check
+
+	// Fill in the back-edge of mainIterPhi now that mainIncr exists.
+	// mainBody.Preds = [entry, mainBackEdge], so Edges = [zeroConst, mainIncr].
+	mainIterPhi.Edges[1] = mainIncr
+	spmdAddReferrer(mainIncr, mainIterPhi)
+
+	// Fill in accumulator back-edges.
+	for i, acc := range loop.Accumulators {
+		backVal := spmdTranslateValue(acc.BackValue, mainValueMap)
+		mainAccPhis[i].Edges[1] = backVal
+		spmdAddReferrer(backVal, mainAccPhis[i])
+	}
+
+	// --- Populate main early-exit block ---
+	// Clone only the non-terminator, non-phi instructions, then wire the
+	// original terminator. For a Return block this is just the Return itself;
+	// for a Jump→done block it is just the Jump.
+	spmdCloneBlock(fn, earlyExitBlock, mainEarlyExit, mainValueMap)
+	spmdCloneTerminator(earlyExitBlock, mainEarlyExit, done, mainValueMap)
+
+	// --- Populate tail check ---
+	// tailIter = phi [entry: 0, mainBackEdge: mainIncr]
+	tailIterPhi := &Phi{Comment: "spmd.tail.iter"}
+	tailIterPhi.setType(intType)
+	tailIterPhi.Edges = []Value{zeroConst, mainIncr}
+	spmdInsertPhiAtFront(tailCheck, tailIterPhi)
+	spmdAddReferrer(zeroConst, tailIterPhi)
+	spmdAddReferrer(mainIncr, tailIterPhi)
+
+	// Accumulator phis in tailCheck.
+	tailAccPhis := make([]*Phi, len(loop.Accumulators))
+	tailValueMap := map[Value]Value{loop.IterPhi: tailIterPhi}
+	for i, acc := range loop.Accumulators {
+		mainAccResult := spmdTranslateValue(acc.BackValue, mainValueMap)
+		tailAccPhi := &Phi{Comment: "spmd.tail.acc"}
+		tailAccPhi.setType(acc.Phi.Type())
+		tailAccPhi.Edges = []Value{acc.InitValue, mainAccResult}
+		spmdInsertPhiAtFront(tailCheck, tailAccPhi)
+		spmdAddReferrer(acc.InitValue, tailAccPhi)
+		spmdAddReferrer(mainAccResult, tailAccPhi)
+		tailValueMap[acc.Phi] = tailAccPhi
+		tailAccPhis[i] = tailAccPhi
+	}
+
+	// hasTail = tailIter < typedBound.
+	hasTail := &BinOp{Op: token.LSS}
+	hasTail.X = tailIterPhi
+	hasTail.Y = typedBound
+	hasTail.setType(types.Typ[types.Bool])
+	hasTail.setBlock(tailCheck)
+	tailCheck.Instrs = append(tailCheck.Instrs, hasTail)
+	spmdAddReferrer(tailIterPhi, hasTail)
+	spmdAddReferrer(typedBound, hasTail)
+
+	// Determine tail exit target: need trampoline when accumulators or done phis exist.
+	tailExitTarget := done
+	var trampoline *BasicBlock
+	if len(loop.Accumulators) > 0 || len(done.phis()) > 0 {
+		trampoline = fn.newBasicBlock("spmd.trampoline")
+		tailExitTarget = trampoline
+		loop.TrampolineBlock = trampoline
+	}
+
+	tailCheckIf := &If{Cond: hasTail}
+	tailCheckIf.setBlock(tailCheck)
+	tailCheck.Instrs = append(tailCheck.Instrs, tailCheckIf)
+	spmdAddReferrer(hasTail, tailCheckIf)
+	addEdge(tailCheck, tailBody)
+	addEdge(tailCheck, tailExitTarget)
+
+	// --- Populate tail body ---
+	spmdCloneBlock(fn, body, tailBody, tailValueMap)
+
+	// Wire tail body's cloned uniform-exit If.
+	tailBodyCont := spmdFirstChainOrBackEdge(tailChain, tailBackEdge)
+	addEdge(tailBody, tailEarlyExit)
+	addEdge(tailBody, tailBodyCont)
+	tailBodyIf := &If{Cond: spmdTranslateValue(bodyTermIf.Cond, tailValueMap)}
+	tailBodyIf.setBlock(tailBody)
+	tailBody.Instrs = append(tailBody.Instrs, tailBodyIf)
+	spmdAddReferrer(tailBodyIf.Cond, tailBodyIf)
+
+	// --- Populate tail chain blocks ---
+	spmdCloneChainBlocks(fn, chainBlocks, tailChain, tailBackEdge, tailValueMap)
+
+	// --- Populate tail back-edge block ---
+	spmdCloneBlock(fn, backEdgeBlock, tailBackEdge, tailValueMap)
+
+	// Tail back-edge jumps unconditionally to tailExitTarget (done or trampoline).
+	tailBackJump := &Jump{}
+	tailBackJump.setBlock(tailBackEdge)
+	tailBackEdge.Instrs = append(tailBackEdge.Instrs, tailBackJump)
+	addEdge(tailBackEdge, tailExitTarget)
+
+	// --- Populate tail early-exit block ---
+	spmdCloneBlock(fn, earlyExitBlock, tailEarlyExit, tailValueMap)
+	spmdCloneTerminator(earlyExitBlock, tailEarlyExit, done, tailValueMap)
+
+	// --- Build trampoline when needed ---
+	if trampoline != nil {
+		accMergeMap := make(map[Value]Value, len(loop.Accumulators)*2)
+		for i, acc := range loop.Accumulators {
+			tailAccResult := spmdTranslateValue(acc.BackValue, tailValueMap)
+			mergePhi := &Phi{Comment: "spmd.acc.merge"}
+			mergePhi.setType(acc.Phi.Type())
+			// trampoline.Preds = [tailCheck, tailBackEdge] (addEdge order below).
+			mergePhi.Edges = []Value{tailAccPhis[i], tailAccResult}
+			spmdInsertPhiAtFront(trampoline, mergePhi)
+			spmdAddReferrer(tailAccPhis[i], mergePhi)
+			spmdAddReferrer(tailAccResult, mergePhi)
+			accMergeMap[acc.Phi] = mergePhi
+			accMergeMap[acc.BackValue] = mergePhi
+			// spmdReplaceAccUses must exclude ALL original blocks that are now dead:
+			// body, chain blocks, and backEdgeBlock.
+			spmdReplaceAccUsesMulti(acc.Phi, mergePhi, body, chainBlocks, backEdgeBlock)
+		}
+
+		trampJump := &Jump{}
+		trampJump.setBlock(trampoline)
+		trampoline.Instrs = append(trampoline.Instrs, trampJump)
+		addEdge(trampoline, done)
+
+		for _, instr := range done.phis() {
+			phi := instr.(*Phi)
+			// The back-edge value that reached done in the original CFG came
+			// from backEdgeBlock, not body (unlike shapeSimple).
+			bodyEdge := donePhiBackEdgeEdges[phi]
+			if mergeVal, ok2 := accMergeMap[bodyEdge]; ok2 {
+				phi.Edges = append(phi.Edges, mergeVal)
+				spmdAddReferrer(mergeVal, phi)
+				continue
+			}
+			entryEdge := donePhiEntryEdges[phi]
+			if entryEdge == nil {
+				entryEdge = bodyEdge
+			}
+			mainBackEdgeVal := spmdTranslateValue(bodyEdge, mainValueMap)
+			tailCheckPhi := &Phi{Comment: "spmd.done.acc"}
+			tailCheckPhi.setType(phi.Type())
+			tailCheckPhi.Edges = []Value{entryEdge, mainBackEdgeVal}
+			spmdInsertPhiAtFront(tailCheck, tailCheckPhi)
+			spmdAddReferrer(entryEdge, tailCheckPhi)
+			spmdAddReferrer(mainBackEdgeVal, tailCheckPhi)
+
+			tailBodyEdge := spmdTranslateValue(bodyEdge, tailValueMap)
+			mergePhi := &Phi{Comment: "spmd.done.merge"}
+			mergePhi.setType(phi.Type())
+			mergePhi.Edges = []Value{tailCheckPhi, tailBodyEdge}
+			spmdInsertPhiAtFront(trampoline, mergePhi)
+			spmdAddReferrer(tailCheckPhi, mergePhi)
+			spmdAddReferrer(tailBodyEdge, mergePhi)
+
+			phi.Edges = append(phi.Edges, mergePhi)
+			spmdAddReferrer(mergePhi, phi)
+		}
+	}
+
+	// --- Update loop metadata ---
+	loop.IsPeeled = true
+	loop.MainBodyBlock = mainBody
+	loop.TailCheckBlock = tailCheck
+	loop.TailBodyBlock = tailBody
+	loop.BackEdgeBlock = backEdgeBlock
+	loop.AlignedBound = alignedBound
+	loop.MainIterPhi = mainIterPhi
+	loop.TailIterPhi = tailIterPhi
+	loop.BoundValue = typedBound
+}
+
+// peelSPMDLoopRangeIndexUniformExit peels a rangeindex loop (go for _, v := range data)
+// whose body ends with a uniform (non-varying) If providing an early exit before
+// jumping back to the loop block. The rangeindex form keeps its iter phi in a
+// dedicated loopBlock (rangeindex.loop), separate from the body block (rangeindex.body).
+//
+// The concrete SSA shape handled here:
+//
+//	entry:     ... Jump → loopBlock
+//
+//	loopBlock: iter = phi [entry: init, body: iter+laneCount]
+//	           incr = iter + laneCount    (or iter + 1 × laneCount)
+//	           cond = incr < bound
+//	           If cond → body, done
+//
+//	body:      [SPMD ops producing uniformCond ...]
+//	           If uniformCond → earlyExit, loopBlock
+//
+//	earlyExit: Return <val>
+//
+//	done:      Return <val>
+//
+// After peeling:
+//
+//	entry:          alignedBound = bound & ^(lc-1)
+//	                If alignedBound > 0 → mainLoopBlock, tailCheck
+//
+//	mainLoopBlock:  mainIter = phi [entry: 0, mainBody: mainIncr]
+//	                [cloned loopBlock non-phi instrs with mainIter substituted]
+//	                mainIncr = mainIter + laneCount
+//	                mainCond = mainIncr < alignedBound
+//	                If mainCond → mainBody, tailCheck
+//
+//	mainBody:       [clone of body]
+//	                If clonedUniformCond → mainEarlyExit, mainLoopBlock
+//
+//	mainEarlyExit:  Return <translated val>
+//
+//	tailCheck:      tailIter = phi [entry: 0, mainBody: mainIncr]
+//	                hasTail = tailIter < bound
+//	                If hasTail → tailBody, done
+//
+//	tailBody:       [clone of body]
+//	                If clonedUniformCond → tailEarlyExit, done
+//
+//	tailEarlyExit:  Return <translated val>
+//
+//	done:           Return <val>
+func peelSPMDLoopRangeIndexUniformExit(fn *Function, loop *SPMDLoopInfo, laneCount int,
+	entry, loopBlock, body, done, earlyExitBlock *BasicBlock) {
+
+	intType := loop.IterPhi.Type()
+	typedBound := spmdTypedBound(loop.BoundValue, intType)
+
+	// Extract live bound from the loopBlock's If condition (the incrCond = incr < bound).
+	// This mirrors peelSPMDLoopSimple's guard extraction from the entry If.
+	// For rangeindex, entry ends with a Jump (not If), so we look at loopBlock's If.
+	loopBlockN := len(loopBlock.Instrs)
+	if loopBlockN == 0 {
+		panic("peelSPMDLoopRangeIndexUniformExit: loopBlock has no instructions")
+	}
+	loopBlockIf, ok := loopBlock.Instrs[loopBlockN-1].(*If)
+	if !ok {
+		panic("peelSPMDLoopRangeIndexUniformExit: loopBlock last instruction is not If")
+	}
+	if guardCond, ok2 := loopBlockIf.Cond.(*BinOp); ok2 && guardCond.Op == token.LSS {
+		typedBound = spmdTypedBound(guardCond.Y, intType)
+	}
+
+	notMaskConst := NewConst(constant.MakeInt64(int64(^(laneCount-1))), intType)
+	laneCountConst := NewConst(constant.MakeInt64(int64(laneCount)), intType)
+	zeroConst := NewConst(constant.MakeInt64(0), intType)
+
+	// Create new blocks.
+	mainLoopBlock := fn.newBasicBlock("spmd.main.loop")
+	mainBody := fn.newBasicBlock("spmd.main.body")
+	mainEarlyExit := fn.newBasicBlock("spmd.main.exit")
+	tailCheck := fn.newBasicBlock("spmd.tail.check")
+	tailBody := fn.newBasicBlock("spmd.tail.body")
+	tailEarlyExit := fn.newBasicBlock("spmd.tail.exit")
+
+	// --- Rewrite entry block ---
+	// entry ends with a Jump → loopBlock. Remove that Jump and the edge.
+	entryN := len(entry.Instrs)
+	if entryN == 0 {
+		panic("peelSPMDLoopRangeIndexUniformExit: entry block has no instructions")
+	}
+	entryJump, ok := entry.Instrs[entryN-1].(*Jump)
+	if !ok {
+		panic("peelSPMDLoopRangeIndexUniformExit: entry block last instruction is not Jump")
+	}
+	_ = entryJump
+
+	// Remove entry → loopBlock edge.
+	loopBlock.removePred(entry)
+	entry.Succs = entry.Succs[:0]
+	entry.Instrs = entry.Instrs[:entryN-1]
+
+	// Remove loopBlock → done edge (loopBlock's If had Succs=[body,done]).
+	// Save loopBlock→done phi edges before disconnecting.
+	donePhiLoopEdges := map[*Phi]Value{}
+	for _, instr := range done.phis() {
+		phi := instr.(*Phi)
+		for j, pred := range done.Preds {
+			if pred == loopBlock {
+				donePhiLoopEdges[phi] = phi.Edges[j]
+			}
+		}
+	}
+	done.removePred(loopBlock)
+
+	// Remove body → loopBlock edge. Body's If had Succs=[earlyExit, loopBlock].
+	loopBlock.removePred(body)
+
+	// Remove earlyExitBlock from done.Preds if it was a direct Jump→done.
+	if len(earlyExitBlock.Succs) == 1 && earlyExitBlock.Succs[0] == done {
+		done.removePred(earlyExitBlock)
+	}
+
+	// Build aligned-bound computation in entry.
+	alignedBound := &BinOp{Op: token.AND}
+	alignedBound.X = typedBound
+	alignedBound.Y = notMaskConst
+	alignedBound.setType(intType)
+	alignedBound.setBlock(entry)
+	entry.Instrs = append(entry.Instrs, alignedBound)
+	spmdAddReferrer(typedBound, alignedBound)
+	spmdAddReferrer(notMaskConst, alignedBound)
+
+	hasMain := &BinOp{Op: token.GTR}
+	hasMain.X = alignedBound
+	hasMain.Y = zeroConst
+	hasMain.setType(types.Typ[types.Bool])
+	hasMain.setBlock(entry)
+	entry.Instrs = append(entry.Instrs, hasMain)
+	spmdAddReferrer(alignedBound, hasMain)
+	spmdAddReferrer(zeroConst, hasMain)
+
+	entryIf := &If{Cond: hasMain}
+	entryIf.setBlock(entry)
+	entry.Instrs = append(entry.Instrs, entryIf)
+	spmdAddReferrer(hasMain, entryIf)
+	addEdge(entry, mainLoopBlock)
+	addEdge(entry, tailCheck)
+
+	// --- Populate mainLoopBlock ---
+	// Build mainIterPhi: phi [entry: 0, mainBody: mainIncr]
+	// Edges[1] (mainIncr) is filled after it's created.
+	mainIterPhi := &Phi{Comment: "spmd.main.iter"}
+	mainIterPhi.setType(intType)
+	mainIterPhi.Edges = []Value{zeroConst, nil}
+	spmdInsertPhiAtFront(mainLoopBlock, mainIterPhi)
+	spmdAddReferrer(zeroConst, mainIterPhi)
+
+	// Accumulator phis in mainLoopBlock.
+	mainAccPhis := make([]*Phi, len(loop.Accumulators))
+	mainLoopValueMap := map[Value]Value{loop.IterPhi: mainIterPhi}
+	for i, acc := range loop.Accumulators {
+		mainAccPhi := &Phi{Comment: "spmd.main.acc"}
+		mainAccPhi.setType(acc.Phi.Type())
+		mainAccPhi.Edges = []Value{acc.InitValue, nil}
+		spmdInsertPhiAtFront(mainLoopBlock, mainAccPhi)
+		spmdAddReferrer(acc.InitValue, mainAccPhi)
+		mainLoopValueMap[acc.Phi] = mainAccPhi
+		mainAccPhis[i] = mainAccPhi
+	}
+
+	// Build mainIncr = mainIterPhi + laneCount.
+	// mainLoopBlock is constructed entirely from scratch: phi + mainIncr + mainCond + If.
+	// We do NOT clone anything from loopBlock — loopBlock may contain ChangeType/Convert/UnOp
+	// instructions between the original IncrBinOp and the bound check, and cloning them
+	// would produce references to values in the now-unreachable loopBlock.  Instead,
+	// mainCond compares mainIncr directly against alignedBound (computed in entry), so no
+	// loopBlock instructions are needed here.
+	mainIncr := &BinOp{Op: token.ADD}
+	mainIncr.X = mainIterPhi
+	mainIncr.Y = laneCountConst
+	mainIncr.setType(intType)
+	mainIncr.setBlock(mainLoopBlock)
+	mainLoopBlock.Instrs = append(mainLoopBlock.Instrs, mainIncr)
+	spmdAddReferrer(mainIterPhi, mainIncr)
+	spmdAddReferrer(laneCountConst, mainIncr)
+
+	// mainCond = mainIncr < alignedBound.
+	// alignedBound is always the same integer type as iter, so no conversion needed.
+	mainCond := &BinOp{Op: token.LSS}
+	mainCond.X = mainIncr
+	mainCond.Y = alignedBound
+	mainCond.setType(types.Typ[types.Bool])
+	mainCond.setBlock(mainLoopBlock)
+	mainLoopBlock.Instrs = append(mainLoopBlock.Instrs, mainCond)
+	spmdAddReferrer(mainIncr, mainCond)
+	spmdAddReferrer(alignedBound, mainCond)
+
+	// If mainCond → mainBody, tailCheck.
+	mainLoopIf := &If{Cond: mainCond}
+	mainLoopIf.setBlock(mainLoopBlock)
+	mainLoopBlock.Instrs = append(mainLoopBlock.Instrs, mainLoopIf)
+	spmdAddReferrer(mainCond, mainLoopIf)
+	addEdge(mainLoopBlock, mainBody)
+	addEdge(mainLoopBlock, tailCheck)
+
+	// Fill in the back-edge of mainIterPhi now that mainBody is the predecessor.
+	// mainLoopBlock.Preds = [entry, mainBody] (addEdge order will be confirmed below).
+	// We fill mainIterPhi.Edges[1] = mainIncr AFTER wiring mainBody → mainLoopBlock.
+
+	// --- Populate mainBody ---
+	// The body block (rangeindex.body) accesses slice elements via IncrBinOp
+	// (the "incr = iter + laneCount" value from loopBlock). Since mainIterPhi
+	// starts at 0 and IncrBinOp in the original starts at 0 (first body visit
+	// with iter=-laneCount → incr=0), we map IncrBinOp → mainIterPhi so that
+	// body references to incrBinOp correctly use the current group's base index.
+	mainValueMap := map[Value]Value{
+		loop.IterPhi:   mainIterPhi,
+		loop.IncrBinOp: mainIterPhi,
+	}
+	// Copy all accumulator phi mappings from loopBlock map to body map.
+	for i, acc := range loop.Accumulators {
+		mainValueMap[acc.Phi] = mainAccPhis[i]
+	}
+
+	// Clone body instructions into mainBody.
+	spmdCloneBlock(fn, body, mainBody, mainValueMap)
+
+	// Wire mainBody's cloned uniform-exit If:
+	//   true  branch → mainEarlyExit
+	//   false branch → mainLoopBlock (continue loop)
+	bodyTermIf := body.Instrs[len(body.Instrs)-1].(*If)
+	mainBodyIf := &If{Cond: spmdTranslateValue(bodyTermIf.Cond, mainValueMap)}
+	mainBodyIf.setBlock(mainBody)
+	mainBody.Instrs = append(mainBody.Instrs, mainBodyIf)
+	spmdAddReferrer(mainBodyIf.Cond, mainBodyIf)
+	addEdge(mainBody, mainEarlyExit)
+	addEdge(mainBody, mainLoopBlock)
+
+	// Now wire mainLoopBlock ← mainBody back-edge:
+	// mainLoopBlock.Preds = [entry, mainBody] in addEdge order.
+	mainIterPhi.Edges[1] = mainIncr
+	spmdAddReferrer(mainIncr, mainIterPhi)
+
+	// Fill accumulator back-edges.
+	for i, acc := range loop.Accumulators {
+		backVal := spmdTranslateValue(acc.BackValue, mainValueMap)
+		mainAccPhis[i].Edges[1] = backVal
+		spmdAddReferrer(backVal, mainAccPhis[i])
+	}
+
+	// --- Populate mainEarlyExit ---
+	spmdCloneBlock(fn, earlyExitBlock, mainEarlyExit, mainValueMap)
+	spmdCloneTerminator(earlyExitBlock, mainEarlyExit, done, mainValueMap)
+
+	// --- Populate tailCheck ---
+	// tailIter = phi [entry: 0, mainLoopBlock: mainIterPhi]
+	// tailCheck.Preds = [entry, mainLoopBlock].
+	// When entry → tailCheck (no main loop, alignedBound == 0), tail starts at 0.
+	// When mainLoopBlock → tailCheck (main loop finished), tail starts at mainIterPhi
+	// which holds the first unprocessed group index (e.g., 1020 when bound=1024 and
+	// laneCount=4). Using mainIncr (= mainIterPhi + laneCount) would overshoot: it
+	// equals alignedBound at loop exit, so hasTail = alignedBound < bound is false
+	// and the tail is skipped even when bound is not a multiple of laneCount.
+	tailIterPhi := &Phi{Comment: "spmd.tail.iter"}
+	tailIterPhi.setType(intType)
+	tailIterPhi.Edges = []Value{zeroConst, mainIterPhi}
+	spmdInsertPhiAtFront(tailCheck, tailIterPhi)
+	spmdAddReferrer(zeroConst, tailIterPhi)
+	spmdAddReferrer(mainIterPhi, tailIterPhi)
+
+	// Accumulator phis in tailCheck.
+	tailAccPhis := make([]*Phi, len(loop.Accumulators))
+	// Map both IterPhi and IncrBinOp to tailIterPhi so body instructions that
+	// reference the original IncrBinOp (rangeindex's "incr = iter + laneCount"
+	// in loopBlock) use the peeled iter value instead of the unreachable original.
+	tailValueMap := map[Value]Value{
+		loop.IterPhi:   tailIterPhi,
+		loop.IncrBinOp: tailIterPhi,
+	}
+	for i, acc := range loop.Accumulators {
+		mainAccResult := spmdTranslateValue(acc.BackValue, mainValueMap)
+		tailAccPhi := &Phi{Comment: "spmd.tail.acc"}
+		tailAccPhi.setType(acc.Phi.Type())
+		tailAccPhi.Edges = []Value{acc.InitValue, mainAccResult}
+		spmdInsertPhiAtFront(tailCheck, tailAccPhi)
+		spmdAddReferrer(acc.InitValue, tailAccPhi)
+		spmdAddReferrer(mainAccResult, tailAccPhi)
+		tailValueMap[acc.Phi] = tailAccPhi
+		tailAccPhis[i] = tailAccPhi
+	}
+
+	// hasTail = tailIterPhi < typedBound.
+	hasTail := &BinOp{Op: token.LSS}
+	hasTail.X = tailIterPhi
+	hasTail.Y = typedBound
+	hasTail.setType(types.Typ[types.Bool])
+	hasTail.setBlock(tailCheck)
+	tailCheck.Instrs = append(tailCheck.Instrs, hasTail)
+	spmdAddReferrer(tailIterPhi, hasTail)
+	spmdAddReferrer(typedBound, hasTail)
+
+	// Determine tail exit target (trampoline needed when accumulators or done phis).
+	tailExitTarget := done
+	var trampoline *BasicBlock
+	if len(loop.Accumulators) > 0 || len(done.phis()) > 0 {
+		trampoline = fn.newBasicBlock("spmd.trampoline")
+		tailExitTarget = trampoline
+		loop.TrampolineBlock = trampoline
+	}
+
+	hasTailIf := &If{Cond: hasTail}
+	hasTailIf.setBlock(tailCheck)
+	tailCheck.Instrs = append(tailCheck.Instrs, hasTailIf)
+	spmdAddReferrer(hasTail, hasTailIf)
+	addEdge(tailCheck, tailBody)
+	addEdge(tailCheck, tailExitTarget)
+
+	// --- Populate tailBody ---
+	spmdCloneBlock(fn, body, tailBody, tailValueMap)
+
+	// Wire tailBody's cloned uniform-exit If:
+	//   true  branch → tailEarlyExit
+	//   false branch → tailExitTarget (done or trampoline, not back to loop)
+	tailBodyIf := &If{Cond: spmdTranslateValue(bodyTermIf.Cond, tailValueMap)}
+	tailBodyIf.setBlock(tailBody)
+	tailBody.Instrs = append(tailBody.Instrs, tailBodyIf)
+	spmdAddReferrer(tailBodyIf.Cond, tailBodyIf)
+	addEdge(tailBody, tailEarlyExit)
+	addEdge(tailBody, tailExitTarget)
+
+	// --- Populate tailEarlyExit ---
+	spmdCloneBlock(fn, earlyExitBlock, tailEarlyExit, tailValueMap)
+	spmdCloneTerminator(earlyExitBlock, tailEarlyExit, done, tailValueMap)
+
+	// --- Build trampoline when needed ---
+	if trampoline != nil {
+		accMergeMap := make(map[Value]Value, len(loop.Accumulators)*2)
+		for i, acc := range loop.Accumulators {
+			tailAccResult := spmdTranslateValue(acc.BackValue, tailValueMap)
+			mergePhi := &Phi{Comment: "spmd.acc.merge"}
+			mergePhi.setType(acc.Phi.Type())
+			// trampoline.Preds = [tailCheck, tailBody] (addEdge order).
+			mergePhi.Edges = []Value{tailAccPhis[i], tailAccResult}
+			spmdInsertPhiAtFront(trampoline, mergePhi)
+			spmdAddReferrer(tailAccPhis[i], mergePhi)
+			spmdAddReferrer(tailAccResult, mergePhi)
+			accMergeMap[acc.Phi] = mergePhi
+			accMergeMap[acc.BackValue] = mergePhi
+			// Dead region is {body, earlyExitBlock, loopBlock} — all become
+			// unreachable after peeling. Exclude all three so stale referrers
+			// aren't recorded on mergePhi.
+			spmdReplaceAccUsesMulti(acc.Phi, mergePhi, body, []*BasicBlock{earlyExitBlock}, loopBlock)
+		}
+
+		trampJump := &Jump{}
+		trampJump.setBlock(trampoline)
+		trampoline.Instrs = append(trampoline.Instrs, trampJump)
+		addEdge(trampoline, done)
+
+		// Wire done-block phis for the new trampoline predecessor.
+		// In rangeindex, the original done-predecessor was loopBlock (not body).
+		for _, instr := range done.phis() {
+			phi := instr.(*Phi)
+			loopEdge := donePhiLoopEdges[phi]
+			if mergeVal, ok3 := accMergeMap[loopEdge]; ok3 {
+				phi.Edges = append(phi.Edges, mergeVal)
+				spmdAddReferrer(mergeVal, phi)
+				continue
+			}
+			// Non-accumulator done-block phi: build tailCheck + trampoline merge phis.
+			entryEdge := donePhiLoopEdges[phi] // rangeindex: entry path through loopBlock
+			if entryEdge == nil {
+				entryEdge = loopEdge
+			}
+			mainLoopEdgeVal := spmdTranslateValue(loopEdge, mainLoopValueMap)
+			tailCheckPhi := &Phi{Comment: "spmd.done.acc"}
+			tailCheckPhi.setType(phi.Type())
+			tailCheckPhi.Edges = []Value{entryEdge, mainLoopEdgeVal}
+			spmdInsertPhiAtFront(tailCheck, tailCheckPhi)
+			spmdAddReferrer(entryEdge, tailCheckPhi)
+			spmdAddReferrer(mainLoopEdgeVal, tailCheckPhi)
+
+			tailBodyEdge := spmdTranslateValue(loopEdge, tailValueMap)
+			mergePhi := &Phi{Comment: "spmd.done.merge"}
+			mergePhi.setType(phi.Type())
+			mergePhi.Edges = []Value{tailCheckPhi, tailBodyEdge}
+			spmdInsertPhiAtFront(trampoline, mergePhi)
+			spmdAddReferrer(tailCheckPhi, mergePhi)
+			spmdAddReferrer(tailBodyEdge, mergePhi)
+
+			phi.Edges = append(phi.Edges, mergePhi)
+			spmdAddReferrer(mergePhi, phi)
+		}
+	}
+
+	// --- Update loop metadata ---
+	loop.IsPeeled = true
+	loop.MainBodyBlock = mainBody
+	loop.TailCheckBlock = tailCheck
+	loop.TailBodyBlock = tailBody
+	loop.BackEdgeBlock = mainLoopBlock
+	loop.AlignedBound = alignedBound
+	loop.MainIterPhi = mainIterPhi
+	loop.TailIterPhi = tailIterPhi
+	loop.BoundValue = typedBound
+}
+
+// spmdFirstChainOrBackEdge returns the first clone chain block if any, or the
+// back-edge block when the chain is empty (body connects directly to back-edge).
+func spmdFirstChainOrBackEdge(chain []*BasicBlock, backEdge *BasicBlock) *BasicBlock {
+	if len(chain) > 0 {
+		return chain[0]
+	}
+	return backEdge
+}
+
+// spmdCloneChainBlocks clones a sequence of straight-line chain blocks into
+// their corresponding target blocks, wiring each clone to the next. The last
+// clone's Jump points to finalDest (the cloned back-edge block).
+func spmdCloneChainBlocks(fn *Function, origChain, cloneChain []*BasicBlock,
+	finalDest *BasicBlock, valueMap map[Value]Value) {
+	for i, orig := range origChain {
+		dst := cloneChain[i]
+		spmdCloneBlock(fn, orig, dst, valueMap)
+
+		// Determine the successor of this clone: next chain block or finalDest.
+		var succ *BasicBlock
+		if i+1 < len(cloneChain) {
+			succ = cloneChain[i+1]
+		} else {
+			succ = finalDest
+		}
+		// Wire: emit a Jump to succ and add the CFG edge.
+		j := &Jump{}
+		j.setBlock(dst)
+		dst.Instrs = append(dst.Instrs, j)
+		addEdge(dst, succ)
+	}
+}
+
+// spmdCloneTerminator copies the terminator of srcBlock into dstBlock,
+// translating operand values through valueMap. For Return terminators, result
+// values are translated. For Jump-to-done terminators, the Jump targets done
+// directly without translation (done is the loop exit; it is already correct).
+// Panic terminators are not expected here and are left as-is.
+func spmdCloneTerminator(srcBlock, dstBlock, done *BasicBlock, valueMap map[Value]Value) {
+	if len(srcBlock.Instrs) == 0 {
+		return
+	}
+	switch term := srcBlock.Instrs[len(srcBlock.Instrs)-1].(type) {
+	case *Return:
+		newRet := &Return{}
+		newRet.Results = make([]Value, len(term.Results))
+		for i, r := range term.Results {
+			newRet.Results[i] = spmdTranslateValue(r, valueMap)
+			spmdAddReferrer(newRet.Results[i], newRet)
+		}
+		newRet.pos = term.pos
+		newRet.setBlock(dstBlock)
+		dstBlock.Instrs = append(dstBlock.Instrs, newRet)
+
+	case *Jump:
+		// A Jump in an exit block goes to done; keep targeting done.
+		j := &Jump{}
+		j.setBlock(dstBlock)
+		dstBlock.Instrs = append(dstBlock.Instrs, j)
+		addEdge(dstBlock, done)
+	}
+}
+
+// spmdReplaceAccUsesMulti is like spmdReplaceAccUses but excludes instructions
+// in any of the provided original loop body blocks (all about to become
+// unreachable after peeling). This is needed for shapeUniformExit where the
+// dead region spans body + chain blocks + backEdgeBlock.
+func spmdReplaceAccUsesMulti(oldPhi *Phi, newVal Value, body *BasicBlock, chainBlocks []*BasicBlock, backEdge *BasicBlock) {
+	// Build a set of excluded blocks for O(1) lookup.
+	excluded := map[*BasicBlock]bool{body: true, backEdge: true}
+	for _, cb := range chainBlocks {
+		excluded[cb] = true
+	}
+
+	pxrefs := oldPhi.Referrers()
+	if pxrefs == nil {
+		return
+	}
+	pyrefs := newVal.Referrers()
+	var remaining []Instruction
+	for _, instr := range *pxrefs {
+		if excluded[instr.Block()] {
+			remaining = append(remaining, instr)
+			continue
+		}
+		var rands []*Value
+		rands = instr.Operands(rands[:0])
+		for _, rand := range rands {
+			if rand != nil && *rand == Value(oldPhi) {
+				*rand = newVal
+			}
+		}
+		if pyrefs != nil {
+			*pyrefs = append(*pyrefs, instr)
+		}
+	}
+	*pxrefs = remaining
 }
 
 // spmdReplaceAccUses replaces uses of the original accumulator phi (oldPhi)
@@ -759,13 +1756,127 @@ func spmdBodyIsCloneable(block *BasicBlock) bool {
 		case *DebugRef, *Phi, *Jump, *If, *Return, *Panic:
 			// Skipped by spmdCloneBlock; always OK.
 		case *BinOp, *UnOp, *Store, *SPMDStore, *SPMDLoad, *SPMDSelect, *SPMDIndex,
-			*SPMDExtractMask, *IndexAddr, *FieldAddr, *Convert, *ChangeType, *Call, *Alloc:
+			*SPMDExtractMask, *IndexAddr, *FieldAddr, *Convert, *ChangeType, *Call, *Alloc,
+			*MakeInterface, *SPMDVectorFromMemory:
 			// Handled by spmdCloneBlock; OK.
 		default:
 			return false
 		}
 	}
 	return true
+}
+
+// loopBodyShape classifies the structure of an SPMD loop body.
+type loopBodyShape int
+
+const (
+	// shapeSimple: body block has exactly two successors, itself and done.
+	// This is the merged rangeint form; the existing fast path handles it.
+	shapeSimple loopBodyShape = iota
+
+	// shapeUniformExit: body ends with a uniform (non-varying) If; one
+	// successor is an exit block (Return or Jump to done), the other leads
+	// through zero or more cloneable chain blocks to a back-edge block whose
+	// If has Succs[0]==body and Succs[1]==done.
+	shapeUniformExit
+
+	// shapeUnpeelable: any other shape; peeling is skipped.
+	shapeUnpeelable
+)
+
+// spmdClassifyLoopBody inspects the successors of body and returns the loop
+// body shape. For shapeUniformExit it also returns:
+//   - exitBlock: the block reached when the uniform condition is true
+//     (either a Return block or a Jump-to-done block).
+//   - chainBlocks: zero or more intermediate blocks between the body's
+//     continuation successor and the back-edge block, in traversal order.
+//   - backEdge: the block whose If has Succs[0]==body and Succs[1]==done.
+//
+// All chainBlocks (and body itself) must pass spmdBodyIsCloneable.
+// exitBlock must either terminate with Return or contain a single Jump to done.
+func spmdClassifyLoopBody(body, done *BasicBlock) (shape loopBodyShape, exitBlock *BasicBlock, chainBlocks []*BasicBlock, backEdge *BasicBlock) {
+	// shapeSimple: body is its own back-edge.
+	if len(body.Succs) == 2 && body.Succs[0] == body && body.Succs[1] == done {
+		return shapeSimple, nil, nil, nil
+	}
+
+	// shapeUniformExit: body must end with a non-varying If with exactly two successors.
+	if len(body.Succs) != 2 {
+		return shapeUnpeelable, nil, nil, nil
+	}
+	bodyIf, ok := body.Instrs[len(body.Instrs)-1].(*If)
+	if !ok || bodyIf.IsVarying {
+		// Either no If terminator or a varying If — not a uniform exit.
+		return shapeUnpeelable, nil, nil, nil
+	}
+
+	// Determine which successor is the exit and which is the continuation.
+	// exitBlock must be a dedicated early-exit block: Return-terminated, or a
+	// single-Jump block to done. The done block itself is not a valid exitBlock
+	// because removing it from done.Preds would corrupt the loop structure.
+	// contStart is where the chain to the back-edge begins.
+	var contStart *BasicBlock
+	for _, succ := range [2]*BasicBlock{body.Succs[0], body.Succs[1]} {
+		other := body.Succs[0]
+		if succ == body.Succs[0] {
+			other = body.Succs[1]
+		}
+		// succ == done means the body's If exits directly to done — that is
+		// a direct break/continue, not an early-exit block that can be cloned.
+		if succ == done {
+			continue
+		}
+		if spmdIsExitBlock(succ, done) {
+			exitBlock = succ
+			contStart = other
+			break
+		}
+	}
+	if exitBlock == nil {
+		return shapeUnpeelable, nil, nil, nil
+	}
+
+	// Walk from contStart, collecting chain blocks, until we find the
+	// back-edge block (one whose If has Succs[0]==body and Succs[1]==done).
+	// Each intermediate block must have exactly one successor (be straight-line),
+	// and every block visited must pass spmdBodyIsCloneable.
+	//
+	// Limit the walk to avoid infinite loops in malformed CFGs; in practice
+	// the chain is at most a handful of blocks.
+	const maxChainLen = 16
+	cur := contStart
+	for i := 0; i < maxChainLen; i++ {
+		if !spmdBodyIsCloneable(cur) {
+			return shapeUnpeelable, nil, nil, nil
+		}
+		// Check if cur is the back-edge block.
+		if len(cur.Succs) == 2 && cur.Succs[0] == body && cur.Succs[1] == done {
+			backEdge = cur
+			return shapeUniformExit, exitBlock, chainBlocks, backEdge
+		}
+		// Must be a straight-line block to continue the chain.
+		if len(cur.Succs) != 1 {
+			return shapeUnpeelable, nil, nil, nil
+		}
+		chainBlocks = append(chainBlocks, cur)
+		cur = cur.Succs[0]
+	}
+	return shapeUnpeelable, nil, nil, nil
+}
+
+// spmdIsExitBlock reports whether block is an exit from the loop body:
+// either it terminates with a Return, or it is a single-instruction Jump to done.
+func spmdIsExitBlock(block, done *BasicBlock) bool {
+	if len(block.Instrs) == 0 {
+		return false
+	}
+	switch block.Instrs[len(block.Instrs)-1].(type) {
+	case *Return:
+		return true
+	case *Jump:
+		return len(block.Succs) == 1 && block.Succs[0] == done
+	}
+	return false
 }
 
 // spmdTypedBound returns a typed version of bound for use in integer arithmetic.
