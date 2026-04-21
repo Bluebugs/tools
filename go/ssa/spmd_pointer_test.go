@@ -101,3 +101,138 @@ func main() {
 		t.Error("no load (UnOp MUL) with result type Varying[int] found; expected one for pointPtr.X")
 	}
 }
+
+// TestSPMDVaryingPointerFieldAccess verifies that a field access through a
+// Varying[*Struct] value (a per-lane pointer vector) produces:
+//
+//  1. FieldAddr.Type() == Varying[*fieldType]  (vector of per-lane field addresses)
+//  2. UnOp(MUL).Type() == Varying[fieldType]   (gather-load of the field value)
+//
+// This is the mirror of TestSPMDPointerVaryingFieldAccess for the other
+// direction of pointer-varying (varying pointer rather than pointer to
+// varying).
+func TestSPMDVaryingPointerFieldAccess(t *testing.T) {
+	src := `package main
+
+import "lanes"
+
+type Point struct{ X, Y int }
+
+func accessFields(pointPtrs lanes.Varying[*Point]) lanes.Varying[int] {
+	return pointPtrs.X
+}
+
+func main() {
+	for i := range 16 {
+		_ = i
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+
+	fn := pkg.Func("accessFields")
+	if fn == nil {
+		t.Fatal("accessFields function not found in SSA")
+	}
+
+	var faddr *ssa.FieldAddr
+	var load *ssa.UnOp
+	for _, bb := range fn.Blocks {
+		for _, instr := range bb.Instrs {
+			switch v := instr.(type) {
+			case *ssa.FieldAddr:
+				faddr = v
+			case *ssa.UnOp:
+				if v.Op == token.MUL {
+					load = v
+				}
+			}
+		}
+	}
+	if faddr == nil {
+		t.Fatal("no FieldAddr found in accessFields")
+	}
+	if load == nil {
+		t.Fatal("no UnOp(MUL) load found in accessFields")
+	}
+
+	// FieldAddr on Varying[*Point] must produce Varying[*int].
+	sv, ok := faddr.Type().(*types.SPMDType)
+	if !ok {
+		t.Fatalf("FieldAddr.Type() = %s; want Varying[*int]", faddr.Type())
+	}
+	if _, ok := sv.Elem().(*types.Pointer); !ok {
+		t.Fatalf("FieldAddr.Type() inner = %s; want *int", sv.Elem())
+	}
+
+	// The load must produce Varying[int].
+	lsv, ok := load.Type().(*types.SPMDType)
+	if !ok {
+		t.Fatalf("UnOp(MUL).Type() = %s; want Varying[int]", load.Type())
+	}
+	if basic, ok := lsv.Elem().(*types.Basic); !ok || basic.Kind() != types.Int {
+		t.Fatalf("UnOp(MUL).Type() inner = %s; want int", lsv.Elem())
+	}
+}
+
+// TestSPMDVaryingPointerFieldStore verifies that a field assignment through a
+// Varying[*Struct] value produces a Store with:
+//
+//   - Addr operand Type() == Varying[*fieldType]  (per-lane addresses)
+//   - Val  operand Type() == Varying[fieldType]   (per-lane values)
+//
+// The backend is expected to lower this Store to a masked scatter.
+func TestSPMDVaryingPointerFieldStore(t *testing.T) {
+	src := `package main
+
+import "lanes"
+
+type Point struct{ X, Y int }
+
+func writeFields(pointPtrs lanes.Varying[*Point], v lanes.Varying[int]) {
+	pointPtrs.Y = v
+}
+
+func main() {
+	for i := range 16 {
+		_ = i
+	}
+}
+`
+	pkg := buildSSAWithSPMD(t, src)
+
+	fn := pkg.Func("writeFields")
+	if fn == nil {
+		t.Fatal("writeFields function not found in SSA")
+	}
+
+	var store *ssa.Store
+	for _, bb := range fn.Blocks {
+		for _, instr := range bb.Instrs {
+			if s, ok := instr.(*ssa.Store); ok {
+				store = s
+			}
+		}
+	}
+	if store == nil {
+		t.Fatal("no Store found in writeFields")
+	}
+
+	// Addr must be Varying[*int].
+	addrSv, ok := store.Addr.Type().(*types.SPMDType)
+	if !ok {
+		t.Fatalf("Store.Addr.Type() = %s; want Varying[*int]", store.Addr.Type())
+	}
+	if _, ok := addrSv.Elem().(*types.Pointer); !ok {
+		t.Fatalf("Store.Addr.Type() inner = %s; want *int", addrSv.Elem())
+	}
+
+	// Val must be Varying[int].
+	valSv, ok := store.Val.Type().(*types.SPMDType)
+	if !ok {
+		t.Fatalf("Store.Val.Type() = %s; want Varying[int]", store.Val.Type())
+	}
+	if basic, ok := valSv.Elem().(*types.Basic); !ok || basic.Kind() != types.Int {
+		t.Fatalf("Store.Val.Type() inner = %s; want int", valSv.Elem())
+	}
+}
