@@ -538,6 +538,12 @@ func emitCall(fn *Function, call *Call) Value {
 // a field; if it is the value of a struct, the result will be the
 // value of a field.
 func emitImplicitSelections(f *Function, v Value, indices []int, pos token.Pos) Value {
+	// NOTE: this function is not yet SPMD-aware. A base of type Varying[*S]
+	// (varying pointer vector) reaching here would hit typeparams.MustDeref,
+	// which does not handle SPMDType. Chained/nested varying-pointer field
+	// access (e.g., p.Inner.X where p: Varying[*Outer]) is out of scope per
+	// spec 2026-04-21-varying-pointer-field-access-design.md §1. If a future
+	// feature needs this, add an SPMDType branch mirroring emitFieldSelection.
 	for _, index := range indices {
 		if isPointerCore(v.Type()) {
 			fld := fieldOf(typeparams.MustDeref(v.Type()), index)
@@ -590,18 +596,18 @@ func isVaryingPtrStruct(t types.Type) bool {
 // Ident id is used for position and debug info.
 func emitFieldSelection(f *Function, v Value, index int, wantAddr bool, id *ast.Ident) Value {
 	if isPointerCore(v.Type()) {
-		var fieldAddrType types.Type
+		// Pointer-to-struct path: includes *S and *Varying[S].
+		var fld *types.Var
 		if isVaryingPtrStruct(v.Type()) {
 			// v has type *Varying[S]; deref gives Varying[S], whose Elem() is S.
-			// The field address is *Varying[fieldType] so that the subsequent load
-			// produces Varying[fieldType] rather than a bare scalar field type.
 			spmd := typeparams.MustDeref(v.Type()).(*types.SPMDType)
-			fld := fieldOf(spmd.Elem(), index)
-			fieldAddrType = types.NewPointer(types.NewVarying(fld.Type()))
+			fld = fieldOf(spmd.Elem(), index)
 		} else {
-			fld := fieldOf(typeparams.MustDeref(v.Type()), index)
-			fieldAddrType = types.NewPointer(fld.Type())
+			fld = fieldOf(typeparams.MustDeref(v.Type()), index)
 		}
+		// The field address is *Varying[fieldType] for *Varying[S], *fieldType otherwise.
+		// spmdFieldAddrResultType handles both cases.
+		fieldAddrType := spmdFieldAddrResultType(v.Type(), fld.Type())
 		instr := &FieldAddr{
 			X:     v,
 			Field: index,
@@ -612,6 +618,34 @@ func emitFieldSelection(f *Function, v Value, index int, wantAddr bool, id *ast.
 		// Load the field's value iff we don't want its address.
 		if !wantAddr {
 			v = emitLoad(f, v)
+		}
+	} else if sv, ok := v.Type().(*types.SPMDType); ok {
+		if ptr, ok := sv.Elem().(*types.Pointer); ok {
+			// v has type Varying[*S]: a per-lane pointer vector.
+			// Emit FieldAddr with result type Varying[*fieldT] so that the
+			// subsequent load produces Varying[fieldT] (scatter/gather path).
+			fld := fieldOf(ptr.Elem().Underlying(), index)
+			fieldAddrType := spmdFieldAddrResultType(v.Type(), fld.Type())
+			instr := &FieldAddr{
+				X:     v,
+				Field: index,
+			}
+			instr.setPos(id.Pos())
+			instr.setType(fieldAddrType)
+			v = f.emit(instr)
+			// Load the field's value iff we don't want its address.
+			if !wantAddr {
+				v = emitLoad(f, v)
+			}
+		} else {
+			fld := fieldOf(sv.Elem(), index)
+			instr := &Field{
+				X:     v,
+				Field: index,
+			}
+			instr.setPos(id.Pos())
+			instr.setType(fld.Type())
+			v = f.emit(instr)
 		}
 	} else {
 		fld := fieldOf(v.Type(), index)

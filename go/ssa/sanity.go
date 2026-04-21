@@ -218,11 +218,14 @@ func (s *sanity) checkInstr(idx int, instr Instruction) {
 		if !spmd.IsVaryingMask(instr.Mask.Type()) {
 			s.errorf("SPMDLoad: Mask must be Varying[mask], got %s", instr.Mask.Type())
 		}
-		if ptrType, ok := instr.Addr.Type().Underlying().(*types.Pointer); !ok {
+		// For Varying[*T] addr (scatter/gather), the element type is T wrapped in Varying.
+		// For *T or *Varying[T] addr (contiguous/masked-load), the element type is T or Varying[T].
+		addrElemTypeLoad := addrElemType(instr.Addr.Type())
+		if addrElemTypeLoad == nil {
 			s.errorf("SPMDLoad: Addr must be a pointer type, got %s", instr.Addr.Type())
-		} else if !types.Identical(instr.Type(), ptrType.Elem()) {
+		} else if !types.Identical(instr.Type(), addrElemTypeLoad) {
 			s.errorf("SPMDLoad: result type %s does not match Addr element type %s",
-				instr.Type(), ptrType.Elem())
+				instr.Type(), addrElemTypeLoad)
 		}
 		if instr.Contiguous && instr.Source == nil {
 			s.errorf("SPMDLoad: Contiguous is true but Source is nil")
@@ -238,11 +241,14 @@ func (s *sanity) checkInstr(idx int, instr Instruction) {
 		if !spmd.IsVaryingMask(instr.Mask.Type()) {
 			s.errorf("SPMDStore: Mask must be Varying[mask], got %s", instr.Mask.Type())
 		}
-		if ptrType, ok := instr.Addr.Type().Underlying().(*types.Pointer); !ok {
+		// For Varying[*T] addr (scatter), the element type is T wrapped in Varying.
+		// For *T or *Varying[T] addr (contiguous/masked-store), the element type is T or Varying[T].
+		addrElemTypeStore := addrElemType(instr.Addr.Type())
+		if addrElemTypeStore == nil {
 			s.errorf("SPMDStore: Addr must be a pointer type, got %s", instr.Addr.Type())
-		} else if !types.Identical(instr.Val.Type(), ptrType.Elem()) {
+		} else if !types.Identical(instr.Val.Type(), addrElemTypeStore) {
 			s.errorf("SPMDStore: Val type %s does not match Addr element type %s",
-				instr.Val.Type(), ptrType.Elem())
+				instr.Val.Type(), addrElemTypeStore)
 		}
 		if instr.Contiguous && instr.Source == nil {
 			s.errorf("SPMDStore: Contiguous is true but Source is nil")
@@ -859,4 +865,25 @@ func sanityCheckPackage(pkg *Package) {
 			panic(fmt.Sprintf("%s Pos=%d obj.Pos=%d", mem, mem.Pos(), obj.Pos()))
 		}
 	}
+}
+
+// addrElemType returns the element type that an SPMDLoad/SPMDStore expects
+// given the address type. It handles three shapes:
+//
+//   - *T or *Varying[T]  → T or Varying[T]  (normal contiguous/masked-vector address)
+//   - Varying[*T]        → Varying[T]        (scatter/gather per-lane pointer vector)
+//
+// Returns nil if t is not a recognised pointer-like type.
+func addrElemType(t types.Type) types.Type {
+	// Varying[*T] → Varying[T]
+	if sv, ok := t.(*types.SPMDType); ok {
+		if ptr, ok := sv.Elem().(*types.Pointer); ok {
+			return types.NewVarying(ptr.Elem())
+		}
+	}
+	// *T or *Varying[T] → T or Varying[T]
+	if ptr, ok := t.Underlying().(*types.Pointer); ok {
+		return ptr.Elem()
+	}
+	return nil
 }

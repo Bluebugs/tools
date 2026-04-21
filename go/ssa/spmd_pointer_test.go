@@ -206,33 +206,35 @@ func main() {
 		t.Fatal("writeFields function not found in SSA")
 	}
 
-	var store *ssa.Store
+	// Functions with varying parameters are predicated: the plain Store is
+	// converted to an SPMDStore by predicateSPMDFuncBody. Look for SPMDStore.
+	var spmdStore *ssa.SPMDStore
 	for _, bb := range fn.Blocks {
 		for _, instr := range bb.Instrs {
-			if s, ok := instr.(*ssa.Store); ok {
-				store = s
+			if s, ok := instr.(*ssa.SPMDStore); ok {
+				spmdStore = s
 			}
 		}
 	}
-	if store == nil {
-		t.Fatal("no Store found in writeFields")
+	if spmdStore == nil {
+		t.Fatal("no SPMDStore found in writeFields")
 	}
 
 	// Addr must be Varying[*int].
-	addrSv, ok := store.Addr.Type().(*types.SPMDType)
+	addrSv, ok := spmdStore.Addr.Type().(*types.SPMDType)
 	if !ok {
-		t.Fatalf("Store.Addr.Type() = %s; want Varying[*int]", store.Addr.Type())
+		t.Fatalf("SPMDStore.Addr.Type() = %s; want Varying[*int]", spmdStore.Addr.Type())
 	}
 	if _, ok := addrSv.Elem().(*types.Pointer); !ok {
-		t.Fatalf("Store.Addr.Type() inner = %s; want *int", addrSv.Elem())
+		t.Fatalf("SPMDStore.Addr.Type() inner = %s; want *int", addrSv.Elem())
 	}
 
 	// Val must be Varying[int].
-	valSv, ok := store.Val.Type().(*types.SPMDType)
+	valSv, ok := spmdStore.Val.Type().(*types.SPMDType)
 	if !ok {
-		t.Fatalf("Store.Val.Type() = %s; want Varying[int]", store.Val.Type())
+		t.Fatalf("SPMDStore.Val.Type() = %s; want Varying[int]", spmdStore.Val.Type())
 	}
 	if basic, ok := valSv.Elem().(*types.Basic); !ok || basic.Kind() != types.Int {
-		t.Fatalf("Store.Val.Type() inner = %s; want int", valSv.Elem())
+		t.Fatalf("SPMDStore.Val.Type() inner = %s; want int", valSv.Elem())
 	}
 }

@@ -10,6 +10,32 @@ import (
 	"go/types"
 )
 
+// spmdFieldAddrResultType returns the SSA-level type for a FieldAddr whose
+// base has type baseT and whose struct field has plain type fieldT.
+//
+//   - *Varying[S] base  → *Varying[fieldT]  (existing behavior; uniform ptr to varying struct).
+//   - Varying[*S] base  → Varying[*fieldT]  (new; per-lane pointer vector).
+//   - Otherwise         → *fieldT           (normal Go field-address).
+//
+// This mirrors the asymmetry between *Varying[T] and Varying[*T] at the
+// type-checker level (see go/types/call_ext_spmd.go spmdWrapFieldType).
+func spmdFieldAddrResultType(baseT, fieldT types.Type) types.Type {
+	// *Varying[S] base → *Varying[fieldT]
+	if ptr, ok := baseT.(*types.Pointer); ok {
+		if _, ok := ptr.Elem().(*types.SPMDType); ok {
+			return types.NewPointer(types.NewVarying(fieldT))
+		}
+	}
+	// Varying[*S] base → Varying[*fieldT]
+	if sv, ok := baseT.(*types.SPMDType); ok {
+		if _, ok := sv.Elem().(*types.Pointer); ok {
+			return types.NewVarying(types.NewPointer(fieldT))
+		}
+	}
+	// Normal Go.
+	return types.NewPointer(fieldT)
+}
+
 // exprHasSPMDType reports whether the AST expression e has or involves
 // *types.SPMDType. It checks the type-checker type first, then recurses
 // into sub-expressions for cases where conversions strip SPMDType

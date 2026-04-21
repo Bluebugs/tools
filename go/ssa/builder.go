@@ -1420,7 +1420,7 @@ func (b *builder) compLit(fn *Function, addr Value, e *ast.CompositeLit, isZero 
 				Field: fieldIndex,
 			}
 			faddr.setPos(pos)
-			faddr.setType(types.NewPointer(sf.Type()))
+			faddr.setType(spmdFieldAddrResultType(addr.Type(), sf.Type()))
 			fn.emit(faddr)
 			b.assign(fn, &address{addr: faddr, pos: pos, expr: e}, e, isZero, sb)
 		}
