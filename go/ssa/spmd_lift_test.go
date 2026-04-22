@@ -11,35 +11,14 @@ import (
 	"golang.org/x/tools/go/ssa"
 )
 
-// isVaryingElem reports whether t is a lanes.Varying[T] type, matching both
-// the *types.SPMDType representation (produced when GOEXPERIMENT=spmd is active
-// and the forked type-checker intercepts the lanes.Varying[T] type expression)
-// and the *types.Named representation (produced without GOEXPERIMENT, where
-// lanes.Varying[T] is a raw generic instantiation from the standard importer).
-func isVaryingElem(t types.Type) bool {
-	if _, ok := t.(*types.SPMDType); ok {
-		return true
-	}
-	if named, ok := t.(*types.Named); ok {
-		obj := named.Obj()
-		if obj.Name() == "Varying" && obj.Pkg() != nil && obj.Pkg().Path() == "lanes" {
-			return true
-		}
-	}
-	return false
-}
-
 // TestSPMDVaryingAllocaNotLifted verifies that a Varying[T] alloca
-// survives the SSA lift() pass — its Alloc instruction remains in the
-// function body so the SPMD predication pass can thread the active mask
-// into its Store instructions.
+// survives the SSA lift() pass — its Alloc, Store, and Load instructions
+// remain in the function body so the SPMD predication pass can thread
+// the active mask into them.
 //
 // Without this property, lift promotes the alloca to phi-nodes whose
 // edge values are computed unconditionally on inactive lanes — causing
 // NaN/Inf to leak through partial-mask go-for iterations.
-//
-// Note: the SPMDStore conversion (Store -> SPMDStore with mask) is
-// validated at the TinyGo LLVM IR layer in TestSPMDVaryingLocalMaskedInTail.
 func TestSPMDVaryingAllocaNotLifted(t *testing.T) {
 	// buildSPMDFuncBody builds SSA for a function with lanes.Varying[T]
 	// parameters (an SPMD function body). The type checker allows
@@ -70,23 +49,26 @@ func main() {}
 		t.Fatal("accumulate function not found in SSA")
 	}
 
-	// Verify the acc alloca survived lift: it must appear as *ssa.Alloc
-	// with a lanes.Varying[T] element (either *types.SPMDType when
-	// GOEXPERIMENT=spmd is active, or *types.Named for lanes.Varying[T]
-	// when the standard importer treats it as a generic instantiation).
 	var gotAlloc bool
+	var gotSPMDStore bool
 	for _, bb := range fn.Blocks {
 		for _, instr := range bb.Instrs {
 			if alloc, ok := instr.(*ssa.Alloc); ok {
 				if ptr, ok := alloc.Type().Underlying().(*types.Pointer); ok {
-					if isVaryingElem(ptr.Elem()) {
+					if _, ok := ptr.Elem().(*types.SPMDType); ok {
 						gotAlloc = true
 					}
 				}
 			}
+			if _, ok := instr.(*ssa.SPMDStore); ok {
+				gotSPMDStore = true
+			}
 		}
 	}
 	if !gotAlloc {
-		t.Fatal("varying alloca was lifted; expected memory-backed *ssa.Alloc with Varying[T] element in function body")
+		t.Fatal("varying alloca was lifted; expected memory-backed *ssa.Alloc with SPMDType element in function body")
+	}
+	if !gotSPMDStore {
+		t.Fatal("no *ssa.SPMDStore found; predication pass didn't see a surviving Store")
 	}
 }
