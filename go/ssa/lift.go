@@ -41,6 +41,7 @@ package ssa
 import (
 	"fmt"
 	"go/token"
+	"go/types"
 	"math/big"
 	"os"
 	"slices"
@@ -394,12 +395,40 @@ type newPhi struct {
 // must be prepended to the block.
 type newPhiMap map[*BasicBlock][]newPhi
 
+// isLanesVaryingType reports whether t is a lanes.Varying[T] type, either as
+// *types.SPMDType (created by GOEXPERIMENT=spmd type-checker interception) or as
+// *types.Named with Obj().Name()=="Varying" in package "lanes" (the raw generic
+// instantiation stored on types.Var objects and local alloca types).
+func isLanesVaryingType(t types.Type) bool {
+	if _, ok := t.(*types.SPMDType); ok {
+		return true
+	}
+	if named, ok := t.(*types.Named); ok {
+		obj := named.Obj()
+		if obj.Name() == "Varying" && obj.Pkg() != nil && obj.Pkg().Path() == "lanes" {
+			return true
+		}
+	}
+	return false
+}
+
 // liftAlloc determines whether alloc can be lifted into registers,
 // and if so, it populates newPhis with all the φ-nodes it may require
 // and returns true.
 //
 // fresh is a source of fresh ids for phi nodes.
 func liftAlloc(df domFrontier, alloc *Alloc, newPhis newPhiMap, fresh *int) bool {
+	// SPMD: keep varying allocas memory-backed so the SPMD predication
+	// pass can thread the current active mask into their writebacks.
+	// Without this, lift promotes them to phi-nodes whose edge values
+	// are computed unconditionally on inactive lanes — causing NaN/Inf
+	// to leak through partial-mask go-for iterations.
+	if ptr, ok := alloc.Type().Underlying().(*types.Pointer); ok {
+		if isLanesVaryingType(ptr.Elem()) {
+			return false
+		}
+	}
+
 	// Don't lift result values in functions that defer
 	// calls that may recover from panic.
 	if fn := alloc.Parent(); fn.Recover != nil {
