@@ -672,18 +672,6 @@ type Alloc struct {
 	Comment string
 	Heap    bool
 	index   int // dense numbering; for lifting
-
-	// SPMDLaneCount, when non-zero, records the lane count of the SPMD
-	// loop whose scope contains this alloca and whose element type is
-	// lanes.Varying[T]. Set by the SPMD predication pass
-	// (spmdConvertLoopOps) on allocas whose Type().(*types.Pointer)
-	// element is *types.SPMDType. Read by TinyGo during alloca-type
-	// materialization to size the alloca's element as
-	// llvm.VectorType(elem, SPMDLaneCount) — matching the surrounding
-	// SPMD loop's iteration width rather than the type's natural width.
-	// Zero means unset; back-end falls back to its existing lane-count
-	// derivation (typically spmdMinLaneCount).
-	SPMDLaneCount int
 }
 
 // The Phi instruction represents an SSA φ-node, which combines values

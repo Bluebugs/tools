@@ -41,7 +41,6 @@ package ssa
 import (
 	"fmt"
 	"go/token"
-	"go/types"
 	"math/big"
 	"os"
 	"slices"
@@ -395,40 +394,12 @@ type newPhi struct {
 // must be prepended to the block.
 type newPhiMap map[*BasicBlock][]newPhi
 
-// isLanesVaryingType reports whether t is a lanes.Varying[T] type. Matches
-// both *types.SPMDType (the production representation when GOEXPERIMENT=spmd
-// is active and the forked type-checker intercepts lanes.Varying[T]) and the
-// raw *types.Named instantiation produced when the standard importer reads
-// lanes.Varying[T] without GOEXPERIMENT.
-func isLanesVaryingType(t types.Type) bool {
-	if _, ok := t.(*types.SPMDType); ok {
-		return true
-	}
-	if named, ok := t.(*types.Named); ok {
-		obj := named.Obj()
-		if obj.Name() == "Varying" && obj.Pkg() != nil && obj.Pkg().Path() == "lanes" {
-			return true
-		}
-	}
-	return false
-}
-
 // liftAlloc determines whether alloc can be lifted into registers,
 // and if so, it populates newPhis with all the φ-nodes it may require
 // and returns true.
 //
 // fresh is a source of fresh ids for phi nodes.
 func liftAlloc(df domFrontier, alloc *Alloc, newPhis newPhiMap, fresh *int) bool {
-	// SPMD: keep varying allocas memory-backed so the SPMD predication pass
-	// can annotate them with the surrounding loop's lane count (see
-	// SPMDLaneCount field on *Alloc) and TinyGo can materialize the element
-	// type at the correct vector width.
-	if ptr, ok := alloc.Type().(*types.Pointer); ok {
-		if isLanesVaryingType(ptr.Elem()) {
-			return false
-		}
-	}
-
 	// Don't lift result values in functions that defer
 	// calls that may recover from panic.
 	if fn := alloc.Parent(); fn.Recover != nil {

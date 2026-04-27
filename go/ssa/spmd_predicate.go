@@ -291,45 +291,6 @@ func spmdDetectGatherGroups(fn *Function, loop *SPMDLoopInfo, scopeBlocks map[*B
 // function blocks (post-peeling) by BFS from the loop/body blocks. Because
 // deleteUnreachableBlocks has already run, any unreachable cloned blocks are gone.
 // The BFS correctly enumerates only live scope blocks.
-
-// spmdAnnotateAllocaLaneCount annotates every lanes.Varying[T] alloca in fn
-// with laneCount via the *Alloc.SPMDLaneCount field. TinyGo reads this
-// annotation during alloca-type materialization to emit the correct vector
-// width, matching the surrounding SPMD loop's iteration width rather than
-// the alloca's element-type's register-natural width.
-//
-// The walk scans all blocks of fn rather than just the loop's live scope
-// blocks because SSA construction places all local allocas in the entry
-// block (block 0), which is never inside any loop's live scope (the live
-// scope is bounded between loop.BodyBlock/loop.LoopBlock and loop.DoneBlock).
-//
-// The `alloc.SPMDLaneCount == 0` guard implements outer-loop-wins semantics:
-// once an enclosing loop's predication has annotated an alloca, an inner
-// loop's pass leaves it alone. This matches the typical case where an alloca
-// declared above a `go for` is owned by that outer scope. The latent
-// limitation for sibling SPMD loops with different lane counts sharing one
-// alloca is documented as a deferred risk in the v3 design spec.
-func spmdAnnotateAllocaLaneCount(fn *Function, laneCount int) {
-	for _, b := range fn.Blocks {
-		for _, instr := range b.Instrs {
-			alloc, ok := instr.(*Alloc)
-			if !ok {
-				continue
-			}
-			ptr, ok := alloc.Type().(*types.Pointer)
-			if !ok {
-				continue
-			}
-			if !isLanesVaryingType(ptr.Elem()) {
-				continue
-			}
-			if alloc.SPMDLaneCount == 0 {
-				alloc.SPMDLaneCount = laneCount
-			}
-		}
-	}
-}
-
 func spmdConvertLoopOps(fn *Function) {
 	if len(fn.SPMDLoops) == 0 {
 		return
@@ -391,8 +352,6 @@ func spmdConvertLoopOps(fn *Function) {
 		if len(liveScopeBlocks) == 0 {
 			continue
 		}
-
-		spmdAnnotateAllocaLaneCount(fn, loop.LaneCount)
 
 		if loop.IsPeeled {
 			// Create tail mask virtual parameter for the tail phase.
