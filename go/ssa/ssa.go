@@ -535,6 +535,17 @@ type BasicBlock struct {
 	dom          domInfo        // dominator tree info
 	gaps         int            // number of nil Instrs (transient)
 	rundefers    int            // number of rundefers (transient)
+
+	// SPMDLaneCount, when non-zero, is the canonical lane count for every
+	// *types.SPMDType value materialized inside this block. Set by the SPMD
+	// predication pass (spmdConvertLoopOps) for blocks in a `go for` loop's
+	// scope, by the per-call specialization pass for blocks in a specialized
+	// SPMD function variant, and by the forward-propagation pass for entry
+	// blocks of non-SPMD functions whose allocas feed in-loop SPMD ops.
+	// TinyGo reads this field during type materialization, alloca sizing,
+	// and every other lane-count derivation; when 0, TinyGo falls back to
+	// its existing element-natural / function-min derivations.
+	SPMDLaneCount int
 }
 
 // Pure values ----------------------------------------

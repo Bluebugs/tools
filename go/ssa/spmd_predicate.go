@@ -353,6 +353,18 @@ func spmdConvertLoopOps(fn *Function) {
 			continue
 		}
 
+		// Annotate every in-scope block with the loop's canonical lane count.
+		// TinyGo reads bb.SPMDLaneCount for ALL Varying[T] lane-count
+		// derivations inside the block (type materialization, alloca sizing,
+		// gather/scatter widths, reduce dispatch, mask widths). The
+		// `bb.SPMDLaneCount == 0` guard preserves an outer loop's annotation
+		// when an inner loop's predication revisits the same block.
+		for b := range liveScopeBlocks {
+			if b.SPMDLaneCount == 0 {
+				b.SPMDLaneCount = loop.LaneCount
+			}
+		}
+
 		if loop.IsPeeled {
 			// Create tail mask virtual parameter for the tail phase.
 			if loop.TailMask == nil {
