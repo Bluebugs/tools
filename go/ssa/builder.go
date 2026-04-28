@@ -3329,15 +3329,13 @@ func (prog *Program) Build() {
 	}
 	wg.Wait()
 
-	// SPMD v4.1 (deferred): per-call specialization pass disabled. The pass
-	// (in spmd_specialize.go) was implemented but TinyGo emission of cloned
-	// SPMD function variants triggers a SIGSEGV in DI metadata generation
-	// for the cloned parameters. The block-annotation half of v4 (predication,
-	// propagation, TinyGo block-aware materialization) works correctly
-	// without it. Re-enable once TinyGo's parameter metadata for cloned
-	// functions is fixed (see v4 design spec §3.6).
-	//
-	// _ = spmdSpecializeFunctions(prog)
+	// SPMD v4: specialize SPMD functions per call-site lane count.
+	// Runs after all packages have finished building so all SPMD passes
+	// (predication, propagation) have populated block annotations.
+	// If specialization fails (should not happen for valid SPMD programs),
+	// the error is silently swallowed — TinyGo's downstream emission will
+	// produce a clear error if the program is left in an inconsistent state.
+	_ = spmdSpecializeFunctions(prog)
 }
 
 // cpuLimit is a counting semaphore to limit CPU parallelism.
@@ -3371,15 +3369,12 @@ func (p *Package) build() {
 	p.files = nil
 	p.initVersion = nil
 
-	// SPMD v4.1 (deferred): per-call specialization pass disabled. The pass
-	// (in spmd_specialize.go) was implemented but TinyGo emission of cloned
-	// SPMD function variants triggers a SIGSEGV in DI metadata generation
-	// for the cloned parameters. The block-annotation half of v4 (predication,
-	// propagation, TinyGo block-aware materialization) works correctly
-	// without it. Re-enable once TinyGo's parameter metadata for cloned
-	// functions is fixed (see v4 design spec §3.6).
-	//
-	// _ = spmdSpecializePackage(p)
+	// SPMD v4: specialize SPMD functions per call-site lane count.
+	// Runs here for the ssautil.BuildPackage path (which calls p.Build()
+	// directly without calling prog.Build()). This call only operates on
+	// functions within p itself to avoid races with other goroutines that
+	// may be building other packages concurrently.
+	_ = spmdSpecializePackage(p)
 
 	if p.Prog.mode&SanityCheckFunctions != 0 {
 		sanityCheckPackage(p)

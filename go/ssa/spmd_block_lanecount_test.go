@@ -159,7 +159,6 @@ func main() {
 // (e.g., sum.spmd2 and sum.spmd4) with each variant's blocks annotated
 // to the variant's lane count.
 func TestSPMDSpecializationCloneVariants(t *testing.T) {
-	t.Skip("SPMD v4.1 deferred: specialization pass disabled pending TinyGo cloned-variant emission fix")
 	src := `package main
 
 import "lanes"
@@ -214,7 +213,6 @@ func main() {
 // the call sites in annotated blocks point to the specialized variant,
 // not the original function.
 func TestSPMDSpecializationRewriteCallSites(t *testing.T) {
-	t.Skip("SPMD v4.1 deferred: specialization pass disabled pending TinyGo cloned-variant emission fix")
 	src := `package main
 
 import "lanes"
@@ -256,7 +254,6 @@ func main() {
 // called from exactly one lane count is renamed in place (single variant)
 // rather than cloned.
 func TestSPMDSpecializationSingleLaneShortcut(t *testing.T) {
-	t.Skip("SPMD v4.1 deferred: specialization pass disabled pending TinyGo cloned-variant emission fix")
 	src := `package main
 
 import "lanes"
