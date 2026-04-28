@@ -429,12 +429,6 @@ func (f *Function) finishBody() {
 		// Runs after peeling and cleanup so peeled blocks (spmd.main.body,
 		// spmd.tail.body) are live and original unreachable blocks are gone.
 		spmdConvertLoopOps(f)
-		// SPMD v4: propagate loop-scope lane counts to entry-block allocas
-		// whose consumers are inside annotated blocks. Runs AFTER
-		// spmdConvertLoopOps (so SPMDLoad/SPMDStore exist and loop blocks are
-		// annotated) and BEFORE specialization (so specialization sees the
-		// propagated annotations).
-		spmdPropagateBlockLaneCount(f)
 	}
 	if len(f.SPMDLoops) == 0 && hasSPMDParams(f) {
 		// Create the implicit mask parameter for this SPMD function body.
