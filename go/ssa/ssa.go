@@ -1894,6 +1894,30 @@ func (v *register) Referrers() *[]Instruction { return &v.referrers }
 func (v *register) Pos() token.Pos            { return v.pos }
 func (v *register) setPos(pos token.Pos)      { v.pos = pos }
 
+// setSPMDValueType mutates v's underlying type via the register mix-in's
+// setType. Used ONLY by the SPMD predication pass to rewrite a Varying
+// value's type from the type-checker's abstract Varying[T] (lanes=0) to
+// a width-fixed Varying[T]_N (lanes=N) where N is the surrounding SPMD
+// loop's canonical lane count.
+//
+// TinyGo reads the new type via getLLVMType to materialize the LLVM
+// vector at the correct width. This avoids the need for side-channel
+// annotations and downstream "consult the annotation" patches at every
+// TinyGo materialization site.
+//
+// Returns true if v embedded *register and the type was set; false
+// otherwise. Not part of the public SSA API.
+func setSPMDValueType(v Value, t types.Type) bool {
+	type setter interface {
+		setType(types.Type)
+	}
+	if s, ok := v.(setter); ok {
+		s.setType(t)
+		return true
+	}
+	return false
+}
+
 func (v *anInstruction) Parent() *Function          { return v.block.parent }
 func (v *anInstruction) Block() *BasicBlock         { return v.block }
 func (v *anInstruction) setBlock(block *BasicBlock) { v.block = block }

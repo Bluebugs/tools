@@ -212,6 +212,11 @@ func spmdCloneBlock(fn *Function, srcBlock *BasicBlock, dstBlock *BasicBlock,
 			dstBlock.Instrs = append(dstBlock.Instrs, newInstr)
 			valueMap[v] = newInstr
 			// Alloc has no input operands to register referrers for.
+			// Non-heap allocas must appear in fn.Locals so the sanity
+			// checker and lift pass see them as frame-allocated variables.
+			if !newInstr.Heap {
+				fn.Locals = append(fn.Locals, newInstr)
+			}
 
 		case *MakeInterface:
 			newInstr := &MakeInterface{SPMDLanes: v.SPMDLanes}
