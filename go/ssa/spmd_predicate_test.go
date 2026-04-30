@@ -1164,16 +1164,13 @@ func main() { f(make([]int, 16)) }
 	// Count SPMDStore and SPMDSelect instructions.
 	// Before store-merge: 4 stores (one per case/default).
 	// After store-merge: 1 store + 3 SPMDSelects (chained).
-	// Exclude stores to Alloc addresses (v5 lift guard bookkeeping).
 	spmdStoreCount := 0
 	spmdSelectCount := 0
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
-			switch st := instr.(type) {
+			switch instr.(type) {
 			case *ssa.SPMDStore:
-				if _, isAlloca := st.Addr.(*ssa.Alloc); !isAlloca {
-					spmdStoreCount++
-				}
+				spmdStoreCount++
 			case *ssa.SPMDSelect:
 				spmdSelectCount++
 			}
@@ -1395,8 +1392,6 @@ func main() { f(make([]int, 16)) }
 	// After store-merge: the 3 per-case stores (300, 200, 100) to dst[i] are
 	// collapsed into 1 SPMDStore with 2 chained SPMDSelects.
 	// Verify mask correctness on surviving SPMDStores.
-	// Exclude stores to Alloc addresses (v5 lift guard bookkeeping stores
-	// for iter-phi allocas — not case body data stores).
 	spmdStoreCount := 0
 	badMaskCount := 0
 	for _, block := range fn.Blocks {
@@ -1404,9 +1399,6 @@ func main() { f(make([]int, 16)) }
 			st, ok := instr.(*ssa.SPMDStore)
 			if !ok {
 				continue
-			}
-			if _, isAlloca := st.Addr.(*ssa.Alloc); isAlloca {
-				continue // bookkeeping store, skip
 			}
 			spmdStoreCount++
 			if !spmd.IsVaryingMask(st.Mask.Type()) {
@@ -2011,22 +2003,14 @@ func f(dst []int) {
 		t.Fatal("function f not found")
 	}
 
-	// After predication, the if-body's Phi merge is implemented via the v5
-	// lift guard's alloca-mediated pattern: the if-body writes to the result
-	// alloca with a narrowed mask (& condition), and the merge block reads back
-	// via spmd_load. This is semantically equivalent to SPMDSelect.
-	// For if-without-else, there is no &^ (inverted) mask — the else branch
-	// simply doesn't write; the alloca retains its pre-if value.
+	// After predication, the Phi at the merge block should be replaced
+	// with an SPMDSelect. Check that at least one SPMDSelect exists.
 	var buf bytes.Buffer
 	ssa.WriteFunction(&buf, fn)
 	output := buf.String()
 
-	if !strings.Contains(output, "spmd_store") {
-		t.Error("expected spmd_store on the result alloca for the linearized if-without-else")
-		t.Logf("SSA output:\n%s", output)
-	}
-	if !strings.Contains(output, "spmd_load") {
-		t.Error("expected spmd_load on the result alloca at the merge point")
+	if !strings.Contains(output, "spmd_select") {
+		t.Error("expected SPMDSelect in output for if-without-else && chain with Phi merge")
 		t.Logf("SSA output:\n%s", output)
 	}
 
@@ -2063,20 +2047,14 @@ func f(dst []int) {
 		t.Fatal("function f not found")
 	}
 
-	// After predication, the if-body's Phi merge is implemented via the v5
-	// lift guard's alloca-mediated pattern: the if-body writes to the result
-	// alloca with a narrowed mask (& condition), and the merge block reads back
-	// via spmd_load. For if-without-else there is no &^ (inverted mask).
+	// After predication, the Phi at the merge block should be replaced
+	// with an SPMDSelect. Check that at least one SPMDSelect exists.
 	var buf bytes.Buffer
 	ssa.WriteFunction(&buf, fn)
 	output := buf.String()
 
-	if !strings.Contains(output, "spmd_store") {
-		t.Error("expected spmd_store on the result alloca for the linearized if-without-else || chain")
-		t.Logf("SSA output:\n%s", output)
-	}
-	if !strings.Contains(output, "spmd_load") {
-		t.Error("expected spmd_load on the result alloca at the merge point")
+	if !strings.Contains(output, "spmd_select") {
+		t.Error("expected SPMDSelect in output for if-without-else || chain with Phi merge")
 		t.Logf("SSA output:\n%s", output)
 	}
 
@@ -2386,18 +2364,9 @@ func main() {}
 		t.Errorf("expected Varying[mask] instructions from break mask computation:\n%s", output)
 	}
 
-	// With the v5 lift guard, the break result update is alloca-mediated:
-	// the break body writes to the result alloca with a narrowed mask (&^),
-	// and the merge/post-loop reads back via spmd_load. This is semantically
-	// equivalent to the older SPMDSelect-based approach.
-	if !strings.Contains(output, "&^") {
-		t.Errorf("expected mask narrowing via &^ for break result update:\n%s", output)
-	}
-	if !strings.Contains(output, "spmd_store") {
-		t.Errorf("expected spmd_store for break result alloca update:\n%s", output)
-	}
-	if !strings.Contains(output, "spmd_load") {
-		t.Errorf("expected spmd_load for break result alloca read:\n%s", output)
+	// Verify SPMDSelect for break result is present.
+	if !strings.Contains(output, "spmd_select") {
+		t.Errorf("expected spmd_select for break result selection:\n%s", output)
 	}
 
 	// Verify the original If is gone (replaced by Jump).
@@ -2454,23 +2423,25 @@ func main() {}
 		t.Fatal("rangeint.done block not found")
 	}
 
-	// With the v5 lift guard, the break result is accumulated in an alloca
-	// rather than via SPMDSelect. The done block's phi (if any) may have an
-	// SPMDLoad edge (reading the result alloca) or the function may read the
-	// alloca directly. Either way the output must contain spmd_store and
-	// spmd_load instructions reflecting the alloca-mediated accumulation.
-	var buf bytes.Buffer
-	ssa.WriteFunction(&buf, fn)
-	output := buf.String()
-
-	if !strings.Contains(output, "spmd_store") {
-		t.Errorf("expected spmd_store for break result alloca update, SSA:\n%s", output)
+	// The done block should have a result phi whose loop-exit edge is an
+	// SPMDSelect (the accumulated break result).
+	// After transformation, the result phi should be phi [entry: v, loop_exit: spmd_select].
+	foundSPMDSelectEdge := false
+	for _, instr := range doneBlock.Instrs {
+		phi, ok := instr.(*ssa.Phi)
+		if !ok {
+			break
+		}
+		for _, edge := range phi.Edges {
+			if _, ok := edge.(*ssa.SPMDSelect); ok {
+				foundSPMDSelectEdge = true
+			}
+		}
 	}
-	if !strings.Contains(output, "spmd_load") {
-		t.Errorf("expected spmd_load for break result alloca read, SSA:\n%s", output)
-	}
-	if !strings.Contains(output, "&^") {
-		t.Errorf("expected mask narrowing via &^ in break result update, SSA:\n%s", output)
+	if !foundSPMDSelectEdge {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Errorf("expected SPMDSelect as a phi edge at done block, SSA:\n%s", buf.String())
 	}
 }
 
@@ -2577,28 +2548,9 @@ func main() {}
 		t.Errorf("varying If was not linearized by predicateSPMDFuncBody:\n%s", output)
 	}
 
-	// With the v5 lift guard, lanes.Varying[T] allocas are preserved as memory-
-	// backed locals rather than being lifted to phi nodes. The if/else merge is
-	// therefore alloca-mediated: each branch writes to the result alloca via
-	// spmd_store with a branch-specific mask, and the merge block reads the
-	// combined value via spmd_load. This is semantically equivalent to
-	// (and downstream-compatible with) the older phi→SPMDSelect lowering:
-	// load-blend-store on each branch naturally combines disjoint masks in
-	// memory; TinyGo's createSPMDStore implements load-blend-store, and
-	// createSPMDLoad reads the merged result.
-	//
-	// Required shape: at least one branch's spmd_store must use a narrowed
-	// mask (mask & cond) and another must use the inverted mask (mask &^ cond)
-	// — i.e. the conjunction "& " and the bit-clear "&^" patterns must both
-	// appear in the dumped function.
-	if !strings.Contains(output, "&^") {
-		t.Errorf("expected mask narrowing via &^ for else-branch spmd_store after linearization:\n%s", output)
-	}
-	if !strings.Contains(output, "spmd_store") {
-		t.Errorf("expected spmd_store on the result alloca for the linearized if/else:\n%s", output)
-	}
-	if !strings.Contains(output, "spmd_load") {
-		t.Errorf("expected spmd_load on the result alloca at the if/else merge:\n%s", output)
+	// predicateSPMDFuncBody rewrites the merge phi to an SPMDSelect.
+	if !strings.Contains(output, "spmd_select") {
+		t.Errorf("expected spmd_select for if/else merge:\n%s", output)
 	}
 
 	// Mask computation instructions must be present.
@@ -2662,41 +2614,46 @@ func main() {}
 		t.Fatal("rangeint.body (loop header) block not found")
 	}
 
-	// With the v5 lift guard, "result" is kept as a varying alloca rather than
-	// being lifted to a Phi. The break result accumulation is alloca-mediated:
-	// the break body writes to the result alloca (spmd_store), and the post-loop
-	// code reads the accumulated value back (spmd_load). There is no explicit
-	// "spmd.break.accum" phi because the alloca itself carries state across
-	// iterations via the load-blend-store semantics of spmd_store.
-	//
-	// We verify: (a) the break mask phi is still present at the loop header,
-	// and (b) the output contains spmd_store + spmd_load patterns for the
-	// alloca-mediated accumulation.
-	foundBreakMaskPhi := false
+	// The loop header must contain an "spmd.break.accum" phi.
+	// This phi carries the accumulated break result across iterations, ensuring
+	// the SPMDSelect's Y operand is the prior accumulated result rather than
+	// the static default (normVal).
+	foundAccumPhi := false
 	for _, instr := range loopBlock.Instrs {
 		phi, ok := instr.(*ssa.Phi)
 		if !ok {
-			break // phis are at the front; stop at first non-phi
+			break // phis are always at the front; stop at first non-phi
 		}
-		if strings.Contains(phi.Comment, "spmd.break.mask") {
-			foundBreakMaskPhi = true
+		if strings.Contains(phi.Comment, "spmd.break.accum") {
+			foundAccumPhi = true
 			break
 		}
 	}
-	if !foundBreakMaskPhi {
+	if !foundAccumPhi {
 		var buf bytes.Buffer
 		ssa.WriteFunction(&buf, fn)
-		t.Errorf("expected spmd.break.mask phi at loop header, SSA:\n%s", buf.String())
+		t.Errorf("expected spmd.break.accum phi at loop header for cross-iteration accumulation, SSA:\n%s", buf.String())
 	}
 
-	var buf bytes.Buffer
-	ssa.WriteFunction(&buf, fn)
-	output := buf.String()
-	if !strings.Contains(output, "spmd_store") {
-		t.Errorf("expected spmd_store for break result alloca update, SSA:\n%s", output)
+	// The SPMDSelect's Y operand must reference the accumulator phi, NOT the
+	// static default (normVal). Verify by checking that the SPMDSelect inside
+	// the loop body has a phi (not a Const) as its Y operand.
+	foundSPMDSelectWithPhiY := false
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			sel, ok := instr.(*ssa.SPMDSelect)
+			if !ok {
+				continue
+			}
+			if _, ok := sel.Y.(*ssa.Phi); ok {
+				foundSPMDSelectWithPhiY = true
+			}
+		}
 	}
-	if !strings.Contains(output, "spmd_load") {
-		t.Errorf("expected spmd_load for break result alloca read, SSA:\n%s", output)
+	if !foundSPMDSelectWithPhiY {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Errorf("expected SPMDSelect.Y to be accum phi (not static default), SSA:\n%s", buf.String())
 	}
 }
 
@@ -3698,10 +3655,6 @@ func main() { f(make([]int, 16)) }
 // TestPredicateSPMD_GoForLoopCallMask verifies that SPMD function calls inside
 // a go-for loop body receive the active mask via spmdMaskScopedCallOps.
 func TestPredicateSPMD_GoForLoopCallMask(t *testing.T) {
-	// The explicit `int(result)` conversion was invalid: the type checker
-	// rejects lanes.Varying[int] → int casts (use reduce.From() for that).
-	// Replace with `_ = result` to avoid the type error while still exercising
-	// the SPMD function call masking logic.
 	src := `package main
 import "lanes"
 
@@ -3713,7 +3666,7 @@ func f(arr []int) {
 	for i := range len(arr) {
 		vi := lanes.Varying[int](arr[i])
 		result := helper(vi)
-		_ = result
+		arr[i] = int(result)
 	}
 }
 
@@ -4029,7 +3982,7 @@ func f(arr []int) {
 	for i := range len(arr) {
 		vi := lanes.Varying[int](arr[i])
 		result := helper(vi)
-		_ = result
+		arr[i] = int(result)
 	}
 }
 
@@ -4268,22 +4221,8 @@ func f(dst []int32, lo, hi int32) {
 	// All memory ops inside varying branches must have been masked.
 	// After spmdMergeRedundantStores, the 3 per-branch stores to dst[i] are
 	// collapsed into 1 SPMDStore with 2 chained SPMDSelects.
-	// Count only data stores (exclude bookkeeping stores to Alloc addresses
-	// added by the v5 lift guard for iter-phi allocas).
-	storeCount := 0
-	selectCount := 0
-	for _, block := range fn.Blocks {
-		for _, instr := range block.Instrs {
-			switch st := instr.(type) {
-			case *ssa.SPMDStore:
-				if _, isAlloca := st.Addr.(*ssa.Alloc); !isAlloca {
-					storeCount++
-				}
-			case *ssa.SPMDSelect:
-				selectCount++
-			}
-		}
-	}
+	storeCount := strings.Count(output, "spmd_store")
+	selectCount := strings.Count(output, "spmd_select")
 	if storeCount < 1 {
 		t.Errorf("expected at least 1 SPMDStore instruction, got %d", storeCount)
 		t.Logf("SSA output:\n%s", output)
@@ -4725,22 +4664,21 @@ func main() { f([]uint8{0xFF, 0x0F}) }
 		t.Fatal("function f not found")
 	}
 
-	// With the v5 lift guard, the varying "count" variable is kept as an alloca
-	// rather than being lifted to a phi. The if-body merge is alloca-mediated:
-	// spmd_store with a narrowed mask (& condition) writes the updated count,
-	// and spmd_load reads the merged value. For if-without-else, no &^ pattern
-	// is generated. Check that spmd_store is present (meaning the inner loop
-	// with a Varying phi DID remain in SPMD scope and its if-body was predicated).
+	var selects int
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if _, ok := instr.(*ssa.SPMDSelect); ok {
+				selects++
+			}
+		}
+	}
+
 	var buf bytes.Buffer
 	ssa.WriteFunction(&buf, fn)
 	output := buf.String()
 
-	if !strings.Contains(output, "spmd_store") {
-		t.Errorf("expected spmd_store for varying if-else inside inner SPMD loop;"+
-			" inner loop with Varying phi must remain in SPMD scope:\n%s", output)
-	}
-	if !strings.Contains(output, "spmd_load") {
-		t.Errorf("expected spmd_load for varying if-else inside inner SPMD loop;"+
+	if selects == 0 {
+		t.Errorf("expected SPMDSelect(s) for varying if-else inside inner SPMD loop;"+
 			" inner loop with Varying phi must remain in SPMD scope:\n%s", output)
 	}
 }
@@ -4871,17 +4809,13 @@ func main() { clamp(make([]int32, 16), -10, 10) }
 	}
 
 	// Count SPMDStore and SPMDSelect instructions across all blocks.
-	// Exclude stores to Alloc addresses (bookkeeping stores added by the v5
-	// lift guard for iter-phi allocas — not data stores to array elements).
 	storeCount := 0
 	selectCount := 0
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
-			switch st := instr.(type) {
+			switch instr.(type) {
 			case *ssa.SPMDStore:
-				if _, isAlloca := st.Addr.(*ssa.Alloc); !isAlloca {
-					storeCount++
-				}
+				storeCount++
 			case *ssa.SPMDSelect:
 				selectCount++
 			}
@@ -4935,13 +4869,9 @@ func main() { f(make([]int32, 16)) }
 	selectCount := 0
 	for _, block := range fn.Blocks {
 		for _, instr := range block.Instrs {
-			switch st := instr.(type) {
+			switch instr.(type) {
 			case *ssa.SPMDStore:
-				// Exclude bookkeeping stores to varying allocas added by the
-				// v5 lift guard — those are not data stores to array elements.
-				if _, isAlloca := st.Addr.(*ssa.Alloc); !isAlloca {
-					storeCount++
-				}
+				storeCount++
 			case *ssa.SPMDSelect:
 				selectCount++
 			}

@@ -184,41 +184,22 @@ func spmdDetectGatherGroups(fn *Function, loop *SPMDLoopInfo, scopeBlocks map[*B
 			return
 		}
 
-		// extractConstInt returns the integer value of a constant-like SSA value,
-		// unwrapping ChangeType wrappers. When emitArith converts a scalar int
-		// literal to lanes.Varying[int], it emits changetype Varying[int] <- int
-		// (1:int), so the BinOp operand is a *ChangeType not a *Const directly.
-		extractConstInt := func(v Value) (int64, bool) {
-			for {
-				switch u := v.(type) {
-				case *Const:
-					return constant.Int64Val(u.Value)
-				case *ChangeType:
-					v = u.X
-				default:
-					return 0, false
-				}
-			}
-		}
-
 		// Decompose index into base + constant offset.
 		base := idxVal
 		offset := 0
 		if binop, ok := idxVal.(*BinOp); ok && binop.Op == token.ADD {
-			if v, ok := extractConstInt(binop.X); ok {
-				base = binop.Y
-				offset = int(v)
-			} else if v, ok := extractConstInt(binop.Y); ok {
-				base = binop.X
-				offset = int(v)
+			if c, ok := binop.X.(*Const); ok {
+				if v, ok := constant.Int64Val(c.Value); ok {
+					base = binop.Y
+					offset = int(v)
+				}
+			} else if c, ok := binop.Y.(*Const); ok {
+				if v, ok := constant.Int64Val(c.Value); ok {
+					base = binop.X
+					offset = int(v)
+				}
 			}
 		}
-		// Canonicalize base through SPMDLoad-from-alloca chains. The v5 lift
-		// guard preserves lanes.Varying[T] allocas; each load of the iter-phi
-		// alloca is a distinct SSA value, but they all originate from the same
-		// stored value. Tracing through single-store allocas gives a stable
-		// group key across all accesses.
-		base = spmdCanonicalIndex(base)
 
 		key := gatherKey{source: source, base: base}
 		groups[key] = append(groups[key], candidate{
@@ -370,165 +351,6 @@ func spmdConvertLoopOps(fn *Function) {
 		}
 		if len(liveScopeBlocks) == 0 {
 			continue
-		}
-
-		// SPMD v5: rewrite every Varying value's type in this loop's scope
-		// to be width-fixed at loop.LaneCount. TinyGo reads typ.Lanes()
-		// during getLLVMType to materialize the LLVM vector at the
-		// canonical width.
-		//
-		// Strategy: two passes.
-		//
-		// Pass A — alloca-rooted propagation (full-function scope):
-		//   Walk all *Alloc instructions in the function. For each alloca
-		//   whose pointee is abstract Varying[T] (Lanes()==0), width-fix
-		//   the alloca to *Varying[T]_N and propagate through the def-use
-		//   chain via a worklist to keep all dependent values consistent.
-		//   Scanning the full function is safe because SPMD loops cannot
-		//   nest (§8), so loop.LaneCount is the unique canonical width.
-		//
-		//   The worklist processes pointer-to-Varying values (FieldAddr,
-		//   IndexAddr derived from Varying allocas) and Varying values
-		//   (SPMDLoad results, BinOps, etc.) whose types must match the
-		//   now-fixed alloca. This covers SPMDLoad/SPMDStore in inner
-		//   scalar loop blocks (excluded from liveScopeBlocks) that
-		//   pre-exist from predicateSPMD.
-		//
-		// Pass B — scope-limited non-alloca rewrite:
-		//   Walk liveScopeBlocks only. For each instruction whose result
-		//   type is still abstract Varying[T] after Pass A (e.g.
-		//   ChangeType, SPMDSelect, non-alloca-rooted Varying values),
-		//   width-fix the type. Also fix *Const operands in SPMDSelect.
-
-		// spmdMaybeFixVarying returns the width-fixed *types.SPMDType if t
-		// is abstract (Lanes() == 0), or nil if already fixed or not Varying.
-		spmdMaybeFixVarying := func(t types.Type) *types.SPMDType {
-			if st, ok := t.(*types.SPMDType); ok && st.Lanes() == 0 {
-				return types.NewVaryingWithLanes(st.Elem(), loop.LaneCount)
-			}
-			return nil
-		}
-
-		// spmdMaybeFixPtrToVarying returns the width-fixed *types.Pointer
-		// if p is *Varying[T] with Lanes()==0, or nil otherwise.
-		spmdMaybeFixPtrToVarying := func(t types.Type) *types.Pointer {
-			if ptr, ok := t.(*types.Pointer); ok {
-				if fixed := spmdMaybeFixVarying(ptr.Elem()); fixed != nil {
-					return types.NewPointer(fixed)
-				}
-			}
-			return nil
-		}
-
-		// spmdFixConstVaryingType returns a new *Const carrying the
-		// width-fixed Varying[T]_N type if c has abstract Varying[T] type.
-		spmdFixConstVaryingType := func(c *Const) *Const {
-			if fixed := spmdMaybeFixVarying(c.Type()); fixed != nil {
-				return NewConst(c.Value, fixed)
-			}
-			return c
-		}
-
-		// Pass A: worklist-based propagation from Varying allocas.
-		// The worklist holds *pointer* Values whose pointee type is now
-		// width-fixed Varying[T]_N. For each such pointer, we fix all
-		// downstream SPMDLoad result types and SPMDStore val types, and
-		// also enqueue derived pointer values (FieldAddr, IndexAddr).
-		type ptrWorkItem struct {
-			ptr   Value          // value of pointer type *Varying[T]_N
-			fixed *types.SPMDType // the Varying[T]_N pointee
-		}
-		ptrWorklist := []ptrWorkItem{}
-
-		for _, b := range fn.Blocks {
-			for _, instr := range b.Instrs {
-				alloc, ok := instr.(*Alloc)
-				if !ok {
-					continue
-				}
-				fixedPtr := spmdMaybeFixPtrToVarying(alloc.Type())
-				if fixedPtr == nil {
-					continue
-				}
-				fixed := fixedPtr.Elem().(*types.SPMDType)
-				setSPMDValueType(alloc, fixedPtr)
-				ptrWorklist = append(ptrWorklist, ptrWorkItem{alloc, fixed})
-			}
-		}
-
-		// processed tracks visited pointer values to avoid infinite loops.
-		ptrVisited := make(map[Value]bool)
-		for len(ptrWorklist) > 0 {
-			item := ptrWorklist[0]
-			ptrWorklist = ptrWorklist[1:]
-			if ptrVisited[item.ptr] {
-				continue
-			}
-			ptrVisited[item.ptr] = true
-
-			if item.ptr.Referrers() == nil {
-				continue
-			}
-			for _, ref := range *item.ptr.Referrers() {
-				switch r := ref.(type) {
-				case *SPMDLoad:
-					// Fix the load result type if it matches the expected elem.
-					if spmdT, ok := r.Type().(*types.SPMDType); ok && spmdT.Lanes() == 0 && types.Identical(spmdT.Elem(), item.fixed.Elem()) {
-						setSPMDValueType(r, item.fixed)
-						// Propagate one level through the load's own referrers
-						// (e.g. BinOp using the loaded value in an excluded block).
-						if r.Referrers() == nil {
-							continue
-						}
-						for _, rref := range *r.Referrers() {
-							if rv, ok := rref.(Value); ok {
-								if spmdT2, ok := rv.Type().(*types.SPMDType); ok && spmdT2.Lanes() == 0 && types.Identical(spmdT2.Elem(), item.fixed.Elem()) {
-									setSPMDValueType(rv, item.fixed)
-								}
-							}
-						}
-					}
-				case *FieldAddr:
-					// FieldAddr from a *Varying[Struct]_N alloca produces
-					// *Varying[fieldType]. Fix it and enqueue as a new
-					// pointer work item so its SPMDLoad consumers are fixed.
-					if fixedChildPtr := spmdMaybeFixPtrToVarying(r.Type()); fixedChildPtr != nil {
-						setSPMDValueType(r, fixedChildPtr)
-						childFixed := fixedChildPtr.Elem().(*types.SPMDType)
-						ptrWorklist = append(ptrWorklist, ptrWorkItem{r, childFixed})
-					}
-				}
-			}
-		}
-
-		// Pass B: rewrite result types of value-producing instructions in the
-		// live scope blocks (ChangeType, SPMDSelect, etc.) that still carry
-		// abstract Varying[T] after Pass A. Allocas are skipped (Pass A).
-		for b := range liveScopeBlocks {
-			for _, instr := range b.Instrs {
-				if _, ok := instr.(*Alloc); ok {
-					continue // handled in Pass A
-				}
-				// SPMDSelect: fix up *Const operands (X or Y) that carry
-				// abstract Varying types. predicateSPMD emits zero-value
-				// constants (e.g. false:Varying[bool]) as inactive-lane
-				// defaults; these must match the width-fixed result type.
-				if sel, ok := instr.(*SPMDSelect); ok {
-					if c, ok := sel.X.(*Const); ok {
-						sel.X = spmdFixConstVaryingType(c)
-					}
-					if c, ok := sel.Y.(*Const); ok {
-						sel.Y = spmdFixConstVaryingType(c)
-					}
-				}
-				v, ok := instr.(Value)
-				if !ok {
-					continue
-				}
-				if fixed := spmdMaybeFixVarying(v.Type()); fixed != nil {
-					setSPMDValueType(v, fixed)
-				}
-			}
 		}
 
 		if loop.IsPeeled {
@@ -3793,56 +3615,14 @@ func spmdIsVectorizableElemType(t types.Type) bool {
 	return false
 }
 
-// spmdAllocaStoredValue returns the value stored into a varying *Alloc
-// when the alloca has exactly one SPMDStore (or plain Store) writer.
-// Returns nil when there are multiple stores, no stores, or addr is not
-// an *Alloc. Used by contiguity detection to trace through
-// SPMDLoad-from-alloca chains when the SPMD lift guard preserves varying
-// allocas (v5 lift guard in lift.go).
-func spmdAllocaStoredValue(addr Value) Value {
-	alloc, ok := addr.(*Alloc)
-	if !ok {
-		return nil
-	}
-	refs := alloc.Referrers()
-	if refs == nil {
-		return nil
-	}
-	var stored Value
-	for _, ref := range *refs {
-		switch op := ref.(type) {
-		case *SPMDStore:
-			if op.Addr == alloc {
-				if stored != nil {
-					return nil // multiple stores; can't pick a single value
-				}
-				stored = op.Val
-			}
-		case *Store:
-			if op.Addr == alloc {
-				if stored != nil {
-					return nil
-				}
-				stored = op.Val
-			}
-		}
-	}
-	return stored
-}
-
 // spmdIsContiguousIndex reports whether index traces back to an SPMD loop's
 // IterPhi (or scalar+IterPhi BinOp), indicating contiguous lane addresses.
 // Unwraps ChangeType/Convert chains since the type checker wraps the
-// iter phi in changetype Varying[int] <- int. Also traces through
-// SPMDLoad-from-alloca chains produced by the v5 lift guard which
-// preserves lanes.Varying[T] allocas rather than promoting them to SSA
-// values: the iter-phi is stored into the alloca then loaded back, so the
-// index seen at the IndexAddr is an SPMDLoad rather than the phi directly.
+// iter phi in changetype Varying[int] <- int.
 // Runs during predication (before peeling), so IterPhi is valid.
 // For function bodies (no SPMDLoops), always returns false.
 func spmdIsContiguousIndex(fn *Function, index Value) bool {
-	// unwrap peels ChangeType/Convert wrappers and also traces through
-	// SPMDLoad/UnOp-MUL from a single-store alloca to find the stored value.
+	// Unwrap ChangeType/Convert chains to find underlying value.
 	unwrap := func(v Value) Value {
 		for {
 			switch u := v.(type) {
@@ -3850,26 +3630,6 @@ func spmdIsContiguousIndex(fn *Function, index Value) bool {
 				v = u.X
 			case *Convert:
 				v = u.X
-			case *SPMDLoad:
-				// SPMD lift guard preserves varying allocas. When the load
-				// reads from an alloca with a single store, trace through to
-				// the stored value to find the underlying iter-phi.
-				stored := spmdAllocaStoredValue(u.Addr)
-				if stored == nil {
-					return v
-				}
-				v = stored
-			case *UnOp:
-				// Plain pointer load (pre-predication or test-mode equivalent).
-				if u.Op == token.MUL {
-					stored := spmdAllocaStoredValue(u.X)
-					if stored == nil {
-						return v
-					}
-					v = stored
-					continue
-				}
-				return v
 			default:
 				return v
 			}
@@ -4078,51 +3838,12 @@ type spmdAddrKey struct {
 	index Value
 }
 
-// spmdCanonicalIndex returns the canonical form of an IndexAddr index value
-// for use as an address key. When the v5 lift guard preserves varying
-// allocas, the iter-phi is stored into the alloca and later loaded back;
-// each load is a distinct Value even though they all refer to the same
-// underlying alloca. To ensure that &dst[i] expressions in different
-// linearized branches of an if/else-if/else map to the same key, we
-// trace through SPMDLoad-from-single-store-alloca chains and return the
-// stored value (which is the same changetype-of-iter-phi across all branches).
-func spmdCanonicalIndex(v Value) Value {
-	for {
-		switch u := v.(type) {
-		case *SPMDLoad:
-			// Post-predication: varying alloca load.
-			stored := spmdAllocaStoredValue(u.Addr)
-			if stored == nil {
-				return v
-			}
-			v = stored
-		case *UnOp:
-			// Pre-predication (e.g. during spmdDetectGatherGroups which runs
-			// before spmdConvertLoopOps): varying alloca load is still a
-			// pointer dereference.
-			if u.Op != token.MUL {
-				return v
-			}
-			stored := spmdAllocaStoredValue(u.X)
-			if stored == nil {
-				return v
-			}
-			v = stored
-		default:
-			return v
-		}
-	}
-}
-
 // spmdNormalizeAddr returns a canonical key for the address operand of an
 // SPMDStore. IndexAddr instructions with the same X and Index map to the same
-// key; all other addresses use identity. The index is canonicalized through
-// SPMDLoad-from-alloca chains (see spmdCanonicalIndex) so that branches of a
-// predicated if/else-if/else that each re-load the iter-phi from its alloca
-// still hash to the same key.
+// key; all other addresses use identity.
 func spmdNormalizeAddr(addr Value) spmdAddrKey {
 	if ia, ok := addr.(*IndexAddr); ok {
-		return spmdAddrKey{base: ia.X, index: spmdCanonicalIndex(ia.Index)}
+		return spmdAddrKey{base: ia.X, index: ia.Index}
 	}
 	return spmdAddrKey{base: addr}
 }

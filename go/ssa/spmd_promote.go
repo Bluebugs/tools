@@ -280,12 +280,11 @@ func checkArrayPromotion(alloc *Alloc, blockToLoop map[*BasicBlock]*SPMDLoopInfo
 			return nil, nil
 		}
 
-		// Check 7: index must be the IterPhi (possibly via ChangeType or a
-		// load-from-alloca chain). After lift, the iter phi may be stored into
-		// a varying alloca (by the v5 lift guard) and loaded back via *UnOp{MUL};
-		// unwrapIterIndex peels both ChangeType wrappers and these alloca-load
-		// chains to reach the underlying IterPhi.
-		if unwrapIterIndex(ia.Index) != loop.IterPhi {
+		// Check 7: index must be the IterPhi (possibly via ChangeType).
+		// After lift, the iter alloc is promoted to a Phi, and the loop
+		// variable `i` is a ChangeType wrapping that Phi. Peel any ChangeType
+		// wrappers to reach the underlying Phi.
+		if unwrapChangeType(ia.Index) != loop.IterPhi {
 			return nil, nil
 		}
 
@@ -787,32 +786,6 @@ func unwrapChangeType(v Value) Value {
 			return v
 		}
 		v = ct.X
-	}
-}
-
-// unwrapIterIndex unwraps ChangeType and UnOp-load-from-single-store-alloca
-// chains to find the underlying value (typically the IterPhi). The v5 lift
-// guard preserves lanes.Varying[T] allocas instead of lifting them to phi
-// nodes: the iter-phi is stored into the alloca and loaded back via *UnOp{MUL}
-// (before spmdConvertLoopOps runs). Tracing through these load-from-alloca
-// chains is necessary for promoteSPMDArrays to identify iter-phi accesses.
-func unwrapIterIndex(v Value) Value {
-	for {
-		switch u := v.(type) {
-		case *ChangeType:
-			v = u.X
-		case *UnOp:
-			if u.Op != token.MUL {
-				return v
-			}
-			stored := spmdAllocaStoredValue(u.X)
-			if stored == nil {
-				return v
-			}
-			v = stored
-		default:
-			return v
-		}
 	}
 }
 
