@@ -4962,3 +4962,106 @@ func main() { f(make([]int32, 16)) }
 			selectCount, buf.String())
 	}
 }
+
+// buildSPMDFunction builds an SSA package from src (which must contain a go-for
+// loop), marks the first RangeStmt as SPMD, and returns the named function.
+// It uses buildSSAWithSPMD (defined in spmd_loop_test.go) to compile and run
+// the predication pass, then looks up the function by name.
+func buildSPMDFunction(t *testing.T, src string, name string) *ssa.Function {
+	t.Helper()
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func(name)
+	if fn == nil {
+		t.Fatalf("function %q not found in SSA package", name)
+	}
+	return fn
+}
+
+// TestSPMDAllocaIsLoopLocal_LoopLocalIter verifies that an alloca initialized
+// from the loop iter (loop-local) is width-fixed by Pass A.
+func TestSPMDAllocaIsLoopLocal_LoopLocalIter(t *testing.T) {
+	src := `package main
+
+import "lanes"
+
+func accumulate(data []int) lanes.Varying[int] {
+	var v lanes.Varying[int]
+	for i := range len(data) {
+		v = lanes.Varying[int](i)
+	}
+	return v
+}
+
+func main() {}
+`
+	fn := buildSPMDFunction(t, src, "accumulate")
+	// Find the alloca for v.
+	var vAlloc *ssa.Alloc
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			if a, ok := instr.(*ssa.Alloc); ok {
+				if ptr, ok := a.Type().(*types.Pointer); ok {
+					if st, ok := ptr.Elem().(*types.SPMDType); ok && st.Elem().String() == "int" {
+						vAlloc = a
+						break
+					}
+				}
+			}
+			if vAlloc != nil {
+				break
+			}
+		}
+	}
+	if vAlloc == nil {
+		t.Fatal("did not find alloca for v")
+	}
+	ptr := vAlloc.Type().(*types.Pointer)
+	st := ptr.Elem().(*types.SPMDType)
+	if st.Lanes() == 0 {
+		t.Errorf("loop-local alloca should be width-fixed; Lanes()==0")
+	}
+}
+
+// TestSPMDAllocaIsLoopLocal_ExternalSliceLoad verifies that an alloca whose
+// stored value comes from a []Varying[T] slice element load is NOT width-fixed
+// (Lanes() stays 0 — TinyGo will use natural width).
+func TestSPMDAllocaIsLoopLocal_ExternalSliceLoad(t *testing.T) {
+	src := `package main
+
+import "lanes"
+
+func process(s []lanes.Varying[int]) lanes.Varying[int] {
+	var acc lanes.Varying[int]
+	for i := range len(s) {
+		v := s[i]
+		acc = v
+	}
+	return acc
+}
+
+func main() {}
+`
+	fn := buildSPMDFunction(t, src, "process")
+	// Find any Varying[int] alloca; there may be multiple (acc and v).
+	// The one for acc receives a store from an IndexAddr (external), so it
+	// should NOT be width-fixed.
+	var externalAlloc *ssa.Alloc
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			if a, ok := instr.(*ssa.Alloc); ok {
+				if ptr, ok := a.Type().(*types.Pointer); ok {
+					if st, ok := ptr.Elem().(*types.SPMDType); ok && st.Elem().String() == "int" {
+						// The alloca that has a non-loop-local store keeps Lanes()==0.
+						// We check all found allocas — at least one must be not fixed.
+						if st.Lanes() == 0 {
+							externalAlloc = a
+						}
+					}
+				}
+			}
+		}
+	}
+	if externalAlloc == nil {
+		t.Errorf("external alloca (slice-of-Varying load) must keep Lanes()==0, but all were width-fixed")
+	}
+}

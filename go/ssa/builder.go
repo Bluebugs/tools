@@ -2511,6 +2511,26 @@ func (b *builder) rangeStmt(fn *Function, s *ast.RangeStmt, label *lblock) {
 		case *types.Slice, *types.Array, *types.Pointer:
 			info.IsRangeIndex = true
 		}
+		// Cap LaneCount at the array length for rangeindex loops over fixed-size arrays.
+		// The type checker computes LaneCount = registerBits/elemSize without knowing the
+		// array length; this mismatch causes peelSPMDLoop to compute alignedBound=0 for
+		// small arrays (e.g., [4]uint16 at 8 lanes: 4 & ~7 = 0, no main body). Capping
+		// here ensures the loop is peeled with the correct lane count from the start, so
+		// the main body runs and types are annotated consistently with the actual width.
+		if info.IsRangeIndex && info.LaneCount > 1 {
+			var arrayLen int
+			switch ct := typeparams.CoreType(x.Type()).(type) {
+			case *types.Array:
+				arrayLen = int(ct.Len())
+			case *types.Pointer:
+				if at, ok := typeparams.CoreType(ct.Elem()).(*types.Array); ok {
+					arrayLen = int(at.Len())
+				}
+			}
+			if arrayLen > 0 && info.LaneCount > arrayLen {
+				info.LaneCount = arrayLen
+			}
+		}
 		// Save iter alloc for post-lift phi resolution.
 		// The iter alloc is the last matching Alloc in fn.Locals.
 		for i := len(fn.Locals) - 1; i >= 0; i-- {

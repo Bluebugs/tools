@@ -310,6 +310,124 @@ func spmdDetectGatherGroups(fn *Function, loop *SPMDLoopInfo, scopeBlocks map[*B
 // function blocks (post-peeling) by BFS from the loop/body blocks. Because
 // deleteUnreachableBlocks has already run, any unreachable cloned blocks are gone.
 // The BFS correctly enumerates only live scope blocks.
+
+// spmdAllocaIsLoopLocal reports whether every value stored into alloc is
+// derived from the SPMD loop's iter, splatted constants, or other loop-local
+// computations — versus loaded from external memory (slice/struct elements,
+// function parameters, call results).
+//
+// Used by Pass A in spmdConvertLoopOps to decide whether to width-fix the
+// alloca's pointee Varying[T] type to loop.LaneCount, or leave it abstract
+// (Lanes()==0) so TinyGo's getLLVMType uses the natural width path.
+//
+// The walk is bounded by the visited set to handle phi cycles within the loop
+// body (such cycles are loop-local by construction). Unknown / unhandled value
+// shapes are conservatively classified as external.
+func spmdAllocaIsLoopLocal(alloc *Alloc, loop *SPMDLoopInfo) bool {
+	return spmdAllocaIsLoopLocalWith(alloc, loop, make(map[Value]bool))
+}
+
+// spmdAllocaIsLoopLocalWith is the internal implementation of
+// spmdAllocaIsLoopLocal that shares a visited set across mutual recursion
+// with spmdValueIsLoopLocal to prevent infinite cycles.
+func spmdAllocaIsLoopLocalWith(alloc *Alloc, loop *SPMDLoopInfo, visited map[Value]bool) bool {
+	// Mark the alloca itself as visited so that any load-of-alloca cycle
+	// (e.g. acc = acc, which loads and stores the same alloca) terminates.
+	if visited[alloc] {
+		return true
+	}
+	visited[alloc] = true
+	var stores []Value
+	if alloc.Referrers() != nil {
+		for _, ref := range *alloc.Referrers() {
+			switch r := ref.(type) {
+			case *Store:
+				if r.Addr == alloc {
+					stores = append(stores, r.Val)
+				}
+			case *SPMDStore:
+				if r.Addr == alloc {
+					stores = append(stores, r.Val)
+				}
+			}
+		}
+	}
+	if len(stores) == 0 {
+		// No stores: zero-init only — loop-local trivially.
+		return true
+	}
+	for _, sv := range stores {
+		if !spmdValueIsLoopLocal(sv, loop, visited) {
+			return false
+		}
+	}
+	return true
+}
+
+// spmdValueIsLoopLocal classifies a value as loop-local-derived. Returns true
+// for iter-derived, splatted-uniform, and arithmetic-of-loop-local values.
+// Returns false for parameters, call results, IndexAddr/FieldAddr loads, and
+// anything else not enumerated as loop-local.
+func spmdValueIsLoopLocal(v Value, loop *SPMDLoopInfo, visited map[Value]bool) bool {
+	if v == nil {
+		return false
+	}
+	if visited[v] {
+		// Cycle (e.g., phi within the loop body) — loop-local by construction.
+		return true
+	}
+	visited[v] = true
+	// Direct loop iter: definitely loop-local.
+	if loop != nil && loop.IterPhi != nil && Value(loop.IterPhi) == v {
+		return true
+	}
+	switch u := v.(type) {
+	case *SPMDIndex:
+		// The lane-index vector — loop-local by definition.
+		return true
+	case *Const:
+		// Compile-time constant — uniform, splattable.
+		return true
+	case *ChangeType:
+		return spmdValueIsLoopLocal(u.X, loop, visited)
+	case *Convert:
+		return spmdValueIsLoopLocal(u.X, loop, visited)
+	case *BinOp:
+		return spmdValueIsLoopLocal(u.X, loop, visited) && spmdValueIsLoopLocal(u.Y, loop, visited)
+	case *UnOp:
+		// UnOp{MUL} dereferences external memory — NOT loop-local unless the
+		// addr is itself a loop-local alloca.
+		if u.Op == token.MUL {
+			if a, ok := u.X.(*Alloc); ok {
+				return spmdAllocaIsLoopLocalWith(a, loop, visited)
+			}
+			return false
+		}
+		return spmdValueIsLoopLocal(u.X, loop, visited)
+	case *Phi:
+		for _, edge := range u.Edges {
+			if !spmdValueIsLoopLocal(edge, loop, visited) {
+				return false
+			}
+		}
+		return true
+	case *SPMDSelect:
+		return spmdValueIsLoopLocal(u.Mask, loop, visited) &&
+			spmdValueIsLoopLocal(u.X, loop, visited) &&
+			spmdValueIsLoopLocal(u.Y, loop, visited)
+	case *SPMDLoad:
+		// Loop-local IFF loading from a loop-local alloca.
+		if a, ok := u.Addr.(*Alloc); ok {
+			return spmdAllocaIsLoopLocalWith(a, loop, visited)
+		}
+		return false
+	default:
+		// Conservative: parameters, call results, IndexAddr, FieldAddr, etc.
+		// are external by default.
+		return false
+	}
+}
+
 func spmdConvertLoopOps(fn *Function) {
 	if len(fn.SPMDLoops) == 0 {
 		return
@@ -377,7 +495,13 @@ func spmdConvertLoopOps(fn *Function) {
 		// during getLLVMType to materialize the LLVM vector at the
 		// canonical width.
 		//
-		// Strategy: two passes.
+		// v6.1: skip type-rewriting for LaneCount<=1 loops (e.g. outer loop
+		// over []Varying[T] where laneCount=1). Type-rewriting to width-1 would
+		// collapse abstract Varying[T] allocas to scalar, losing the inner vector
+		// width. TinyGo derives the correct width via spmdEffectiveLaneCount
+		// (registerSize/elemSize) when Lanes()==0. Predication also skips <=1.
+		//
+		// Strategy (for LaneCount>1 only): two passes.
 		//
 		// Pass A — alloca-rooted propagation (full-function scope):
 		//   Walk all *Alloc instructions in the function. For each alloca
@@ -399,137 +523,163 @@ func spmdConvertLoopOps(fn *Function) {
 		//   type is still abstract Varying[T] after Pass A (e.g.
 		//   ChangeType, SPMDSelect, non-alloca-rooted Varying values),
 		//   width-fix the type. Also fix *Const operands in SPMDSelect.
-
-		// spmdMaybeFixVarying returns the width-fixed *types.SPMDType if t
-		// is abstract (Lanes() == 0), or nil if already fixed or not Varying.
-		spmdMaybeFixVarying := func(t types.Type) *types.SPMDType {
-			if st, ok := t.(*types.SPMDType); ok && st.Lanes() == 0 {
-				return types.NewVaryingWithLanes(st.Elem(), loop.LaneCount)
-			}
-			return nil
-		}
-
-		// spmdMaybeFixPtrToVarying returns the width-fixed *types.Pointer
-		// if p is *Varying[T] with Lanes()==0, or nil otherwise.
-		spmdMaybeFixPtrToVarying := func(t types.Type) *types.Pointer {
-			if ptr, ok := t.(*types.Pointer); ok {
-				if fixed := spmdMaybeFixVarying(ptr.Elem()); fixed != nil {
-					return types.NewPointer(fixed)
+		if loop.LaneCount > 1 {
+			// v5EffectiveLaneCount is loop.LaneCount capped at the array length
+			// for rangeindex loops over fixed-size arrays (e.g., [4]uint16 has
+			// natural width 8 on WASM128 but only 4 elements). The type checker
+			// sets LaneCount = registerBits/elemSize without knowing the array
+			// length cap; TinyGo's heuristic applies the cap at codegen time.
+			// Using the uncapped value here produces <8 x i32> types that TinyGo
+			// materialises at laneCount=4, causing the upper 4 lanes to carry
+			// garbage values that corrupt scatter stores (e.g., ip[field] = v
+			// over [4]byte with 8-wide field writes to ip[4..7]).
+			v5EffectiveLaneCount := loop.LaneCount
+			if loop.IsRangeIndex && loop.BoundValue != nil {
+				if arrType, ok := loop.BoundValue.Type().Underlying().(*types.Array); ok {
+					arrayLen := int(arrType.Len())
+					if arrayLen > 0 && v5EffectiveLaneCount > arrayLen {
+						v5EffectiveLaneCount = arrayLen
+					}
 				}
 			}
-			return nil
-		}
 
-		// spmdFixConstVaryingType returns a new *Const carrying the
-		// width-fixed Varying[T]_N type if c has abstract Varying[T] type.
-		spmdFixConstVaryingType := func(c *Const) *Const {
-			if fixed := spmdMaybeFixVarying(c.Type()); fixed != nil {
-				return NewConst(c.Value, fixed)
+			// spmdMaybeFixVarying returns the width-fixed *types.SPMDType if t
+			// is abstract (Lanes() == 0), or nil if already fixed or not Varying.
+			spmdMaybeFixVarying := func(t types.Type) *types.SPMDType {
+				if st, ok := t.(*types.SPMDType); ok && st.Lanes() == 0 {
+					return types.NewVaryingWithLanes(st.Elem(), v5EffectiveLaneCount)
+				}
+				return nil
 			}
-			return c
-		}
 
-		// Pass A: worklist-based propagation from Varying allocas.
-		// The worklist holds *pointer* Values whose pointee type is now
-		// width-fixed Varying[T]_N. For each such pointer, we fix all
-		// downstream SPMDLoad result types and SPMDStore val types, and
-		// also enqueue derived pointer values (FieldAddr, IndexAddr).
-		type ptrWorkItem struct {
-			ptr   Value          // value of pointer type *Varying[T]_N
-			fixed *types.SPMDType // the Varying[T]_N pointee
-		}
-		ptrWorklist := []ptrWorkItem{}
+			// spmdMaybeFixPtrToVarying returns the width-fixed *types.Pointer
+			// if p is *Varying[T] with Lanes()==0, or nil otherwise.
+			spmdMaybeFixPtrToVarying := func(t types.Type) *types.Pointer {
+				if ptr, ok := t.(*types.Pointer); ok {
+					if fixed := spmdMaybeFixVarying(ptr.Elem()); fixed != nil {
+						return types.NewPointer(fixed)
+					}
+				}
+				return nil
+			}
 
-		for _, b := range fn.Blocks {
-			for _, instr := range b.Instrs {
-				alloc, ok := instr.(*Alloc)
-				if !ok {
+			// spmdFixConstVaryingType returns a new *Const carrying the
+			// width-fixed Varying[T]_N type if c has abstract Varying[T] type.
+			spmdFixConstVaryingType := func(c *Const) *Const {
+				if fixed := spmdMaybeFixVarying(c.Type()); fixed != nil {
+					return NewConst(c.Value, fixed)
+				}
+				return c
+			}
+
+			// Pass A: worklist-based propagation from Varying allocas.
+			// The worklist holds *pointer* Values whose pointee type is now
+			// width-fixed Varying[T]_N. For each such pointer, we fix all
+			// downstream SPMDLoad result types and SPMDStore val types, and
+			// also enqueue derived pointer values (FieldAddr, IndexAddr).
+			type ptrWorkItem struct {
+				ptr   Value           // value of pointer type *Varying[T]_N
+				fixed *types.SPMDType // the Varying[T]_N pointee
+			}
+			ptrWorklist := []ptrWorkItem{}
+
+			for _, b := range fn.Blocks {
+				for _, instr := range b.Instrs {
+					alloc, ok := instr.(*Alloc)
+					if !ok {
+						continue
+					}
+					fixedPtr := spmdMaybeFixPtrToVarying(alloc.Type())
+					if fixedPtr == nil {
+						continue
+					}
+					// v6.1: only width-fix loop-local allocas. External allocas
+					// (loaded from []Varying[T] slice elements, parameters, etc.)
+					// keep abstract Lanes()==0 so TinyGo uses natural width.
+					if !spmdAllocaIsLoopLocal(alloc, loop) {
+						continue
+					}
+					fixed := fixedPtr.Elem().(*types.SPMDType)
+					setSPMDValueType(alloc, fixedPtr)
+					ptrWorklist = append(ptrWorklist, ptrWorkItem{alloc, fixed})
+				}
+			}
+
+			// processed tracks visited pointer values to avoid infinite loops.
+			ptrVisited := make(map[Value]bool)
+			for len(ptrWorklist) > 0 {
+				item := ptrWorklist[0]
+				ptrWorklist = ptrWorklist[1:]
+				if ptrVisited[item.ptr] {
 					continue
 				}
-				fixedPtr := spmdMaybeFixPtrToVarying(alloc.Type())
-				if fixedPtr == nil {
+				ptrVisited[item.ptr] = true
+
+				if item.ptr.Referrers() == nil {
 					continue
 				}
-				fixed := fixedPtr.Elem().(*types.SPMDType)
-				setSPMDValueType(alloc, fixedPtr)
-				ptrWorklist = append(ptrWorklist, ptrWorkItem{alloc, fixed})
-			}
-		}
-
-		// processed tracks visited pointer values to avoid infinite loops.
-		ptrVisited := make(map[Value]bool)
-		for len(ptrWorklist) > 0 {
-			item := ptrWorklist[0]
-			ptrWorklist = ptrWorklist[1:]
-			if ptrVisited[item.ptr] {
-				continue
-			}
-			ptrVisited[item.ptr] = true
-
-			if item.ptr.Referrers() == nil {
-				continue
-			}
-			for _, ref := range *item.ptr.Referrers() {
-				switch r := ref.(type) {
-				case *SPMDLoad:
-					// Fix the load result type if it matches the expected elem.
-					if spmdT, ok := r.Type().(*types.SPMDType); ok && spmdT.Lanes() == 0 && types.Identical(spmdT.Elem(), item.fixed.Elem()) {
-						setSPMDValueType(r, item.fixed)
-						// Propagate one level through the load's own referrers
-						// (e.g. BinOp using the loaded value in an excluded block).
-						if r.Referrers() == nil {
-							continue
-						}
-						for _, rref := range *r.Referrers() {
-							if rv, ok := rref.(Value); ok {
-								if spmdT2, ok := rv.Type().(*types.SPMDType); ok && spmdT2.Lanes() == 0 && types.Identical(spmdT2.Elem(), item.fixed.Elem()) {
-									setSPMDValueType(rv, item.fixed)
+				for _, ref := range *item.ptr.Referrers() {
+					switch r := ref.(type) {
+					case *SPMDLoad:
+						// Fix the load result type if it matches the expected elem.
+						if spmdT, ok := r.Type().(*types.SPMDType); ok && spmdT.Lanes() == 0 && types.Identical(spmdT.Elem(), item.fixed.Elem()) {
+							setSPMDValueType(r, item.fixed)
+							// Propagate one level through the load's own referrers
+							// (e.g. BinOp using the loaded value in an excluded block).
+							if r.Referrers() == nil {
+								continue
+							}
+							for _, rref := range *r.Referrers() {
+								if rv, ok := rref.(Value); ok {
+									if spmdT2, ok := rv.Type().(*types.SPMDType); ok && spmdT2.Lanes() == 0 && types.Identical(spmdT2.Elem(), item.fixed.Elem()) {
+										setSPMDValueType(rv, item.fixed)
+									}
 								}
 							}
 						}
-					}
-				case *FieldAddr:
-					// FieldAddr from a *Varying[Struct]_N alloca produces
-					// *Varying[fieldType]. Fix it and enqueue as a new
-					// pointer work item so its SPMDLoad consumers are fixed.
-					if fixedChildPtr := spmdMaybeFixPtrToVarying(r.Type()); fixedChildPtr != nil {
-						setSPMDValueType(r, fixedChildPtr)
-						childFixed := fixedChildPtr.Elem().(*types.SPMDType)
-						ptrWorklist = append(ptrWorklist, ptrWorkItem{r, childFixed})
+					case *FieldAddr:
+						// FieldAddr from a *Varying[Struct]_N alloca produces
+						// *Varying[fieldType]. Fix it and enqueue as a new
+						// pointer work item so its SPMDLoad consumers are fixed.
+						if fixedChildPtr := spmdMaybeFixPtrToVarying(r.Type()); fixedChildPtr != nil {
+							setSPMDValueType(r, fixedChildPtr)
+							childFixed := fixedChildPtr.Elem().(*types.SPMDType)
+							ptrWorklist = append(ptrWorklist, ptrWorkItem{r, childFixed})
+						}
 					}
 				}
 			}
-		}
 
-		// Pass B: rewrite result types of value-producing instructions in the
-		// live scope blocks (ChangeType, SPMDSelect, etc.) that still carry
-		// abstract Varying[T] after Pass A. Allocas are skipped (Pass A).
-		for b := range liveScopeBlocks {
-			for _, instr := range b.Instrs {
-				if _, ok := instr.(*Alloc); ok {
-					continue // handled in Pass A
-				}
-				// SPMDSelect: fix up *Const operands (X or Y) that carry
-				// abstract Varying types. predicateSPMD emits zero-value
-				// constants (e.g. false:Varying[bool]) as inactive-lane
-				// defaults; these must match the width-fixed result type.
-				if sel, ok := instr.(*SPMDSelect); ok {
-					if c, ok := sel.X.(*Const); ok {
-						sel.X = spmdFixConstVaryingType(c)
+			// Pass B: rewrite result types of value-producing instructions in the
+			// live scope blocks (ChangeType, SPMDSelect, etc.) that still carry
+			// abstract Varying[T] after Pass A. Allocas are skipped (Pass A).
+			for b := range liveScopeBlocks {
+				for _, instr := range b.Instrs {
+					if _, ok := instr.(*Alloc); ok {
+						continue // handled in Pass A
 					}
-					if c, ok := sel.Y.(*Const); ok {
-						sel.Y = spmdFixConstVaryingType(c)
+					// SPMDSelect: fix up *Const operands (X or Y) that carry
+					// abstract Varying types. predicateSPMD emits zero-value
+					// constants (e.g. false:Varying[bool]) as inactive-lane
+					// defaults; these must match the width-fixed result type.
+					if sel, ok := instr.(*SPMDSelect); ok {
+						if c, ok := sel.X.(*Const); ok {
+							sel.X = spmdFixConstVaryingType(c)
+						}
+						if c, ok := sel.Y.(*Const); ok {
+							sel.Y = spmdFixConstVaryingType(c)
+						}
 					}
-				}
-				v, ok := instr.(Value)
-				if !ok {
-					continue
-				}
-				if fixed := spmdMaybeFixVarying(v.Type()); fixed != nil {
-					setSPMDValueType(v, fixed)
+					v, ok := instr.(Value)
+					if !ok {
+						continue
+					}
+					if fixed := spmdMaybeFixVarying(v.Type()); fixed != nil {
+						setSPMDValueType(v, fixed)
+					}
 				}
 			}
-		}
+		} // end if loop.LaneCount > 1
 
 		if loop.IsPeeled {
 			// Create tail mask virtual parameter for the tail phase.
@@ -1162,13 +1312,10 @@ func predicateVaryingBreaks(fn *Function, fl *spmdRegularForLoop, breaks []*spmd
 		elseBlock := vb.elseBlock
 		lastElseBlock = elseBlock
 
-		// Relocate FIRST: move thenBlock's non-terminator instructions into
-		// ifBlock before inserting mask ops and SPMDSelect. This ensures values
-		// defined in thenBlock (e.g., ChangeType for break-value assignments)
-		// appear before the SPMDSelect that references them, maintaining the
-		// producer-before-consumer ordering that TinyGo requires.
-		spmdRelocateToBlock(thenBlock, ifBlock)
-
+		// Compute active mask and breakLanes BEFORE relocating thenBlock.
+		// This ensures breakLanes is defined in ifBlock before any SPMDStore
+		// that references it (producer-before-consumer ordering).
+		//
 		// Compute active mask: AND_NOT(entryMask, lastBreakMask)
 		breakActiveMask := spmdInsertMaskAndNot(ifBlock, activeMask, lastBreakMask)
 
@@ -1179,6 +1326,50 @@ func predicateVaryingBreaks(fn *Function, fl *spmdRegularForLoop, breaks []*spmd
 		// Accumulate break mask.
 		newBreakMask := spmdInsertMaskOr(ifBlock, lastBreakMask, breakLanes)
 		lastBreakMask = newBreakMask
+
+		// Now relocate thenBlock's non-terminator instructions into ifBlock.
+		// Record the insertion range so we can convert relocated Store
+		// instructions to SPMDStore with breakLanes below.
+		//
+		// The relocated instructions appear between relocStart and relocEnd
+		// (exclusive) in ifBlock.Instrs after the growth.
+		relocStart := len(ifBlock.Instrs) - 1 // terminator position before growth
+		spmdRelocateToBlock(thenBlock, ifBlock)
+		relocEnd := len(ifBlock.Instrs) - 1 // terminator position after growth
+
+		// With the v5 lift guard active, Varying allocas survive lift() so
+		// break-body assignments appear as Store instructions rather than SSA
+		// phi edges. The relocated Store instructions must be converted to
+		// SPMDStore with breakLanes (not the function-wide activeMask that
+		// spmdConvertAllMemOps would assign). Converting here marks them as
+		// already-SPMDStore so spmdConvertAllMemOps skips them.
+		for idx := relocStart; idx < relocEnd; idx++ {
+			store, ok := ifBlock.Instrs[idx].(*Store)
+			if !ok {
+				continue
+			}
+			if !spmdIsVectorizableElemType(store.Val.Type()) {
+				continue
+			}
+			sstore := &SPMDStore{
+				Addr:  store.Addr,
+				Val:   store.Val,
+				Mask:  breakLanes,
+				Lanes: lanes,
+				pos:   store.Pos(),
+			}
+			sstore.setBlock(ifBlock)
+			ifBlock.Instrs[idx] = sstore
+			spmdAddReferrer(store.Addr, sstore)
+			spmdAddReferrer(store.Val, sstore)
+			spmdAddReferrer(breakLanes, sstore)
+			if refs := store.Addr.Referrers(); refs != nil {
+				*refs = removeInstr(*refs, store)
+			}
+			if refs := store.Val.Referrers(); refs != nil {
+				*refs = removeInstr(*refs, store)
+			}
+		}
 
 		// For each result phi that has a break value from this break block,
 		// create SPMDSelect: sel = select(breakLanes, break_val, prev_accum).

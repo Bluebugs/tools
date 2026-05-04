@@ -223,7 +223,7 @@ func (s *sanity) checkInstr(idx int, instr Instruction) {
 		addrElemTypeLoad := addrElemType(instr.Addr.Type())
 		if addrElemTypeLoad == nil {
 			s.errorf("SPMDLoad: Addr must be a pointer type, got %s", instr.Addr.Type())
-		} else if !types.Identical(instr.Type(), addrElemTypeLoad) {
+		} else if !types.Identical(instr.Type(), addrElemTypeLoad) && !spmdTypesCompatible(instr.Type(), addrElemTypeLoad) {
 			s.errorf("SPMDLoad: result type %s does not match Addr element type %s",
 				instr.Type(), addrElemTypeLoad)
 		}
@@ -246,7 +246,7 @@ func (s *sanity) checkInstr(idx int, instr Instruction) {
 		addrElemTypeStore := addrElemType(instr.Addr.Type())
 		if addrElemTypeStore == nil {
 			s.errorf("SPMDStore: Addr must be a pointer type, got %s", instr.Addr.Type())
-		} else if !types.Identical(instr.Val.Type(), addrElemTypeStore) {
+		} else if !types.Identical(instr.Val.Type(), addrElemTypeStore) && !spmdTypesCompatible(instr.Val.Type(), addrElemTypeStore) {
 			s.errorf("SPMDStore: Val type %s does not match Addr element type %s",
 				instr.Val.Type(), addrElemTypeStore)
 		}
@@ -865,6 +865,30 @@ func sanityCheckPackage(pkg *Package) {
 			panic(fmt.Sprintf("%s Pos=%d obj.Pos=%d", mem, mem.Pos(), obj.Pos()))
 		}
 	}
+}
+
+// spmdTypesCompatible reports whether a and b are compatible Varying[T] types
+// that differ only in their lane count (Lanes()). This is used by the sanity
+// checker to allow abstract Varying[T] (Lanes()==0) in combination with a
+// width-fixed Varying[T]_N (Lanes()>0) — a pattern introduced in v6.1 where
+// external allocas keep abstract type while values stored into them may be
+// width-fixed by Pass B. Both types must be *types.SPMDType with identical
+// element types.
+func spmdTypesCompatible(a, b types.Type) bool {
+	sa, okA := a.(*types.SPMDType)
+	sb, okB := b.(*types.SPMDType)
+	if !okA || !okB {
+		return false
+	}
+	// One must be abstract (Lanes==0), the other concrete.
+	aAbs := sa.Lanes() == 0
+	bAbs := sb.Lanes() == 0
+	if aAbs == bAbs {
+		// Both abstract or both concrete with different counts — not compatible.
+		return false
+	}
+	// Elem types must match.
+	return types.Identical(sa.Elem(), sb.Elem())
 }
 
 // addrElemType returns the element type that an SPMDLoad/SPMDStore expects

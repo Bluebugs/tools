@@ -425,6 +425,10 @@ func liftAlloc(df domFrontier, alloc *Alloc, newPhis newPhiMap, fresh *int) bool
 	// phi's type would be mutated instead — semantically fine but breaks
 	// the alloca-based forward-propagation pass for entry-block allocas
 	// in non-SPMD functions.
+	//
+	// Note: "rangeindex" iter allocas have type *int (not *Varying[T]), so
+	// isLanesVaryingType returns false for them — they are always lifted
+	// normally. This guard only applies to user variables typed as Varying[T].
 	if ptr, ok := alloc.Type().(*types.Pointer); ok {
 		if isLanesVaryingType(ptr.Elem()) {
 			return false
