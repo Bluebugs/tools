@@ -311,6 +311,33 @@ func spmdDetectGatherGroups(fn *Function, loop *SPMDLoopInfo, scopeBlocks map[*B
 // deleteUnreachableBlocks has already run, any unreachable cloned blocks are gone.
 // The BFS correctly enumerates only live scope blocks.
 
+// spmdAllocaIsReferencedInScope reports whether any referrer of alloc
+// (store, load, or derived address) has its instruction in one of the
+// liveScopeBlocks. Entry-block allocas have their instruction in the
+// entry block (not in any loop's scope), so this function looks at the
+// *users* of the alloca rather than the alloca's own block.
+//
+// Used by Pass A in spmdConvertLoopOps to determine which SPMD loop owns
+// an alloca for the purpose of width-fixing the abstract Varying[T]
+// (Lanes()==0) type. An alloca is owned by the loop whose scope blocks
+// contain the majority of its references. With non-nested sequential
+// SPMD loops (which is all that is allowed), each alloca is used in at
+// most one loop's scope blocks, so any reference in a scope block
+// unambiguously identifies the owning loop.
+func spmdAllocaIsReferencedInScope(alloc *Alloc, liveScopeBlocks map[*BasicBlock]bool) bool {
+	if alloc.Referrers() == nil {
+		return false
+	}
+	for _, ref := range *alloc.Referrers() {
+		if instr, ok := ref.(Instruction); ok {
+			if liveScopeBlocks[instr.Block()] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // spmdAllocaIsLoopLocal reports whether every value stored into alloc is
 // derived from the SPMD loop's iter, splatted constants, or other loop-local
 // computations — versus loaded from external memory (slice/struct elements,
@@ -593,10 +620,18 @@ func spmdConvertLoopOps(fn *Function) {
 					if fixedPtr == nil {
 						continue
 					}
-					// v6.1: only width-fix loop-local allocas. External allocas
-					// (loaded from []Varying[T] slice elements, parameters, etc.)
-					// keep abstract Lanes()==0 so TinyGo uses natural width.
-					if !spmdAllocaIsLoopLocal(alloc, loop) {
+					// v6.1: only width-fix allocas that are referenced (stored or
+					// loaded) within this loop's scope blocks. Allocas for a
+					// different sequential SPMD loop will not be referenced in
+					// this loop's scope and are skipped. Entry-block allocas
+					// (whose own block is not in any loop's liveScopeBlocks)
+					// are correctly attributed to the loop that uses them.
+					//
+					// This replaces the earlier two-condition check
+					// (liveScopeBlocks[b] + spmdAllocaIsLoopLocal) which was too
+					// restrictive: it prevented entry-block allocas used by
+					// inner sequential loops from being width-fixed by those loops.
+					if !spmdAllocaIsReferencedInScope(alloc, liveScopeBlocks) {
 						continue
 					}
 					fixed := fixedPtr.Elem().(*types.SPMDType)
@@ -676,6 +711,19 @@ func spmdConvertLoopOps(fn *Function) {
 					}
 					if fixed := spmdMaybeFixVarying(v.Type()); fixed != nil {
 						setSPMDValueType(v, fixed)
+					}
+					// Phi nodes: also fix abstract Varying *Const edges. predicateSPMD
+					// emits constant edges (e.g. true:Varying[bool]) whose type is
+					// abstract when the phi result type has been width-fixed by Pass A.
+					// The phi result type is now fixed above; bring edges into agreement.
+					if phi, ok := instr.(*Phi); ok {
+						for i, edge := range phi.Edges {
+							if c, ok := edge.(*Const); ok {
+								if fc := spmdFixConstVaryingType(c); fc != c {
+									phi.Edges[i] = fc
+								}
+							}
+						}
 					}
 				}
 			}
@@ -2686,6 +2734,57 @@ func findMergeBlock(fn *Function, thenBlock, elseBlock *BasicBlock) *BasicBlock 
 	return nil
 }
 
+// findElseSubgraphPredOfThen searches the subgraph reachable from elseBlock
+// (excluding chain blocks) for the direct predecessor of thenBlock that is
+// reachable from elseBlock. Returns the predecessor and true if found.
+//
+// This handles the compound boolean chain pattern:
+//
+//	(A && B) || (C && D)
+//
+// where the outer LOR creates binop.done (thenBlock) and binop.rhs (elseBlock),
+// and the inner LAND for (C && D) creates binop.rhs2 (cond.true2) and
+// binop.done2 (elsePred). After linearization, binop.rhs would become
+// unreachable, so we must snapshot binop.done's phis using elsePred=binop.done2
+// before predication removes the paths.
+//
+// chainBlocks is used to exclude chain blocks themselves from the search so we
+// find only the "else-path" predecessor, not a short-circuit chain block.
+func findElseSubgraphPredOfThen(elseBlock, thenBlock *BasicBlock, chainBlocks []*BasicBlock) (*BasicBlock, bool) {
+	chainSet := make(map[*BasicBlock]bool, len(chainBlocks))
+	for _, cb := range chainBlocks {
+		chainSet[cb] = true
+	}
+	// BFS from elseBlock. We want to find a block B such that:
+	//   - B is reachable from elseBlock (including elseBlock itself)
+	//   - B is NOT a chain block
+	//   - B is a direct predecessor of thenBlock
+	// We stop the BFS at thenBlock to avoid traversing past the merge point.
+	visited := map[*BasicBlock]bool{elseBlock: true}
+	queue := []*BasicBlock{elseBlock}
+	for len(queue) > 0 {
+		b := queue[0]
+		queue = queue[1:]
+		// Check if this block is a direct predecessor of thenBlock.
+		if !chainSet[b] {
+			for _, pred := range thenBlock.Preds {
+				if pred == b {
+					return b, true
+				}
+			}
+		}
+		// Expand successors (do not cross thenBlock).
+		for _, succ := range b.Succs {
+			if succ == thenBlock || visited[succ] {
+				continue
+			}
+			visited[succ] = true
+			queue = append(queue, succ)
+		}
+	}
+	return nil, false
+}
+
 // spmdInsertMergeTrampoline creates a new block between thenBlock/elseBlock and
 // their shared successor (the loop header). It redirects both branches to the
 // new merge block, which then jumps to the original successor. Phis at the
@@ -2948,24 +3047,51 @@ func predicateBooleanChain(fn *Function, lanes int, chain *SPMDBooleanChain, act
 	}
 
 	// Detect "then-as-merge" pattern: mergeBlock==nil because thenBlock has
-	// 3+ predecessors (chain blocks + elseBlock), but elseBlock has thenBlock
-	// as its sole successor. This happens with 3+ operand LOR/LAND chains
-	// used as value expressions (e.g., a || b || c). Snapshot phi edges at
-	// thenBlock now while the CFG is intact; chain block rewiring below
-	// removes chain blocks from thenBlock.Preds, compacting phi edges.
+	// 3+ predecessors (chain blocks + elseBlock or its sub-blocks), but the
+	// else-subgraph eventually reaches thenBlock. Two sub-cases:
+	//
+	// Simple (1-hop): elseBlock has thenBlock as its sole successor. This
+	// happens with 3+ operand LOR/LAND chains used as value expressions
+	// (e.g., a || b || c).
+	//
+	// Extended (multi-hop): elseBlock reaches thenBlock through multiple
+	// intermediate blocks (e.g., (A && B) || (C && D) where the inner LAND
+	// for (C && D) creates an intermediate merge block binop.done2 that
+	// directly precedes thenBlock=binop.done). In this case elseBlock=binop.rhs
+	// has 2+ successors, but its subgraph eventually connects to thenBlock.
+	//
+	// In both cases, snapshot phi edges at thenBlock now while the CFG is
+	// intact; chain block rewiring below removes chain blocks from thenBlock.Preds,
+	// compacting phi edges. thenAsMergeElsePred holds the direct predecessor
+	// of thenBlock that is reachable from elseBlock (elseBlock itself for the
+	// 1-hop case, or an intermediate block for the multi-hop case).
 	var thenAsMergeSnaps []spmdPhiSnapshot
-	if mergeBlock == nil && len(loopHeaderSnaps) == 0 &&
-		elseBlock != nil && len(elseBlock.Succs) == 1 && elseBlock.Succs[0] == thenBlock {
-		for _, instr := range thenBlock.Instrs {
-			phi, ok := instr.(*Phi)
-			if !ok {
-				break
+	var thenAsMergeElsePred *BasicBlock
+	if mergeBlock == nil && len(loopHeaderSnaps) == 0 && elseBlock != nil {
+		var elsePred *BasicBlock
+		if len(elseBlock.Succs) == 1 && elseBlock.Succs[0] == thenBlock {
+			// Simple 1-hop case.
+			elsePred = elseBlock
+		} else {
+			// Extended multi-hop case: search elseBlock's subgraph for a
+			// direct predecessor of thenBlock.
+			if ep, ok := findElseSubgraphPredOfThen(elseBlock, thenBlock, chain.Blocks); ok {
+				elsePred = ep
 			}
-			snap := spmdPhiSnapshot{phi: phi, edgeVal: make(map[*BasicBlock]Value, len(thenBlock.Preds))}
-			for j, pred := range thenBlock.Preds {
-				snap.edgeVal[pred] = phi.Edges[j]
+		}
+		if elsePred != nil {
+			thenAsMergeElsePred = elsePred
+			for _, instr := range thenBlock.Instrs {
+				phi, ok := instr.(*Phi)
+				if !ok {
+					break
+				}
+				snap := spmdPhiSnapshot{phi: phi, edgeVal: make(map[*BasicBlock]Value, len(thenBlock.Preds))}
+				for j, pred := range thenBlock.Preds {
+					snap.edgeVal[pred] = phi.Edges[j]
+				}
+				thenAsMergeSnaps = append(thenAsMergeSnaps, snap)
 			}
-			thenAsMergeSnaps = append(thenAsMergeSnaps, snap)
 		}
 	}
 
@@ -3064,12 +3190,16 @@ func predicateBooleanChain(fn *Function, lanes int, chain *SPMDBooleanChain, act
 				})
 			}
 		} else if len(thenAsMergeSnaps) > 0 {
-			// "Then-as-merge" pattern: elseBlock → thenBlock, and thenBlock
-			// is the merge point for both chain short-circuit edges and the
-			// else/rhs value. Chain blocks were removed from thenBlock.Preds
-			// by spmdReplaceIfWithJump; elseBlock is the sole remaining pred.
+			// "Then-as-merge" pattern: elseBlock (or its subgraph) flows into
+			// thenBlock, which is the merge point for both chain short-circuit
+			// edges and the else/rhs value. Chain blocks were removed from
+			// thenBlock.Preds by spmdReplaceIfWithJump. The last chain block
+			// jumped to elseBlock (not thenBlock), keeping the else path live.
+			// thenAsMergeElsePred is the direct predecessor of thenBlock that
+			// is reachable from elseBlock (elseBlock itself in the 1-hop case,
+			// or an intermediate block like binop.done2 in the multi-hop case).
 			// Use snapshotted phi edges to build SPMDSelect at thenBlock:
-			//   SPMDSelect(combinedMask, short_circuit_val, else_val)
+			//   SPMDSelect(thenMask, short_circuit_val, else_val)
 			for i, snap := range thenAsMergeSnaps {
 				// short_val: from any chain block (they all carry the same
 				// short-circuit constant, e.g. true for LOR, false for LAND).
@@ -3080,7 +3210,7 @@ func predicateBooleanChain(fn *Function, lanes int, chain *SPMDBooleanChain, act
 						break
 					}
 				}
-				elseVal := snap.edgeVal[elseBlock]
+				elseVal := snap.edgeVal[thenAsMergeElsePred]
 				if shortVal == nil || elseVal == nil {
 					continue
 				}
