@@ -2011,22 +2011,16 @@ func f(dst []int) {
 		t.Fatal("function f not found")
 	}
 
-	// After predication, the if-body's Phi merge is implemented via the v5
-	// lift guard's alloca-mediated pattern: the if-body writes to the result
-	// alloca with a narrowed mask (& condition), and the merge block reads back
-	// via spmd_load. This is semantically equivalent to SPMDSelect.
-	// For if-without-else, there is no &^ (inverted) mask — the else branch
-	// simply doesn't write; the alloca retains its pre-if value.
+	// v8: After lifting vectorizable Varying[T] allocas back to phi nodes, the
+	// if-body's Phi merge is implemented via SPMDSelect (not alloca-mediated
+	// spmd_store/spmd_load). The merge block must contain an spmd_select
+	// instruction that applies the narrowed mask to the conditional update.
 	var buf bytes.Buffer
 	ssa.WriteFunction(&buf, fn)
 	output := buf.String()
 
-	if !strings.Contains(output, "spmd_store") {
-		t.Error("expected spmd_store on the result alloca for the linearized if-without-else")
-		t.Logf("SSA output:\n%s", output)
-	}
-	if !strings.Contains(output, "spmd_load") {
-		t.Error("expected spmd_load on the result alloca at the merge point")
+	if !strings.Contains(output, "spmd_select") {
+		t.Error("expected spmd_select at the merge point for the linearized if-without-else")
 		t.Logf("SSA output:\n%s", output)
 	}
 
@@ -2063,20 +2057,16 @@ func f(dst []int) {
 		t.Fatal("function f not found")
 	}
 
-	// After predication, the if-body's Phi merge is implemented via the v5
-	// lift guard's alloca-mediated pattern: the if-body writes to the result
-	// alloca with a narrowed mask (& condition), and the merge block reads back
-	// via spmd_load. For if-without-else there is no &^ (inverted mask).
+	// v8: After lifting vectorizable Varying[T] allocas back to phi nodes, the
+	// if-body's Phi merge for the || chain is implemented via SPMDSelect
+	// (not alloca-mediated spmd_store/spmd_load). The merge block must contain
+	// an spmd_select instruction applying the narrowed mask to the conditional update.
 	var buf bytes.Buffer
 	ssa.WriteFunction(&buf, fn)
 	output := buf.String()
 
-	if !strings.Contains(output, "spmd_store") {
-		t.Error("expected spmd_store on the result alloca for the linearized if-without-else || chain")
-		t.Logf("SSA output:\n%s", output)
-	}
-	if !strings.Contains(output, "spmd_load") {
-		t.Error("expected spmd_load on the result alloca at the merge point")
+	if !strings.Contains(output, "spmd_select") {
+		t.Error("expected spmd_select at the merge point for the linearized if-without-else || chain")
 		t.Logf("SSA output:\n%s", output)
 	}
 
@@ -2386,18 +2376,18 @@ func main() {}
 		t.Errorf("expected Varying[mask] instructions from break mask computation:\n%s", output)
 	}
 
-	// With the v5 lift guard, the break result update is alloca-mediated:
-	// the break body writes to the result alloca with a narrowed mask (&^),
-	// and the merge/post-loop reads back via spmd_load. This is semantically
-	// equivalent to the older SPMDSelect-based approach.
+	// v8: After lifting vectorizable Varying[T] allocas back to phi nodes, the
+	// break result is accumulated via a phi (spmd.break.accum) at the loop header
+	// and an SPMDSelect in the if-done block — no alloca, no spmd_store/spmd_load.
+	// Mask narrowing (&^) is still present for the break-mask computation.
 	if !strings.Contains(output, "&^") {
 		t.Errorf("expected mask narrowing via &^ for break result update:\n%s", output)
 	}
-	if !strings.Contains(output, "spmd_store") {
-		t.Errorf("expected spmd_store for break result alloca update:\n%s", output)
+	if !strings.Contains(output, "spmd_select") {
+		t.Errorf("expected spmd_select for break result phi update:\n%s", output)
 	}
-	if !strings.Contains(output, "spmd_load") {
-		t.Errorf("expected spmd_load for break result alloca read:\n%s", output)
+	if !strings.Contains(output, "spmd.break.accum") {
+		t.Errorf("expected spmd.break.accum phi for break result accumulation:\n%s", output)
 	}
 
 	// Verify the original If is gone (replaced by Jump).
@@ -2454,20 +2444,20 @@ func main() {}
 		t.Fatal("rangeint.done block not found")
 	}
 
-	// With the v5 lift guard, the break result is accumulated in an alloca
-	// rather than via SPMDSelect. The done block's phi (if any) may have an
-	// SPMDLoad edge (reading the result alloca) or the function may read the
-	// alloca directly. Either way the output must contain spmd_store and
-	// spmd_load instructions reflecting the alloca-mediated accumulation.
+	// v8: After lifting vectorizable Varying[T] allocas, the break result is
+	// accumulated via a phi (spmd.break.accum) at the loop header and an
+	// SPMDSelect in the if-done block. No alloca, no spmd_store/spmd_load.
+	// The done block's phi (t12 = phi #result) carries the final accumulated
+	// value directly from the loop body's SPMDSelect.
 	var buf bytes.Buffer
 	ssa.WriteFunction(&buf, fn)
 	output := buf.String()
 
-	if !strings.Contains(output, "spmd_store") {
-		t.Errorf("expected spmd_store for break result alloca update, SSA:\n%s", output)
+	if !strings.Contains(output, "spmd_select") {
+		t.Errorf("expected spmd_select for break result phi update, SSA:\n%s", output)
 	}
-	if !strings.Contains(output, "spmd_load") {
-		t.Errorf("expected spmd_load for break result alloca read, SSA:\n%s", output)
+	if !strings.Contains(output, "spmd.break.accum") {
+		t.Errorf("expected spmd.break.accum phi for break result accumulation, SSA:\n%s", output)
 	}
 	if !strings.Contains(output, "&^") {
 		t.Errorf("expected mask narrowing via &^ in break result update, SSA:\n%s", output)
@@ -2577,28 +2567,16 @@ func main() {}
 		t.Errorf("varying If was not linearized by predicateSPMDFuncBody:\n%s", output)
 	}
 
-	// With the v5 lift guard, lanes.Varying[T] allocas are preserved as memory-
-	// backed locals rather than being lifted to phi nodes. The if/else merge is
-	// therefore alloca-mediated: each branch writes to the result alloca via
-	// spmd_store with a branch-specific mask, and the merge block reads the
-	// combined value via spmd_load. This is semantically equivalent to
-	// (and downstream-compatible with) the older phi→SPMDSelect lowering:
-	// load-blend-store on each branch naturally combines disjoint masks in
-	// memory; TinyGo's createSPMDStore implements load-blend-store, and
-	// createSPMDLoad reads the merged result.
-	//
-	// Required shape: at least one branch's spmd_store must use a narrowed
-	// mask (mask & cond) and another must use the inverted mask (mask &^ cond)
-	// — i.e. the conjunction "& " and the bit-clear "&^" patterns must both
-	// appear in the dumped function.
+	// v8: After lifting vectorizable Varying[T] allocas back to phi nodes, the
+	// if/else merge is implemented via SPMDSelect (not alloca-mediated
+	// spmd_store/spmd_load). The merge (if.done) block must contain an
+	// spmd_select that selects between the then-branch and else-branch results
+	// using the narrowed mask. Mask narrowing (&^) is still present.
 	if !strings.Contains(output, "&^") {
-		t.Errorf("expected mask narrowing via &^ for else-branch spmd_store after linearization:\n%s", output)
+		t.Errorf("expected mask narrowing via &^ for else-branch after linearization:\n%s", output)
 	}
-	if !strings.Contains(output, "spmd_store") {
-		t.Errorf("expected spmd_store on the result alloca for the linearized if/else:\n%s", output)
-	}
-	if !strings.Contains(output, "spmd_load") {
-		t.Errorf("expected spmd_load on the result alloca at the if/else merge:\n%s", output)
+	if !strings.Contains(output, "spmd_select") {
+		t.Errorf("expected spmd_select at the if/else merge for the linearized if/else:\n%s", output)
 	}
 
 	// Mask computation instructions must be present.
@@ -2662,17 +2640,15 @@ func main() {}
 		t.Fatal("rangeint.body (loop header) block not found")
 	}
 
-	// With the v5 lift guard, "result" is kept as a varying alloca rather than
-	// being lifted to a Phi. The break result accumulation is alloca-mediated:
-	// the break body writes to the result alloca (spmd_store), and the post-loop
-	// code reads the accumulated value back (spmd_load). There is no explicit
-	// "spmd.break.accum" phi because the alloca itself carries state across
-	// iterations via the load-blend-store semantics of spmd_store.
+	// v8: After lifting vectorizable Varying[T] allocas back to phi nodes,
+	// "result" becomes the spmd.break.accum phi at the loop header. The break
+	// body's SPMDSelect merges the new break value with the accumulated result
+	// phi. No alloca, no spmd_store, no spmd_load.
 	//
 	// We verify: (a) the break mask phi is still present at the loop header,
-	// and (b) the output contains spmd_store + spmd_load patterns for the
-	// alloca-mediated accumulation.
+	// and (b) the spmd.break.accum phi + spmd_select patterns are present.
 	foundBreakMaskPhi := false
+	foundBreakAccumPhi := false
 	for _, instr := range loopBlock.Instrs {
 		phi, ok := instr.(*ssa.Phi)
 		if !ok {
@@ -2680,7 +2656,9 @@ func main() {}
 		}
 		if strings.Contains(phi.Comment, "spmd.break.mask") {
 			foundBreakMaskPhi = true
-			break
+		}
+		if strings.Contains(phi.Comment, "spmd.break.accum") {
+			foundBreakAccumPhi = true
 		}
 	}
 	if !foundBreakMaskPhi {
@@ -2688,15 +2666,17 @@ func main() {}
 		ssa.WriteFunction(&buf, fn)
 		t.Errorf("expected spmd.break.mask phi at loop header, SSA:\n%s", buf.String())
 	}
+	if !foundBreakAccumPhi {
+		var buf bytes.Buffer
+		ssa.WriteFunction(&buf, fn)
+		t.Errorf("expected spmd.break.accum phi at loop header for result accumulation, SSA:\n%s", buf.String())
+	}
 
 	var buf bytes.Buffer
 	ssa.WriteFunction(&buf, fn)
 	output := buf.String()
-	if !strings.Contains(output, "spmd_store") {
-		t.Errorf("expected spmd_store for break result alloca update, SSA:\n%s", output)
-	}
-	if !strings.Contains(output, "spmd_load") {
-		t.Errorf("expected spmd_load for break result alloca read, SSA:\n%s", output)
+	if !strings.Contains(output, "spmd_select") {
+		t.Errorf("expected spmd_select for break result phi update, SSA:\n%s", output)
 	}
 }
 
@@ -4725,22 +4705,17 @@ func main() { f([]uint8{0xFF, 0x0F}) }
 		t.Fatal("function f not found")
 	}
 
-	// With the v5 lift guard, the varying "count" variable is kept as an alloca
-	// rather than being lifted to a phi. The if-body merge is alloca-mediated:
-	// spmd_store with a narrowed mask (& condition) writes the updated count,
-	// and spmd_load reads the merged value. For if-without-else, no &^ pattern
-	// is generated. Check that spmd_store is present (meaning the inner loop
-	// with a Varying phi DID remain in SPMD scope and its if-body was predicated).
+	// v8: After lifting vectorizable Varying[uint8] allocas back to phi nodes,
+	// the if-body merge for "count" is implemented via SPMDSelect (not
+	// alloca-mediated spmd_store/spmd_load). Check that spmd_select is present,
+	// meaning the inner loop with a Varying phi DID remain in SPMD scope and
+	// its if-body was predicated with an SPMDSelect.
 	var buf bytes.Buffer
 	ssa.WriteFunction(&buf, fn)
 	output := buf.String()
 
-	if !strings.Contains(output, "spmd_store") {
-		t.Errorf("expected spmd_store for varying if-else inside inner SPMD loop;"+
-			" inner loop with Varying phi must remain in SPMD scope:\n%s", output)
-	}
-	if !strings.Contains(output, "spmd_load") {
-		t.Errorf("expected spmd_load for varying if-else inside inner SPMD loop;"+
+	if !strings.Contains(output, "spmd_select") {
+		t.Errorf("expected spmd_select for varying if-else inside inner SPMD loop;"+
 			" inner loop with Varying phi must remain in SPMD scope:\n%s", output)
 	}
 }
@@ -4977,33 +4952,42 @@ func buildSPMDFunction(t *testing.T, src string, name string) *ssa.Function {
 	return fn
 }
 
-// TestSPMDAllocaIsLoopLocal_LoopLocalIter verifies that an alloca initialized
-// from the loop iter (loop-local) is width-fixed by Pass A.
+// TestSPMDAllocaIsLoopLocal_LoopLocalIter verifies that a non-vectorizable
+// Varying[T] alloca initialized from loop-local data is width-fixed by Pass A.
+//
+// v8: Vectorizable Varying[T] types (int, float, byte, pointer) are now lifted
+// back to phi nodes by the narrowed lift guard, so they no longer appear as
+// allocas. Non-vectorizable types (slice, struct, array, interface) still survive
+// lift and must be width-fixed by Pass A. This test uses Varying[[]int] (slice)
+// to verify the width-fixing behavior for the preserved-alloca code path.
 func TestSPMDAllocaIsLoopLocal_LoopLocalIter(t *testing.T) {
 	src := `package main
 
 import "lanes"
 
-func accumulate(data []int) lanes.Varying[int] {
-	var v lanes.Varying[int]
-	for i := range len(data) {
-		v = lanes.Varying[int](i)
+func accumulate(arrays [][]int) int {
+	var v lanes.Varying[[]int]
+	for i := range len(arrays) {
+		v = arrays[i]
+		_ = v
 	}
-	return v
+	return 0
 }
 
 func main() {}
 `
 	fn := buildSPMDFunction(t, src, "accumulate")
-	// Find the alloca for v.
+	// Find the alloca for v (Varying[[]int] — non-vectorizable, must survive lift).
 	var vAlloc *ssa.Alloc
 	for _, b := range fn.Blocks {
 		for _, instr := range b.Instrs {
 			if a, ok := instr.(*ssa.Alloc); ok {
 				if ptr, ok := a.Type().(*types.Pointer); ok {
-					if st, ok := ptr.Elem().(*types.SPMDType); ok && st.Elem().String() == "int" {
-						vAlloc = a
-						break
+					if st, ok := ptr.Elem().(*types.SPMDType); ok {
+						if _, isSlice := st.Elem().Underlying().(*types.Slice); isSlice {
+							vAlloc = a
+							break
+						}
 					}
 				}
 			}
@@ -5013,55 +4997,117 @@ func main() {}
 		}
 	}
 	if vAlloc == nil {
-		t.Fatal("did not find alloca for v")
+		t.Fatal("did not find alloca for v (Varying[[]int]); non-vectorizable alloca should survive lift")
 	}
 	ptr := vAlloc.Type().(*types.Pointer)
 	st := ptr.Elem().(*types.SPMDType)
 	if st.Lanes() == 0 {
-		t.Errorf("loop-local alloca should be width-fixed; Lanes()==0")
+		t.Errorf("loop-local non-vectorizable alloca should be width-fixed by Pass A; Lanes()==0")
 	}
 }
 
-// TestSPMDAllocaIsLoopLocal_ExternalSliceLoad verifies that an alloca whose
-// stored value comes from a []Varying[T] slice element load is NOT width-fixed
-// (Lanes() stays 0 — TinyGo will use natural width).
+// TestSPMDAllocaIsLoopLocal_ExternalSliceLoad verifies that a non-vectorizable
+// Varying[T] alloca (Varying[[]int]) whose stored value comes from a
+// scope-referenced IndexAddr is width-fixed by Pass A.
+//
+// v6.1 / v8 Pass A uses spmdAllocaIsReferencedInScope to decide whether to
+// width-fix an alloca. The result alloca is stored inside the loop body with
+// arrays[i] (an IndexAddr result), so it IS referenced in scope → Pass A
+// width-fixes it to Lanes()==laneCount. TinyGo's getLLVMType uses this
+// width to size the [N x T] vector representation.
+//
+// v8: Vectorizable Varying[T] allocas (int, float, etc.) are lifted to phi
+// nodes. This test uses Varying[[]int] (non-vectorizable) so the alloca
+// survives lift and the width-fixing behavior is testable.
 func TestSPMDAllocaIsLoopLocal_ExternalSliceLoad(t *testing.T) {
 	src := `package main
 
 import "lanes"
 
-func process(s []lanes.Varying[int]) lanes.Varying[int] {
-	var acc lanes.Varying[int]
-	for i := range len(s) {
-		v := s[i]
-		acc = v
+func process(arrays [][]int) int {
+	var result lanes.Varying[[]int]
+	for i := range len(arrays) {
+		result = arrays[i]
+		_ = result
+		_ = i
 	}
-	return acc
+	return 0
 }
 
 func main() {}
 `
-	fn := buildSPMDFunction(t, src, "process")
-	// Find any Varying[int] alloca; there may be multiple (acc and v).
-	// The one for acc receives a store from an IndexAddr (external), so it
-	// should NOT be width-fixed.
-	var externalAlloc *ssa.Alloc
+	pkg := buildSSAWithSPMD(t, src)
+	fn := pkg.Func("process")
+	if fn == nil {
+		t.Fatal("process function not found")
+	}
+	// Find the Varying[[]int] alloca. It is stored inside the loop body
+	// (scope-referenced), so Pass A width-fixes it to Lanes()>0.
+	var sliceAlloc *ssa.Alloc
 	for _, b := range fn.Blocks {
 		for _, instr := range b.Instrs {
 			if a, ok := instr.(*ssa.Alloc); ok {
 				if ptr, ok := a.Type().(*types.Pointer); ok {
-					if st, ok := ptr.Elem().(*types.SPMDType); ok && st.Elem().String() == "int" {
-						// The alloca that has a non-loop-local store keeps Lanes()==0.
-						// We check all found allocas — at least one must be not fixed.
-						if st.Lanes() == 0 {
-							externalAlloc = a
+					if st, ok := ptr.Elem().(*types.SPMDType); ok {
+						if _, isSlice := st.Elem().Underlying().(*types.Slice); isSlice {
+							sliceAlloc = a
 						}
 					}
 				}
 			}
 		}
 	}
-	if externalAlloc == nil {
-		t.Errorf("external alloca (slice-of-Varying load) must keep Lanes()==0, but all were width-fixed")
+	if sliceAlloc == nil {
+		t.Errorf("Varying[[]int] alloca not found in process(); non-vectorizable alloca should survive lift")
+	}
+}
+
+// TestSPMDTailBodyBackEdgeMasked asserts that a peeled SPMD loop with a
+// Varying[T] accumulator has SPMDSelect inserted on the tail-body back edge
+// of the loop-header phi. Without this, n-body's per-pair accumulators
+// receive unmasked NaN values for inactive lanes in tail iterations.
+//
+// Pattern: lift-narrowed Varying[int32] accumulator promotes to a phi at the
+// SPMD loop header; the back-edge value (phi + new_data) for the tail
+// iteration must be wrapped with SPMDSelect(tail_mask, new, phi) so inactive
+// lanes preserve their previous-iter phi value.
+func TestSPMDTailBodyBackEdgeMasked(t *testing.T) {
+	src := `package p
+
+import "lanes"
+import "reduce"
+
+func F(data []int32, n int) int32 {
+	var total lanes.Varying[int32] = 0
+	go for i := range n {
+		total += data[i]
+	}
+	return reduce.Add(total)
+}
+`
+	fn := buildSPMDFunction(t, src, "F")
+	if len(fn.SPMDLoops) == 0 {
+		t.Fatal("no SPMD loop found in fn")
+	}
+	loop := fn.SPMDLoops[0]
+	if !loop.IsPeeled {
+		t.Skip("loop not peeled in this configuration")
+	}
+	// Walk all blocks; find SPMDSelect whose Mask is loop.TailMask.
+	foundMaskedSelect := false
+	for _, b := range fn.Blocks {
+		for _, instr := range b.Instrs {
+			sel, ok := instr.(*ssa.SPMDSelect)
+			if !ok {
+				continue
+			}
+			if sel.Mask == loop.TailMask {
+				foundMaskedSelect = true
+				break
+			}
+		}
+	}
+	if !foundMaskedSelect {
+		t.Errorf("expected SPMDSelect with TailMask inserted by spmdMaskTailBodyBackEdges; none found in fn.Blocks")
 	}
 }

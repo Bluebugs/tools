@@ -727,6 +727,57 @@ func spmdConvertLoopOps(fn *Function) {
 					}
 				}
 			}
+
+			// v8 correctness fix: after Pass B width-fixes values in tail/main scope
+			// blocks, a peeled loop's trampoline block and done block may have phis
+			// with stale abstract Varying[T] (Lanes()==0) types while their edges
+			// carry width-fixed Varying[T]_N types. The trampoline and done blocks
+			// are outside liveScopeBlocks so Pass B skips them, but their phis
+			// reference values from tailBody/tailCheck/trampoline that have been
+			// width-fixed. The SSA sanity checker rejects type mismatches on phi edges.
+			//
+			// This arises when a vectorizable Varying[T] alloca is lifted to a phi
+			// by the v8 lift-guard narrowing: the trampoline merge phi and the
+			// done-block phi inherit the abstract type at peel time, but Pass B
+			// width-fixes the incoming edges.
+			//
+			// Fix: walk trampoline block then done block. For each phi whose type is
+			// abstract (Lanes()==0), find the first edge whose type is width-fixed
+			// (Lanes()>0) and use it to update the phi type.
+			if loop.IsPeeled {
+				isAbstractVarying := func(t types.Type) bool {
+					st, ok := t.(*types.SPMDType)
+					return ok && st.Lanes() == 0
+				}
+				isFixedVarying := func(t types.Type) bool {
+					st, ok := t.(*types.SPMDType)
+					return ok && st.Lanes() > 0
+				}
+				spmdFixBlockPhiTypes := func(b *BasicBlock) {
+					if b == nil {
+						return
+					}
+					for _, instr := range b.Instrs {
+						phi, ok := instr.(*Phi)
+						if !ok {
+							break // phis are at the top
+						}
+						if !isAbstractVarying(phi.Type()) {
+							continue // phi is already fixed or not Varying
+						}
+						for _, edge := range phi.Edges {
+							if edge == nil || !isFixedVarying(edge.Type()) {
+								continue
+							}
+							// First edge with a width-fixed type: update the phi.
+							setSPMDValueType(phi, edge.Type())
+							break
+						}
+					}
+				}
+				spmdFixBlockPhiTypes(loop.TrampolineBlock)
+				spmdFixBlockPhiTypes(loop.DoneBlock)
+			}
 		} // end if loop.LaneCount > 1
 
 		if loop.IsPeeled {
@@ -759,6 +810,10 @@ func spmdConvertLoopOps(fn *Function) {
 			// Narrow mask at TypeAssert sites in both main and tail blocks.
 			spmdNarrowMaskAtTypeAsserts(fn, mainBlocks, allOnesMask, loop.LaneCount)
 			spmdNarrowMaskAtTypeAsserts(fn, tailBlocks, loop.TailMask, loop.LaneCount)
+			// v8: mask lifted-phi back-edges in tail-body blocks so inactive
+			// lanes preserve their previous-iter phi value instead of receiving
+			// unmasked arithmetic results (e.g. NaN from 0*Inf in n-body).
+			spmdMaskTailBodyBackEdges(fn, loop, tailBlocks, loop.TailMask)
 		} else if loop.IsRangeIndex {
 			// Non-peeled rangeindex: array length may not be a multiple of
 			// laneCount, so every iteration may be partial. Use tail mask
@@ -4910,6 +4965,157 @@ func spmdNarrowMaskAtTypeAsserts(fn *Function, scopeBlocks map[*BasicBlock]bool,
 					v.SPMDMask = currentMask
 					spmdAddReferrer(currentMask, v)
 				}
+			}
+		}
+	}
+}
+
+// spmdMaskTailBodyBackEdges wraps loop-header phi back-edge values that
+// originate in tail-body blocks with SPMDSelect(tail_mask, new, phi_before)
+// so inactive lanes preserve their pre-tail-body accumulator value across
+// tail iterations. This is the predication-side complement to v8's narrowed
+// lift guard: lifted Varying[T] phis receive correctly-masked back-edge
+// values without needing the alloca preserved.
+//
+// For peeled loops, the trampoline block (or done block) holds a merge phi
+// with two predecessors: tail.check (the "no tail-body ran" path) and
+// tail.body (the "tail-body ran" path). Inactive lanes that did not
+// participate in the tail body should preserve the value from tail.check,
+// not the unmasked arithmetic from tail.body.
+//
+// The helper walks varying-typed phis in fn.Blocks. For each edge whose
+// source is loop.TailBodyBlock (or deeper tail computation blocks), it
+// finds the "pre-body" value from the tail.check predecessor of the same
+// phi, inserts SPMDSelect(tail_mask, newVal, preVal) at the end of the
+// tail.body predecessor block, and rewrites the phi edge to the
+// SPMDSelect result.
+//
+// Edges from loop.TailCheckBlock are never masked: no computation happened
+// on that path, so the value is already correct for all lanes.
+//
+// Main-body edges (from loop.MainBodyBlock) are also skipped: main
+// iterations have an all-ones mask, so masking would be identity.
+func spmdMaskTailBodyBackEdges(fn *Function, loop *SPMDLoopInfo, tailBlocks map[*BasicBlock]bool, tailMask Value) {
+	if !loop.IsPeeled || tailMask == nil {
+		return
+	}
+	// tailCheckBlock is the block that carries the "pre-tail-body" accumulator
+	// value. Its edge to the merge phi is the correct Y for SPMDSelect.
+	tailCheckBlock := loop.TailCheckBlock
+	tailBodyBlock := loop.TailBodyBlock
+
+	for _, header := range fn.Blocks {
+		for _, instr := range header.Instrs {
+			phi, ok := instr.(*Phi)
+			if !ok {
+				break // phis are at the top of a block
+			}
+			// Only mask vectorizable varying-typed phis. Non-vectorizable
+			// Varying types (slice, struct, array, interface) are represented
+			// as [N x T] allocas in TinyGo and do not become LLVM vector
+			// elements; masking their phi edges here would be incorrect.
+			// (They are handled via SPMDStore/SPMDLoad masking instead.)
+			spmdT, isVarying := phi.Type().(*types.SPMDType)
+			if !isVarying {
+				continue
+			}
+			if spmdElemNonVectorizable(spmdT) {
+				continue
+			}
+
+			// Collect the "pre-body" value: the phi edge from tailCheckBlock.
+			// This is the accumulator value before the tail body ran — the
+			// correct value for inactive lanes.
+			var preBodyVal Value
+			if tailCheckBlock != nil {
+				for j, pred := range header.Preds {
+					if pred == tailCheckBlock {
+						preBodyVal = phi.Edges[j]
+						break
+					}
+				}
+			}
+
+			for i, pred := range header.Preds {
+				// Only mask edges from tail computation blocks, not from
+				// tail.check (no body ran) or main.body (all-ones mask).
+				if pred == tailCheckBlock {
+					continue // no masking: correct value already
+				}
+				if !tailBlocks[pred] {
+					continue // not a tail block
+				}
+				edgeVal := phi.Edges[i]
+				if edgeVal == nil || edgeVal == phi {
+					continue // nil or self-loop
+				}
+
+				// Choose the "old value" for inactive lanes.
+				// Prefer the pre-body value from tail.check. Fall back to the
+				// phi edge from tail.body's predecessor in the tail check (if
+				// tailCheckBlock is nil, the loop may have no accumulator phi
+				// in tail.check — rare). If no pre-body value is available,
+				// skip: we cannot mask without a correct inactive-lane value.
+				oldVal := preBodyVal
+				if oldVal == nil {
+					// No tail.check edge found — look for the tail.body's own
+					// accumulator input phi (pred of pred pattern for simple loops).
+					if pred == tailBodyBlock {
+						// For the simple peeled shape, the tail.body's loop-carried
+						// value comes from the tail.check acc phi (the phi inside
+						// tailCheckBlock itself). Find it via tailBodyBlock.Preds.
+						for _, tbPred := range tailBodyBlock.Preds {
+							if tbPred == tailCheckBlock {
+								// tail.check → tail.body: look for a varying phi
+								// in tail.check that feeds this phi's edge.
+								for _, tci := range tailCheckBlock.Instrs {
+									if tcPhi, ok2 := tci.(*Phi); ok2 {
+										if types.Identical(tcPhi.Type(), phi.Type()) {
+											oldVal = tcPhi
+											break
+										}
+									} else {
+										break
+									}
+								}
+								break
+							}
+						}
+					}
+				}
+				if oldVal == nil {
+					continue // cannot determine inactive-lane value; skip
+				}
+
+				sel := &SPMDSelect{
+					Mask:  tailMask,
+					X:     edgeVal,
+					Y:     oldVal,
+					Lanes: loop.LaneCount,
+				}
+				sel.setType(phi.Type())
+				spmdInsertBeforeTerminator(pred, sel)
+				// Register sel as user of its three operands.
+				spmdAddReferrer(tailMask, sel)
+				spmdAddReferrer(edgeVal, sel)
+				spmdAddReferrer(oldVal, sel)
+				// The phi now uses sel instead of edgeVal.
+				// Before removing phi from edgeVal's referrers, check that
+				// no other edge of this phi still uses edgeVal directly.
+				edgeValStillUsed := false
+				for j2, e2 := range phi.Edges {
+					if j2 != i && e2 == edgeVal {
+						edgeValStillUsed = true
+						break
+					}
+				}
+				phi.Edges[i] = sel
+				if !edgeValStillUsed {
+					if refs := edgeVal.Referrers(); refs != nil {
+						*refs = removeInstr(*refs, phi)
+					}
+				}
+				spmdAddReferrer(sel, phi)
 			}
 		}
 	}
