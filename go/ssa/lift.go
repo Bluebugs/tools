@@ -413,24 +413,63 @@ func isLanesVaryingType(typ types.Type) bool {
 	return false
 }
 
+// spmdElemNonVectorizable reports whether the element type T of Varying[T]
+// is non-vectorizable (struct, array, slice, interface — types that lower to
+// LLVM aggregate types and cannot be elements of an LLVM vector). For these,
+// the alloca [N x T] representation is the only valid lowering, so the alloca
+// must survive lift; the predication pass + v7 Phase 1 alloca sizing handle
+// width-fixing and per-lane access.
+//
+// Vectorizable element types (int, float, byte, pointer) lift normally —
+// TinyGo represents them as <N x T> LLVM vectors. The predication pass's
+// tail-body back-edge masking handles the partial-mask iter case, so lift
+// is safe for these types.
+func spmdElemNonVectorizable(t types.Type) bool {
+	var inner types.Type
+	if spmdT, ok := t.(*types.SPMDType); ok {
+		inner = spmdT.Elem()
+	} else if named, ok := t.(*types.Named); ok {
+		if named.TypeArgs() != nil && named.TypeArgs().Len() > 0 {
+			inner = named.TypeArgs().At(0)
+		} else {
+			return false
+		}
+	} else {
+		return false
+	}
+	switch inner.Underlying().(type) {
+	case *types.Struct, *types.Array, *types.Slice, *types.Interface:
+		return true
+	case *types.Pointer:
+		return false // vector of pointers is fine
+	default:
+		return false
+	}
+}
+
 // liftAlloc determines whether alloc can be lifted into registers,
 // and if so, it populates newPhis with all the φ-nodes it may require
 // and returns true.
 //
 // fresh is a source of fresh ids for phi nodes.
 func liftAlloc(df domFrontier, alloc *Alloc, newPhis newPhiMap, fresh *int) bool {
-	// SPMD: keep varying allocas memory-backed so the SPMD predication
-	// pass can mutate the alloca's pointee type to a width-fixed
-	// *types.SPMDType. Without this, the alloca becomes a phi and the
-	// phi's type would be mutated instead — semantically fine but breaks
-	// the alloca-based forward-propagation pass for entry-block allocas
-	// in non-SPMD functions.
+	// SPMD: keep varying allocas memory-backed when their element type is
+	// non-vectorizable (slice, struct, array, interface). These types cannot
+	// be represented as LLVM vector elements, so the alloca [N x T] layout
+	// is the only valid lowering; the predication pass + v7 Phase 1 alloca
+	// sizing handle per-lane access for these types.
+	//
+	// Vectorizable element types (int, float, byte, pointer) are allowed to
+	// lift normally: TinyGo lowers them as <N x T> LLVM vectors, and the
+	// predication pass's tail-body back-edge SPMDSelect masking (v8 Phase 2)
+	// ensures inactive lanes preserve their previous phi value across tail
+	// iterations.
 	//
 	// Note: "rangeindex" iter allocas have type *int (not *Varying[T]), so
 	// isLanesVaryingType returns false for them — they are always lifted
 	// normally. This guard only applies to user variables typed as Varying[T].
 	if ptr, ok := alloc.Type().(*types.Pointer); ok {
-		if isLanesVaryingType(ptr.Elem()) {
+		if isLanesVaryingType(ptr.Elem()) && spmdElemNonVectorizable(ptr.Elem()) {
 			return false
 		}
 	}
