@@ -750,6 +750,19 @@ func (b *builder) expr(fn *Function, e ast.Expr) Value {
 		// by Load over subelement extraction (e.g. Index, Field),
 		// to avoid large copies.
 		v = b.addr(fn, e, false).load(fn)
+		// When a uniform slice/array is indexed by a varying lane index inside a
+		// go for loop, handleSPMDIndexing in go/types records tv.Type as
+		// Varying[elem] but the addressable path above emits IndexAddr+Load which
+		// produces a plain elem type. Detect this mismatch and emit a ChangeType
+		// so that downstream MakeInterface (e.g. fmt.Printf("%v", data[i])) sees
+		// Varying[elem] and produces mask-aware output like [10 20 30 40].
+		if _, tvVarying := tv.Type.(*types.SPMDType); tvVarying {
+			if _, vVarying := v.Type().(*types.SPMDType); !vVarying {
+				conv := &ChangeType{X: v}
+				conv.setType(fn.typ(tv.Type))
+				v = fn.emit(conv)
+			}
+		}
 	} else {
 		v = b.expr0(fn, e, tv)
 	}
@@ -1039,6 +1052,12 @@ func (b *builder) expr0(fn *Function, e ast.Expr, tv types.TypeAndValue) Value {
 		switch et, mode := indexType(xt); mode {
 		case ixVar:
 			// Addressable slice/array; use IndexAddr and Load.
+			// Normally unreachable for addressable slice/array expressions:
+			// b.expr() dispatches them via b.addr(...).load(fn) before reaching
+			// b.expr0, which is where the Varying[elem] promotion for
+			// varying-indexed slices is applied. If a future change introduces
+			// a path that lands here while tv.Type is *types.SPMDType, the same
+			// ChangeType fixup will need to be applied here as well.
 			return b.addr(fn, e, false).load(fn)
 
 		case ixArrVar, ixValue:
